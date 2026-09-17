@@ -1,0 +1,93 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 823cbe02..d93af326 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -25,7 +25,7 @@ import numpy as np
+ from . import dtypes, duck_array_ops, utils
+ from .alignment import align, deep_align
+ from .common import zeros_like
+-from .duck_array_ops import datetime_to_numeric
++from .duck_array_ops import datetime_to_numeric, timedelta_to_numeric, np_timedelta64_to_float
+ from .indexes import Index, filter_indexes_from_coords
+ from .merge import merge_attrs, merge_coordinates_without_align
+ from .options import OPTIONS, _get_keep_attrs
+@@ -1932,15 +1932,43 @@ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+     """
+     from .dataset import Dataset
+ 
+-    def to_floatable(x: DataArray) -> DataArray:
+-        if x.dtype.kind in "mM":
+-            return x.copy(
++    def to_floatable(x):
++        from .dataarray import DataArray
++
++        # If `x` is a DataArray and has a coordinate for its main dimension
++        # (or a coordinate with the same name), prefer converting that
++        # coordinate rather than the DataArray's own data. This preserves
++        # expected behavior when the DataArray stores datetimes but the
++        # meaningful numeric values live in the coordinate (e.g., timedeltas).
++        source = None
++        if isinstance(x, DataArray):
++            # Prefer a coordinate with the same name as the DataArray
++            if x.name and x.name in x.coords:
++                source = x.coords[x.name]
++            else:
++                # Otherwise pick the first coordinate matching one of the dims
++                for dim in x.dims:
++                    if dim in x.coords:
++                        source = x.coords[dim]
++                        break
++        # Fall back to the DataArray itself
++        arr = source if source is not None else x
++
++        if arr.dtype.kind == "M":
++            return arr.copy(
+                 data=datetime_to_numeric(
+-                    x.data,
++                    arr.data,
+                     offset=np.datetime64("1970-01-01"),
+                     datetime_unit="ns",
+                 ),
+             )
++        elif arr.dtype.kind == "m":
++            # arr.data is an ndarray of dtype timedelta64. Convert elementwise
++            # using the ndarray conversion function to avoid type errors.
++            return arr.copy(
++                data=np_timedelta64_to_float(arr.data, "ns"),
++            )
++        # No conversion necessary
+         return x
+ 
+     if isinstance(data, Dataset):
+diff --git a/xarray/tests/test_dataarray.py b/xarray/tests/test_dataarray.py
+index 8e1099b7..e49079b4 100644
+--- a/xarray/tests/test_dataarray.py
++++ b/xarray/tests/test_dataarray.py
+@@ -8,7 +8,10 @@ import numpy as np
+ import pandas as pd
+ import pytest
+ from packaging.version import Version
+-from pandas.core.computation.ops import UndefinedVariableError
++try:
++    from pandas.core.computation.ops import UndefinedVariableError
++except Exception:  # pandas >=1.5 moved this
++    from pandas.errors import UndefinedVariableError
+ 
+ import xarray as xr
+ from xarray import (
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index 263237d9..f9d08dde 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -8,7 +8,10 @@ from textwrap import dedent
+ import numpy as np
+ import pandas as pd
+ import pytest
+-from pandas.core.computation.ops import UndefinedVariableError
++try:
++    from pandas.core.computation.ops import UndefinedVariableError
++except Exception:  # pandas >=1.5 moved this
++    from pandas.errors import UndefinedVariableError
+ from pandas.core.indexes.datetimes import DatetimeIndex
+ 
+ import xarray as xr

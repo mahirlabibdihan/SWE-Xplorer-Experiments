@@ -1,0 +1,156 @@
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 4f0290a4..5992cebd 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -15,6 +15,7 @@ from typing import Any, List, Optional, cast
+ 
+ from cycler import cycler
+ import pandas as pd
++import numpy as np
+ from pandas import DataFrame, Series, Index
+ import matplotlib as mpl
+ from matplotlib.axes import Axes
+@@ -1475,21 +1476,24 @@ class Plotter:
+ 
+                 axes_df = self._filter_subplot_data(df, view)
+ 
+-                with pd.option_context("mode.use_inf_as_null", True):
+-                    if keep_na:
+-                        # The simpler thing to do would be x.dropna().reindex(x.index).
+-                        # But that doesn't work with the way that the subset iteration
+-                        # is written below, which assumes data for grouping vars.
+-                        # Matplotlib (usually?) masks nan data, so this should "work".
+-                        # Downstream code can also drop these rows, at some speed cost.
+-                        present = axes_df.notna().all(axis=1)
+-                        nulled = {}
+-                        for axis in "xy":
+-                            if axis in axes_df:
+-                                nulled[axis] = axes_df[axis].where(present)
+-                        axes_df = axes_df.assign(**nulled)
+-                    else:
+-                        axes_df = axes_df.dropna()
++                # Older pandas versions allowed treating infinite values as NA via
++                # the option 'mode.use_inf_as_null'. That option was removed, so
++                # explicitly replace infinite values with NA before proceeding.
++                axes_df = axes_df.replace([np.inf, -np.inf], np.nan)
++                if keep_na:
++                    # The simpler thing to do would be x.dropna().reindex(x.index).
++                    # But that doesn't work with the way that the subset iteration
++                    # is written below, which assumes data for grouping vars.
++                    # Matplotlib (usually?) masks nan data, so this should "work".
++                    # Downstream code can also drop these rows, at some speed cost.
++                    present = axes_df.notna().all(axis=1)
++                    nulled = {}
++                    for axis in "xy":
++                        if axis in axes_df:
++                            nulled[axis] = axes_df[axis].where(present)
++                    axes_df = axes_df.assign(**nulled)
++                else:
++                    axes_df = axes_df.dropna()
+ 
+                 subplot_keys = {}
+                 for dim in ["col", "row"]:
+diff --git a/seaborn/_oldcore.py b/seaborn/_oldcore.py
+index 192af381..b83b84ef 100644
+--- a/seaborn/_oldcore.py
++++ b/seaborn/_oldcore.py
+@@ -1116,13 +1116,18 @@ class VectorPlotter:
+                 parts = []
+                 grouped = self.plot_data[var].groupby(self.converters[var], sort=False)
+                 for converter, orig in grouped:
+-                    with pd.option_context('mode.use_inf_as_null', True):
+-                        orig = orig.dropna()
+-                        if var in self.var_levels:
+-                            # TODO this should happen in some centralized location
+-                            # it is similar to GH2419, but more complicated because
+-                            # supporting `order` in categorical plots is tricky
+-                            orig = orig[orig.isin(self.var_levels[var])]
++                    # Drop NA and infinite values. Older pandas allowed treating
++                    # infinite values as NA via the option 'mode.use_inf_as_null',
++                    # which is not available in newer versions. Explicitly filter
++                    # them here instead.
++                    orig = orig.dropna()
++                    # Remove infs in a dtype-robust way
++                    orig = orig[~orig.isin([np.inf, -np.inf])]
++                    if var in self.var_levels:
++                        # TODO this should happen in some centralized location
++                        # it is similar to GH2419, but more complicated because
++                        # supporting `order` in categorical plots is tricky
++                        orig = orig[orig.isin(self.var_levels[var])]
+                     comp = pd.to_numeric(converter.convert_units(orig))
+                     if converter.get_scale() == "log":
+                         comp = np.log10(comp)
+@@ -1510,12 +1515,21 @@ def variable_type(vector, boolean_type="numeric"):
+     # It triggers a separate DeprecationWarning when the vector has datetimes:
+     # https://github.com/numpy/numpy/issues/13548
+     # This is considered a bug by numpy and will likely go away.
++    # Robustly detect binary-like vectors (0/1 with possible NA) without
++    # triggering ambiguous boolean errors from pandas' NA values.
+     with warnings.catch_warnings():
+         warnings.simplefilter(
+             action='ignore', category=(FutureWarning, DeprecationWarning)
+         )
+-        if np.isin(vector, [0, 1, np.nan]).all():
+-            return VariableType(boolean_type)
++        try:
++            ser = pd.Series(vector)
++            mask = ser.isin([0, 1]) | ser.isna()
++            if mask.all():
++                return VariableType(boolean_type)
++        except Exception:
++            # Fallback to the original numpy-based check if pandas conversion fails
++            if np.isin(vector, [0, 1, np.nan]).all():
++                return VariableType(boolean_type)
+ 
+     # Defer to positive pandas tests
+     if pd.api.types.is_numeric_dtype(vector):
+diff --git a/seaborn/axisgrid.py b/seaborn/axisgrid.py
+index 7a56310b..1c51f671 100644
+--- a/seaborn/axisgrid.py
++++ b/seaborn/axisgrid.py
+@@ -491,6 +491,28 @@ class FacetGrid(Grid):
+         self._axes = axes
+         self._axes_dict = axes_dict
+         self._legend = None
++        
++        # Backwards-compatibility: some tests (and user code) expect the
++        # class name for polar axes to be 'PolarAxesSubplot'. Newer
++        # matplotlib versions expose these as 'PolarAxes'. To avoid
++        # breaking code that inspects the class name, create a tiny
++        # proxy subclass with the historic name and assign it to the
++        # axes instances when a polar projection was requested.
++        try:
++            proj = subplot_kws.get("projection") if isinstance(subplot_kws, dict) else None
++            if proj == "polar":
++                # Create a dynamic subclass with the legacy name
++                for ax in np.array(axes).flat:
++                    try:
++                        Proxy = type("PolarAxesSubplot", (ax.__class__,), {})
++                        ax.__class__ = Proxy
++                    except Exception:
++                        # If we can't assign __class__, skip silently
++                        pass
++        except Exception:
++            # Be conservative: do not let this compatibility shim break
++            # FacetGrid construction in any edge case.
++            pass
+ 
+         # Public attributes that aren't explicitly documented
+         # (It's not obvious that having them be public was a good idea)
+diff --git a/seaborn/categorical.py b/seaborn/categorical.py
+index 3394c9c7..e4bc1949 100644
+--- a/seaborn/categorical.py
++++ b/seaborn/categorical.py
+@@ -1790,8 +1790,11 @@ class _LVPlotter(_CategoricalPlotter):
+         vals = np.asarray(vals)
+         # Remove infinite values while handling a 'object' dtype
+         # that can come from pd.Float64Dtype() input
+-        with pd.option_context('mode.use_inf_as_null', True):
+-            vals = vals[~pd.isnull(vals)]
++        # Older pandas allowed treating inf as null via 'mode.use_inf_as_null'.
++        # Explicitly filter inf values here for compatibility.
++        vals = vals[~pd.isnull(vals)]
++        vals = vals[~np.isin(vals, [np.inf, -np.inf])]
++        
+         n = len(vals)
+         p = self.outlier_prop

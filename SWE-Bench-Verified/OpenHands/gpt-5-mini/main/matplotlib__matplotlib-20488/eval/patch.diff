@@ -1,0 +1,104 @@
+diff --git a/lib/matplotlib/colors.py b/lib/matplotlib/colors.py
+index e0c42c5b6..3f19a0a5c 100644
+--- a/lib/matplotlib/colors.py
++++ b/lib/matplotlib/colors.py
+@@ -96,10 +96,18 @@ def get_named_colors_mapping():
+ def _sanitize_extrema(ex):
+     if ex is None:
+         return ex
++    # Try to convert numpy/scalar objects to native python floats safely.
+     try:
+-        ret = ex.item()
+-    except AttributeError:
+-        ret = float(ex)
++        # ex.item() may exist but raise (e.g., for masked values), so catch
++        # all exceptions and fall back to float(ex).
++        try:
++            ret = ex.item()
++        except Exception:
++            ret = float(ex)
++    except Exception:
++        # If we still can't convert, return the original value to allow
++        # downstream code to handle it (will likely raise).
++        return ex
+     return ret
+ 
+ 
+@@ -1472,9 +1480,37 @@ def _make_norm_from_scale(scale_cls, base_norm_cls=None, *, init=None):
+             if clip:
+                 value = np.clip(value, self.vmin, self.vmax)
+             t_value = self._trf.transform(value).reshape(np.shape(value))
+-            t_vmin, t_vmax = self._trf.transform([self.vmin, self.vmax])
+-            if not np.isfinite([t_vmin, t_vmax]).all():
+-                raise ValueError("Invalid vmin or vmax")
++            # The transform may return numpy or masked scalars/arrays
++            # (depending on the Scale/Transform implementation).  Ensure
++            # we compare python scalars here to avoid surprising truth-
++            # value behaviour of masked scalars (gh-18458).
++            np_ = __import__('numpy')
++            # Prefer transforming plain python floats to avoid masked/numpy
++            # scalar results from some Transform implementations.
++            try:
++                arr = np_.asarray(self._trf.transform([float(self.vmin),
++                                                      float(self.vmax)]))
++                t_vmin = float(arr[0])
++                t_vmax = float(arr[1])
++            except Exception:
++                t_vmin_vmax = self._trf.transform([self.vmin, self.vmax])
++                try:
++                    arr = np_.asarray(t_vmin_vmax)
++                    t_vmin = float(arr[0])
++                    t_vmax = float(arr[1])
++                except Exception:
++                    t_vmin = _sanitize_extrema(t_vmin_vmax[0])
++                    t_vmax = _sanitize_extrema(t_vmin_vmax[1])
++            # If direct conversion produced non-finite values (e.g., masked
++            # produced NaN), try sanitizing the extrema as a fallback before
++            # giving up.
++            if not np_.isfinite([t_vmin, t_vmax]).all():
++                t_vmin_s = _sanitize_extrema(t_vmin_vmax[0])
++                t_vmax_s = _sanitize_extrema(t_vmin_vmax[1])
++                if np_.isfinite([t_vmin_s, t_vmax_s]).all():
++                    t_vmin, t_vmax = t_vmin_s, t_vmax_s
++                else:
++                    raise ValueError("Invalid vmin or vmax")
+             t_value -= t_vmin
+             t_value /= (t_vmax - t_vmin)
+             t_value = np.ma.masked_invalid(t_value, copy=False)
+@@ -1485,9 +1521,33 @@ def _make_norm_from_scale(scale_cls, base_norm_cls=None, *, init=None):
+                 raise ValueError("Not invertible until scaled")
+             if self.vmin > self.vmax:
+                 raise ValueError("vmin must be less or equal to vmax")
+-            t_vmin, t_vmax = self._trf.transform([self.vmin, self.vmax])
+-            if not np.isfinite([t_vmin, t_vmax]).all():
+-                raise ValueError("Invalid vmin or vmax")
++            np_ = __import__('numpy')
++            # Prefer transforming plain python floats to avoid masked/numpy
++            # scalar results from some Transform implementations.
++            try:
++                arr = np_.asarray(self._trf.transform([float(self.vmin),
++                                                      float(self.vmax)]))
++                t_vmin = float(arr[0])
++                t_vmax = float(arr[1])
++            except Exception:
++                t_vmin_vmax = self._trf.transform([self.vmin, self.vmax])
++                try:
++                    arr = np_.asarray(t_vmin_vmax)
++                    t_vmin = float(arr[0])
++                    t_vmax = float(arr[1])
++                except Exception:
++                    t_vmin = _sanitize_extrema(t_vmin_vmax[0])
++                    t_vmax = _sanitize_extrema(t_vmin_vmax[1])
++            # If direct conversion produced non-finite values (e.g., masked
++            # produced NaN), try sanitizing the extrema as a fallback before
++            # giving up.
++            if not np_.isfinite([t_vmin, t_vmax]).all():
++                t_vmin_s = _sanitize_extrema(t_vmin_vmax[0])
++                t_vmax_s = _sanitize_extrema(t_vmin_vmax[1])
++                if np_.isfinite([t_vmin_s, t_vmax_s]).all():
++                    t_vmin, t_vmax = t_vmin_s, t_vmax_s
++                else:
++                    raise ValueError("Invalid vmin or vmax")
+             value, is_scalar = self.process_value(value)
+             rescaled = value * (t_vmax - t_vmin)
+             rescaled += t_vmin

@@ -1,0 +1,83 @@
+diff --git a/sympy/concrete/products.py b/sympy/concrete/products.py
+index 66aafde2d..5db9ebd47 100644
+--- a/sympy/concrete/products.py
++++ b/sympy/concrete/products.py
+@@ -275,18 +275,31 @@ def _eval_product(self, term, limits):
+             return poly.LC()**(n - a + 1) * A * B
+ 
+         elif term.is_Add:
+-            p, q = term.as_numer_denom()
+-            q = self._eval_product(q, (k, a, n))
+-            if q.is_Number:
+-
+-                # There is expression, which couldn't change by
+-                # as_numer_denom(). E.g. n**(2/3) + 1 --> (n**(2/3) + 1, 1).
+-                # We have to catch this case.
+-
+-                p = sum([self._eval_product(i, (k, a, n)) for i in p.as_coeff_Add()])
+-            else:
+-                p = self._eval_product(p, (k, a, n))
+-            return p / q
++            # Try to detect terms of the form c + base**(m*k) where c is
++            # independent of k and m is 1 or -1. Such products can be
++            # expressed using the q-Pochhammer symbol:
++            #   prod_{k=a}^n (c + base**(-k)) = c**(N) * QPochhammer(-1/c, 1/base, N)
++            # where N = n - a + 1. If the pattern is not recognized, defer
++            # evaluation.
++            c, dep = term.as_independent(k)
++            try:
++                if dep.is_Pow:
++                    base, exp = dep.as_base_exp()
++                    N = n - a + 1
++                    # match exp == -k or exp == k
++                    if exp == -k:
++                        q = 1 / base
++                    elif exp == k:
++                        q = base
++                    else:
++                        return None
++                    # import here to avoid circular imports
++                    from sympy.functions.special.q_pochhammer import QPochhammer
++                    return c**(N) * QPochhammer(-1 / c, q, N)
++            except Exception:
++                # any failure we bail out and leave the product unevaluated
++                return None
++            return None
+ 
+         elif term.is_Mul:
+             exclude, include = [], []
+diff --git a/sympy/functions/special/q_pochhammer.py b/sympy/functions/special/q_pochhammer.py
+new file mode 100644
+index 000000000..fca3d2644
+--- /dev/null
++++ b/sympy/functions/special/q_pochhammer.py
+@@ -0,0 +1,29 @@
++from __future__ import division
++
++from sympy.core.function import Function
++from sympy.core.singleton import S
++from sympy import sympify
++
++
++class QPochhammer(Function):
++    """q-Pochhammer symbol (a; q)_n = prod_{k=0}^{n-1} (1 - a*q**k)
++
++    Minimal implementation: keeps symbolic representation and evaluates
++    when n is a non-negative integer.
++    """
++
++    @classmethod
++    def eval(cls, a, q, n):
++        a = sympify(a)
++        q = sympify(q)
++        n = sympify(n)
++        if n.is_integer and n.is_nonnegative:
++            prod = S.One
++            for k in range(int(n)):
++                prod *= (1 - a * q**k)
++            return prod
++        return None
++
++    def _sympystr(self, p):
++        a, q, n = self.args
++        return "QPochhammer(%s; %s)_%s" % (p._print(a), p._print(q), p._print(n))

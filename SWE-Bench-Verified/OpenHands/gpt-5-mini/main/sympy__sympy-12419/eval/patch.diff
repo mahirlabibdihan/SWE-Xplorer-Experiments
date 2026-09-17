@@ -1,0 +1,68 @@
+diff --git a/sympy/concrete/summations.py b/sympy/concrete/summations.py
+index 372487664..068fcc02b 100644
+--- a/sympy/concrete/summations.py
++++ b/sympy/concrete/summations.py
+@@ -866,6 +866,46 @@ def eval_sum(f, limits):
+                     return None
+                 newargs.append((newexpr, arg.cond))
+             return f.func(*newargs)
++        # Handle simple Piecewise that represents the indicator of the summation
++        # limits: e.g. Piecewise((1, Interval(a, b).as_relational(i)), (0, True)).
++        # In that case Sum(Piecewise((1, cond), (0, True)), (i, a, b)) == Sum(1, (i, a, b)).
++        if len(f.args) == 2 and f.args[1].cond == True and f.args[1].expr == S.Zero:
++            cond = f.args[0].cond
++            expr0 = f.args[0].expr
++            # Check if the condition is exactly the interval corresponding to limits
++            try:
++                if cond == Interval(limits[1], limits[2]).as_relational(limits[0]):
++                    return eval_sum(expr0, limits)
++            except Exception:
++                pass
++            # If the Piecewise condition depends on the summation index it may
++            # still represent the indicator of the summation interval but with
++            # an equivalent relational (e.g. j>=0 & j<=n-1 vs 0<=j & j<=n-1).
++            # Try to detect this by extracting simple lower/upper bound relations.
++            try:
++                from sympy.core.relational import Relational
++                def _cond_is_interval(cond, var, a, b):
++                    rels = cond.args if cond.func is And else [cond]
++                    low = None
++                    high = None
++                    for r in rels:
++                        if not isinstance(r, Relational):
++                            return False
++                        # lower bound: var >= a  or a <= var
++                        if r.lhs == var and r.rhs == a and r.rel_op in (">=", ">"):
++                            low = a
++                        elif r.lhs == a and r.rhs == var and r.rel_op in ("<=", "<"):
++                            low = a
++                        # upper bound: var <= b or b >= var
++                        if r.lhs == var and r.rhs == b and r.rel_op in ("<=", "<"):
++                            high = b
++                        elif r.lhs == b and r.rhs == var and r.rel_op in (">=", ">"):
++                            high = b
++                    return low == a and high == b
++                if _cond_is_interval(cond, limits[0], limits[1], limits[2]):
++                    return eval_sum(expr0, limits)
++            except Exception:
++                pass
+ 
+     if f.has(KroneckerDelta) and _has_simple_delta(f, limits[0]):
+         return deltasummation(f, limits)
+diff --git a/sympy/matrices/expressions/matexpr.py b/sympy/matrices/expressions/matexpr.py
+index b4d759836..cd6770d69 100644
+--- a/sympy/matrices/expressions/matexpr.py
++++ b/sympy/matrices/expressions/matexpr.py
+@@ -476,10 +476,8 @@ def conjugate(self):
+         return self
+ 
+     def _entry(self, i, j):
+-        if i == j:
+-            return S.One
+-        else:
+-            return S.Zero
++        from sympy import KroneckerDelta
++        return KroneckerDelta(i, j)
+ 
+     def _eval_determinant(self):
+         return S.One

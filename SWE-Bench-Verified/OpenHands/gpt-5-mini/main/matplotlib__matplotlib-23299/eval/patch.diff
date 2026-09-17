@@ -1,0 +1,80 @@
+diff --git a/lib/matplotlib/__init__.py b/lib/matplotlib/__init__.py
+index c268a56724..594e1c4135 100644
+--- a/lib/matplotlib/__init__.py
++++ b/lib/matplotlib/__init__.py
+@@ -1095,7 +1095,31 @@ def rc_context(rc=None, fname=None):
+             rcParams.update(rc)
+         yield
+     finally:
+-        dict.update(rcParams, orig)  # Revert to the original rcs.
++        # Revert to the original rcParams.  However, avoid reverting the
++        # "backend" key to the _auto_backend_sentinel if the backend has
++        # already been resolved while inside the context (e.g., by importing
++        # pyplot and creating a figure).  Reverting to the sentinel would
++        # cause a later access to rcParams['backend'] to attempt to resolve
++        # the auto backend again (via pyplot.switch_backend), which may call
++        # close("all") and unexpectedly remove existing figures from
++        # _pylab_helpers.Gcf.figs.  See gh-xxxxx.
++        try:
++            current_backend = dict.__getitem__(rcParams, 'backend')
++        except Exception:
++            # If rcParams is not fully initialized for some reason, fall
++            # back to the plain update behavior.
++            dict.update(rcParams, orig)
++        else:
++            # If the original backend was the auto sentinel, but the current
++            # backend has been resolved to a concrete backend, keep the
++            # resolved backend instead of reverting to the sentinel.
++            if (orig.get('backend', None) is rcsetup._auto_backend_sentinel and
++                    current_backend is not rcsetup._auto_backend_sentinel):
++                # Make a shallow copy so as not to mutate the saved 'orig'
++                # object used by the context manager.
++                orig = orig.copy()
++                dict.__setitem__(orig, 'backend', current_backend)
++            dict.update(rcParams, orig)  # Revert to the original rcs.
+ 
+ 
+ def use(backend, *, force=True):
+@@ -1171,11 +1195,38 @@ def get_backend():
+     """
+     Return the name of the current backend.
+ 
+-    See Also
+-    --------
+-    matplotlib.use
++    NOTE: Accessing ``rcParams['backend']`` may trigger resolution of the
++    ``_auto_backend_sentinel`` which can call into pyplot.switch_backend and
++    ultimately close all figures (via ``close('all')``).  To avoid the
++    surprising side-effect of clearing ``Gcf.figs`` when merely querying the
++    backend, we read the underlying dict directly and only attempt a
++    non-destructive resolution to a concrete backend name.
+     """
+-    return rcParams['backend']
++    # Use the underlying dict.__getitem__ to avoid the RcParams.__getitem__
++    # logic that may attempt to resolve the auto sentinel by importing and
++    # switching backends (which has side effects).
++    backend = dict.__getitem__(rcParams, 'backend')
++    if backend is rcsetup._auto_backend_sentinel:
++        # Prefer any explicitly recorded original/default backend that is
++        # already concrete; fall back to 'agg' as a safe non-GUI backend.
++        try:
++            orig_backend = dict.__getitem__(rcParamsOrig, 'backend')
++        except Exception:
++            orig_backend = None
++        if orig_backend is not None and \
++                orig_backend is not rcsetup._auto_backend_sentinel:
++            return orig_backend
++        try:
++            default_backend = dict.__getitem__(rcParamsDefault, 'backend')
++        except Exception:
++            default_backend = None
++        if default_backend is not None and \
++                default_backend is not rcsetup._auto_backend_sentinel:
++            return default_backend
++        # Last resort: avoid triggering any imports or GUI-related side
++        # effects; return a conservative default.
++        return 'agg'
++    return backend
+ 
+ 
+ def interactive(b):

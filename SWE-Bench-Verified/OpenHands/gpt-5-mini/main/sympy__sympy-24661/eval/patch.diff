@@ -1,0 +1,67 @@
+diff --git a/sympy/parsing/sympy_parser.py b/sympy/parsing/sympy_parser.py
+index 52711d1324..091af19de0 100644
+--- a/sympy/parsing/sympy_parser.py
++++ b/sympy/parsing/sympy_parser.py
+@@ -1186,6 +1186,62 @@ def visit_BinOp(self, node):
+             return new_node
+         return node
+ 
++    def visit_Compare(self, node):
++        # Handle comparison operators by converting them to SymPy relationals
++        # For chained comparisons like a < b < c, produce And(Lt(a,b), Lt(b,c), ...)
++        left = self.visit(node.left)
++        comparators = [self.visit(c) for c in node.comparators]
++        ops = node.ops
++
++        mapping = {
++            ast.Lt: 'Lt',
++            ast.LtE: 'Le',
++            ast.Gt: 'Gt',
++            ast.GtE: 'Ge',
++            ast.Eq: 'Eq',
++            ast.NotEq: 'Ne',
++            ast.Is: 'Eq',
++            ast.IsNot: 'Ne',
++        }
++
++        def make_rel(op_class, a, b):
++            cls_name = mapping.get(op_class, None)
++            if cls_name is None:
++                return None
++            return ast.Call(
++                func=ast.Name(id=cls_name, ctx=ast.Load()),
++                args=[a, b],
++                keywords=[ast.keyword(arg='evaluate', value=ast.NameConstant(value=False, ctx=ast.Load()))],
++                starargs=None,
++                kwargs=None
++            )
++
++        # Single comparison
++        if len(ops) == 1:
++            rel = make_rel(ops[0].__class__, left, comparators[0])
++            if rel is not None:
++                return rel
++            return node
++
++        # Chained comparisons -> And(rel1, rel2, ...)
++        rels = []
++        a = left
++        for op, b in zip(ops, comparators):
++            rel = make_rel(op.__class__, a, b)
++            if rel is None:
++                return node
++            rels.append(rel)
++            a = b
++
++        and_call = ast.Call(
++            func=ast.Name(id='And', ctx=ast.Load()),
++            args=rels,
++            keywords=[ast.keyword(arg='evaluate', value=ast.NameConstant(value=False, ctx=ast.Load()))],
++            starargs=None,
++            kwargs=None
++        )
++        return and_call
++
+     def visit_Call(self, node):
+         new_node = self.generic_visit(node)
+         if isinstance(node.func, ast.Name) and node.func.id in self.functions:
