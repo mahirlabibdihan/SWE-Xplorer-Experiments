@@ -67,17 +67,23 @@ the verification stage, an `eval/` folder (`report.json`, `eval.sh`,
   ```json
   {
     "<instance_id>": [
-      {"node_index": 0, "resolved": true,  "patch_exists": true, "patch_applied": true, "patch_is_none": false},
-      {"node_index": 1, "resolved": false, "patch_exists": true, "patch_applied": true, "patch_is_none": false},
+      {"node_index": 0, "resolved": true,  "patch_exists": true, "patch_applied": true, "patch_is_none": false, "is_submission": false},
+      {"node_index": 1, "resolved": false, "patch_exists": true, "patch_applied": true, "patch_is_none": false, "is_submission": true},
       ...
     ]
   }
   ```
   Candidates are ranked by the value model, so `node_index: 0` is the
-  top-ranked candidate for that instance (closest to, but not always
-  identical to, what was actually submitted). Not every instance has an
-  entry at every node index — most trees produce only a few complete
-  candidates per instance.
+  top-ranked candidate for that instance — this is **not necessarily** the
+  same patch that was actually submitted (the discriminator can pick a
+  different candidate than the pure top-value one). `is_submission: true`
+  marks whichever candidate matches the actual submitted patch in
+  `preds.json`, so `report.json`'s resolved/unresolved verdict for an
+  instance should match the `resolved` value on its `is_submission: true`
+  entry here. At most one entry per instance has `is_submission: true`;
+  some instances have none (the submitted patch wasn't evaluated at any
+  logged node rank). Not every instance has an entry at every node index —
+  most trees produce only a few complete candidates per instance.
 
 Some experiments don't yet have an evaluation report at all (evaluation is
 still pending or was never run) — a missing `report.json`/`report_ts.json`
