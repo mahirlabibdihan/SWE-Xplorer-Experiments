@@ -1,0 +1,69 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 28374272f4..f00f5df488 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -514,19 +514,61 @@ class Field(RegisterLookupMixin):
+         return self.__class__(*args, **kwargs)
+ 
+     def __eq__(self, other):
+-        # Needed for @total_ordering
++        # Needed for @total_ordering.
++        # Two Fields should only compare equal if they have the same
++        # creation_counter and are attached to the same model (if either is
++        # attached). Comparing fields that are attached to different models
++        # as equal was surprising (e.g. when using abstract base classes)
++        # because it caused de-duplication of distinct fields. See ticket
++        # notes in the repository for discussion.
+         if isinstance(other, Field):
++            # If either field is attached to a model, require they be the same
++            # model to be equal. If neither is attached, fall back to
++            # creation_counter comparison for compatibility.
++            self_model = getattr(self, 'model', None)
++            other_model = getattr(other, 'model', None)
++            if (self_model is not None) or (other_model is not None):
++                return self_model is other_model and self.creation_counter == other.creation_counter
+             return self.creation_counter == other.creation_counter
+         return NotImplemented
+ 
+     def __lt__(self, other):
+         # This is needed because bisect does not take a comparison function.
+         if isinstance(other, Field):
+-            return self.creation_counter < other.creation_counter
++            # Primary ordering is by creation_counter so behaviour remains
++            # stable in the common case. If counters are equal (rare), use a
++            # deterministic tie-breaker based on model identity (app_label,
++            # model_name) and finally the field's class name to ensure a total
++            # ordering.
++            if self.creation_counter != other.creation_counter:
++                return self.creation_counter < other.creation_counter
++            # Tie-breaker when creation_counter is equal
++            self_model = getattr(self, 'model', None)
++            other_model = getattr(other, 'model', None)
++            if self_model is not None and other_model is not None:
++                self_key = (self_model._meta.app_label, self_model._meta.model_name)
++                other_key = (other_model._meta.app_label, other_model._meta.model_name)
++                if self_key != other_key:
++                    return self_key < other_key
++            elif self_model is None and other_model is not None:
++                return True
++            elif self_model is not None and other_model is None:
++                return False
++            # Final tie-breaker: compare by class name then field name to be
++            # fully deterministic.
++            self_key = (self.__class__.__name__, getattr(self, 'name', None))
++            other_key = (other.__class__.__name__, getattr(other, 'name', None))
++            return self_key < other_key
+         return NotImplemented
+ 
+     def __hash__(self):
+-        return hash(self.creation_counter)
++        # Hash must be consistent with __eq__. If a field is attached to a
++        # model, include that model's identity (app_label and model_name) in
++        # the hash so that fields on different models do not collide.
++        model = getattr(self, 'model', None)
++        if model is None:
++            return hash(self.creation_counter)
++        return hash((self.creation_counter, model._meta.app_label, model._meta.model_name))
+ 
+     def __deepcopy__(self, memodict):
+         # We don't have to deepcopy very much here, since most things are not

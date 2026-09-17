@@ -1,0 +1,97 @@
+diff --git a/lib/matplotlib/widgets.py b/lib/matplotlib/widgets.py
+index a199e45d4..d73dd50fe 100644
+--- a/lib/matplotlib/widgets.py
++++ b/lib/matplotlib/widgets.py
+@@ -2369,13 +2369,62 @@ class ToolLineHandles:
+         line_fun = ax.axvline if self.direction == 'horizontal' else ax.axhline
+         self._line_props = line_props
+ 
+-        self.artists = [line_fun(p, **line_props) for p in positions]
++        # Create the handle lines in Axes coordinates to avoid updating
++        # the Axes data limits (which would happen if the lines were
++        # added in data coordinates through axvline/axhline).  We convert
++        # the requested data positions to Axes coords and draw full-span
++        # lines in Axes space.  This prevents accidental autoscaling that
++        # would include e.g. x=0 when the initial handle positions are 0.
++        self.artists = []
++        if self.direction == 'horizontal':
++            for p in positions:
++                # Transform data x -> axes coordinates
++                try:
++                    px, py = self.ax.transData.transform((p, 0))
++                    ax_x, _ = self.ax.transAxes.inverted().transform((px, py))
++                except Exception:
++                    # Fall back to using 0 in axes coords if transform fails
++                    ax_x = 0
++                line = Line2D([ax_x, ax_x], [0, 1], transform=self.ax.transAxes,
++                              **line_props)
++                self.ax.add_line(line)
++                self.artists.append(line)
++        else:
++            for p in positions:
++                # Transform data y -> axes coordinates
++                try:
++                    px, py = self.ax.transData.transform((0, p))
++                    _, ax_y = self.ax.transAxes.inverted().transform((px, py))
++                except Exception:
++                    ax_y = 0
++                line = Line2D([0, 1], [ax_y, ax_y], transform=self.ax.transAxes,
++                              **line_props)
++                self.ax.add_line(line)
++                self.artists.append(line)
+ 
+     @property
+     def positions(self):
+-        """Positions of the handle in data coordinates."""
+-        method = 'get_xdata' if self.direction == 'horizontal' else 'get_ydata'
+-        return [getattr(line, method)()[0] for line in self.artists]
++        """Positions of the handle in data coordinates.
++
++        The artists are drawn in Axes coordinates to avoid changing the Axes
++        data limits; this property converts them back to data coordinates so
++        callers see the original data-space positions.
++        """
++        data_positions = []
++        if self.direction == 'horizontal':
++            for line in self.artists:
++                # line xdata is in Axes coords; convert Axes -> display -> data
++                ax_x = line.get_xdata()[0]
++                disp_x, disp_y = self.ax.transAxes.transform((ax_x, 0))
++                data_x, _ = self.ax.transData.inverted().transform((disp_x, disp_y))
++                data_positions.append(data_x)
++        else:
++            for line in self.artists:
++                ax_y = line.get_ydata()[0]
++                disp_x, disp_y = self.ax.transAxes.transform((0, ax_y))
++                _, data_y = self.ax.transData.inverted().transform((disp_x, disp_y))
++                data_positions.append(data_y)
++        return data_positions
+ 
+     @property
+     def direction(self):
+@@ -2392,9 +2441,22 @@ class ToolLineHandles:
+         positions : tuple of length 2
+             Set the positions of the handle in data coordinates
+         """
+-        method = 'set_xdata' if self.direction == 'horizontal' else 'set_ydata'
+-        for line, p in zip(self.artists, positions):
+-            getattr(line, method)([p, p])
++        if self.direction == 'horizontal':
++            for line, p in zip(self.artists, positions):
++                # convert data -> display -> axes coords
++                disp_x, disp_y = self.ax.transData.transform((p, 0))
++                ax_x, _ = self.ax.transAxes.inverted().transform((disp_x, disp_y))
++                line.set_xdata([ax_x, ax_x])
++        else:
++            for line, p in zip(self.artists, positions):
++                disp_x, disp_y = self.ax.transData.transform((0, p))
++                _, ax_y = self.ax.transAxes.inverted().transform((disp_x, disp_y))
++                line.set_ydata([ax_y, ax_y])
++
++        # ensure visibility state/animation is preserved on the artists
++        for artist in self.artists:
++            artist.set_animated(self._line_props.get('animated', False))
++            artist.set_visible(self._line_props.get('visible', False))
+ 
+     def set_visible(self, value):
+         """Set the visibility state of the handles artist."""

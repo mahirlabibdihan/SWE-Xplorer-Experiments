@@ -1,0 +1,73 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 59a5d6abbb..9391827c7e 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1850,11 +1850,44 @@ class SQLUpdateCompiler(SQLCompiler):
+             # Either we're using the idents in multiple update queries (so
+             # don't want them to change), or the db backend doesn't support
+             # selecting from the updating table (e.g. MySQL).
+-            idents = []
++            # Collect the child model primary keys that match the filters.
++            child_idents = []
+             for rows in query.get_compiler(self.using).execute_sql(MULTI):
+-                idents.extend(r[0] for r in rows)
+-            self.query.add_filter("pk__in", idents)
+-            self.query.related_ids = idents
++                child_idents.extend(r[0] for r in rows)
++            # Restrict the main query to the gathered child ids so subsequent
++            # updates don't see changing rows as updates cascade.
++            self.query.add_filter("pk__in", child_idents)
++
++            # If we have related_updates (updates to ancestor tables), we need
++            # to compute the ancestor ids on a per-ancestor basis because the
++            # child's pointer column for each ancestor is different. Build a
++            # mapping from ancestor model -> list of ancestor ids by reusing the
++            # prepared `query` (which already encodes the WHERE conditions)
++            # but selecting the appropriate child pointer column for each
++            # ancestor.
++            related_ids_map = {}
++            if self.query.related_updates:
++                child_opts = self.query.get_meta()
++                for parent_model in self.query.related_updates:
++                    # The field on the child that points to the ancestor model.
++                    link_field = child_opts.get_ancestor_link(parent_model)
++                    if not link_field:
++                        # Fallback: use the child ids if we can't find a link.
++                        related_ids_map[parent_model] = list(child_idents)
++                        continue
++                    ids_query = query.clone()
++                    # Select only the child column that stores the parent's PK.
++                    ids_query.select = []
++                    ids_query.add_fields([link_field.attname])
++                    parent_ids = []
++                    for rows in ids_query.get_compiler(self.using).execute_sql(MULTI):
++                        parent_ids.extend(r[0] for r in rows)
++                    related_ids_map[parent_model] = parent_ids
++
++            # Store both the child ids and, if present, the per-parent mapping.
++            # Keep backward compatibility by storing the child ids in
++            # related_ids as well when there are no related_updates.
++            self.query.related_ids = related_ids_map if related_ids_map else list(child_idents)
+         else:
+             # The fast path. Filters and updates in one query.
+             self.query.add_filter("pk__in", query)
+diff --git a/django/db/models/sql/subqueries.py b/django/db/models/sql/subqueries.py
+index 04063f73bc..c2b9efe2db 100644
+--- a/django/db/models/sql/subqueries.py
++++ b/django/db/models/sql/subqueries.py
+@@ -134,7 +134,14 @@ class UpdateQuery(Query):
+             query = UpdateQuery(model)
+             query.values = values
+             if self.related_ids is not None:
+-                query.add_filter("pk__in", self.related_ids)
++                # related_ids may be a mapping from ancestor model -> list of
++                # IDs (when multiple ancestor updates are required) or a simple
++                # list of child ids for backward compatibility. Handle both.
++                if isinstance(self.related_ids, dict):
++                    ids = self.related_ids.get(model, [])
++                else:
++                    ids = self.related_ids
++                query.add_filter("pk__in", ids)
+             result.append(query)
+         return result
+ 

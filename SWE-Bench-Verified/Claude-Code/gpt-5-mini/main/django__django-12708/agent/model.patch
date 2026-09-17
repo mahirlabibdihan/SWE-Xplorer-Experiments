@@ -1,0 +1,42 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index 61f88401ab..95b8582b63 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -407,6 +407,37 @@ class BaseDatabaseSchemaEditor:
+             model, columns, exclude=meta_constraint_names | meta_index_names,
+             **constraint_kwargs
+         )
++        # If more than one constraint name is found, try to disambiguate.
++        if len(constraint_names) != 1:
++            # Re-fetch full constraint metadata so we can prefer the correct one.
++            with self.connection.cursor() as cursor:
++                all_constraints = self.connection.introspection.get_constraints(
++                    cursor, model._meta.db_table
++                )
++            # If we're deleting an index, prefer a non-unique index (some DBs
++            # report unique constraints as indexed). If we're deleting a unique
++            # constraint, prefer the constraint that is marked unique.
++            preferred = []
++            if constraint_kwargs.get('index'):
++                for name in constraint_names:
++                    info = all_constraints.get(name, {})
++                    if not info.get('unique') and info.get('index'):
++                        preferred.append(name)
++            elif constraint_kwargs.get('unique'):
++                for name in constraint_names:
++                    info = all_constraints.get(name, {})
++                    if info.get('unique'):
++                        preferred.append(name)
++            # If disambiguation found exactly one, use it.
++            if len(preferred) == 1:
++                constraint_names = preferred
++            else:
++                # As a last resort, if there are multiple matches but one of
++                # them is not present in model meta (meaning it was created by
++                # the database for the composed declaration), prefer that one.
++                non_meta = [n for n in constraint_names if n not in meta_constraint_names and n not in meta_index_names]
++                if len(non_meta) == 1:
++                    constraint_names = non_meta
+         if len(constraint_names) != 1:
+             raise ValueError("Found wrong number (%s) of constraints for %s(%s)" % (
+                 len(constraint_names),

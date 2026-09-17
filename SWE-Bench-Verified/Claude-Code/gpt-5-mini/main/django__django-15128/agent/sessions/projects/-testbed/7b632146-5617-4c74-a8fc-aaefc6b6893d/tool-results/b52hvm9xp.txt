@@ -1,0 +1,761 @@
+            return alias, False
+
+        # Create a new alias for this table.
+        if alias_list:
+            alias = '%s%d' % (self.alias_prefix, len(self.alias_map) + 1)
+            alias_list.append(alias)
+        else:
+            # The first occurrence of a table uses the table name directly.
+            alias = filtered_relation.alias if filtered_relation is not None else table_name
+            self.table_map[table_name] = [alias]
+        self.alias_refcount[alias] = 1
+        return alias, True
+
+    def ref_alias(self, alias):
+        """Increases the reference count for this alias."""
+        self.alias_refcount[alias] += 1
+
+    def unref_alias(self, alias, amount=1):
+        """Decreases the reference count for this alias."""
+        self.alias_refcount[alias] -= amount
+
+    def promote_joins(self, aliases):
+        """
+        Promote recursively the join type of given aliases and its children to
+        an outer join. If 'unconditional' is False, only promote the join if
+        it is nullable or the parent join is an outer join.
+
+        The children promotion is done to avoid join chains that contain a LOUTER
+        b INNER c. So, if we have currently a INNER b INNER c and a->b is promoted,
+        then we must also promote b->c automatically, or otherwise the promotion
+        of a->b doesn't actually change anything in the query results.
+        """
+        aliases = list(aliases)
+        while aliases:
+            alias = aliases.pop(0)
+            if self.alias_map[alias].join_type is None:
+                # This is the base table (first FROM entry) - this table
+                # isn't really joined at all in the query, so we should not
+                # alter its join type.
+                continue
+            # Only the first alias (skipped above) should have None join_type
+            assert self.alias_map[alias].join_type is not None
+            parent_alias = self.alias_map[alias].parent_alias
+            parent_louter = parent_alias and self.alias_map[parent_alias].join_type == LOUTER
+            already_louter = self.alias_map[alias].join_type == LOUTER
+            if ((self.alias_map[alias].nullable or parent_louter) and
+                    not already_louter):
+                self.alias_map[alias] = self.alias_map[alias].promote()
+                # Join type of 'alias' changed, so re-examine all aliases that
+                # refer to this one.
+                aliases.extend(
+                    join for join in self.alias_map
+                    if self.alias_map[join].parent_alias == alias and join not in aliases
+                )
+
+    def demote_joins(self, aliases):
+        """
+        Change join type from LOUTER to INNER for all joins in aliases.
+
+        Similarly to promote_joins(), this method must ensure no join chains
+        containing first an outer, then an inner join are generated. If we
+        are demoting b->c join in chain a LOUTER b LOUTER c then we must
+        demote a->b automatically, or otherwise the demotion of b->c doesn't
+        actually change anything in the query results. .
+        """
+        aliases = list(aliases)
+        while aliases:
+            alias = aliases.pop(0)
+            if self.alias_map[alias].join_type == LOUTER:
+                self.alias_map[alias] = self.alias_map[alias].demote()
+                parent_alias = self.alias_map[alias].parent_alias
+                if self.alias_map[parent_alias].join_type == INNER:
+                    aliases.append(parent_alias)
+
+    def reset_refcounts(self, to_counts):
+        """
+        Reset reference counts for aliases so that they match the value passed
+        in `to_counts`.
+        """
+        for alias, cur_refcount in self.alias_refcount.copy().items():
+            unref_amount = cur_refcount - to_counts.get(alias, 0)
+            self.unref_alias(alias, unref_amount)
+
+    def change_aliases(self, change_map):
+        """
+        Change the aliases in change_map (which maps old-alias -> new-alias),
+        relabelling any references to them in select columns and the where
+        clause.
+        """
+        assert set(change_map).isdisjoint(change_map.values())
+
+        # 1. Update references in "select" (normal columns plus aliases),
+        # "group by" and "where".
+        self.where.relabel_aliases(change_map)
+        if isinstance(self.group_by, tuple):
+            self.group_by = tuple([col.relabeled_clone(change_map) for col in self.group_by])
+        self.select = tuple([col.relabeled_clone(change_map) for col in self.select])
+        self.annotations = self.annotations and {
+            key: col.relabeled_clone(change_map) for key, col in self.annotations.items()
+        }
+
+        # 2. Rename the alias in the internal table/alias datastructures.
+        for old_alias, new_alias in change_map.items():
+            if old_alias not in self.alias_map:
+                continue
+            alias_data = self.alias_map[old_alias].relabeled_clone(change_map)
+            self.alias_map[new_alias] = alias_data
+            self.alias_refcount[new_alias] = self.alias_refcount[old_alias]
+            del self.alias_refcount[old_alias]
+            del self.alias_map[old_alias]
+
+            table_aliases = self.table_map[alias_data.table_name]
+            for pos, alias in enumerate(table_aliases):
+                if alias == old_alias:
+                    table_aliases[pos] = new_alias
+                    break
+        self.external_aliases = {
+            # Table is aliased or it's being changed and thus is aliased.
+            change_map.get(alias, alias): (aliased or alias in change_map)
+            for alias, aliased in self.external_aliases.items()
+        }
+
+    def bump_prefix(self, outer_query):
+        """
+        Change the alias prefix to the next letter in the alphabet in a way
+        that the outer query's aliases and this query's aliases will not
+        conflict. Even tables that previously had no alias will get an alias
+        after this call.
+        """
+        def prefix_gen():
+            """
+            Generate a sequence of characters in alphabetical order:
+                -> 'A', 'B', 'C', ...
+
+            When the alphabet is finished, the sequence will continue with the
+            Cartesian product:
+                -> 'AA', 'AB', 'AC', ...
+            """
+            alphabet = ascii_uppercase
+            prefix = chr(ord(self.alias_prefix) + 1)
+            yield prefix
+            for n in count(1):
+                seq = alphabet[alphabet.index(prefix):] if prefix else alphabet
+                for s in product(seq, repeat=n):
+                    yield ''.join(s)
+                prefix = None
+
+        if self.alias_prefix != outer_query.alias_prefix:
+            # No clashes between self and outer query should be possible.
+            return
+
+        # Explicitly avoid infinite loop. The constant divider is based on how
+        # much depth recursive subquery references add to the stack. This value
+        # might need to be adjusted when adding or removing function calls from
+        # the code path in charge of performing these operations.
+        local_recursion_limit = sys.getrecursionlimit() // 16
+        for pos, prefix in enumerate(prefix_gen()):
+            if prefix not in self.subq_aliases:
+                self.alias_prefix = prefix
+                break
+            if pos > local_recursion_limit:
+                raise RecursionError(
+                    'Maximum recursion depth exceeded: too many subqueries.'
+                )
+        self.subq_aliases = self.subq_aliases.union([self.alias_prefix])
+        outer_query.subq_aliases = outer_query.subq_aliases.union(self.subq_aliases)
+        self.change_aliases({
+            alias: '%s%d' % (self.alias_prefix, pos)
+            for pos, alias in enumerate(self.alias_map)
+        })
+
+    def get_initial_alias(self):
+        """
+        Return the first alias for this query, after increasing its reference
+        count.
+        """
+        if self.alias_map:
+            alias = self.base_table
+            self.ref_alias(alias)
+        else:
+            alias = self.join(self.base_table_class(self.get_meta().db_table, None))
+        return alias
+
+    def count_active_tables(self):
+        """
+        Return the number of tables in this query with a non-zero reference
+        count. After execution, the reference counts are zeroed, so tables
+        added in compiler will not be seen by this method.
+        """
+        return len([1 for count in self.alias_refcount.values() if count])
+
+    def join(self, join, reuse=None):
+        """
+        Return an alias for the 'join', either reusing an existing alias for
+        that join or creating a new one. 'join' is either a base_table_class or
+        join_class.
+
+        The 'reuse' parameter can be either None which means all joins are
+        reusable, or it can be a set containing the aliases that can be reused.
+
+        A join is always created as LOUTER if the lhs alias is LOUTER to make
+        sure chains like t1 LOUTER t2 INNER t3 aren't generated. All new
+        joins are created as LOUTER if the join is nullable.
+        """
+        reuse_aliases = [
+            a for a, j in self.alias_map.items()
+            if (reuse is None or a in reuse) and j.equals(join)
+        ]
+        if reuse_aliases:
+            if join.table_alias in reuse_aliases:
+                reuse_alias = join.table_alias
+            else:
+                # Reuse the most recent alias of the joined table
+                # (a many-to-many relation may be joined multiple times).
+                reuse_alias = reuse_aliases[-1]
+            self.ref_alias(reuse_alias)
+            return reuse_alias
+
+        # No reuse is possible, so we need a new alias.
+        alias, _ = self.table_alias(join.table_name, create=True, filtered_relation=join.filtered_relation)
+        if join.join_type:
+            if self.alias_map[join.parent_alias].join_type == LOUTER or join.nullable:
+                join_type = LOUTER
+            else:
+                join_type = INNER
+            join.join_type = join_type
+        join.table_alias = alias
+        self.alias_map[alias] = join
+        return alias
+
+    def join_parent_model(self, opts, model, alias, seen):
+        """
+        Make sure the given 'model' is joined in the query. If 'model' isn't
+        a parent of 'opts' or if it is None this method is a no-op.
+
+        The 'alias' is the root alias for starting the join, 'seen' is a dict
+        of model -> alias of existing joins. It must also contain a mapping
+        of None -> some alias. This will be returned in the no-op case.
+        """
+        if model in seen:
+            return seen[model]
+        chain = opts.get_base_chain(model)
+        if not chain:
+            return alias
+        curr_opts = opts
+        for int_model in chain:
+            if int_model in seen:
+                curr_opts = int_model._meta
+                alias = seen[int_model]
+                continue
+            # Proxy model have elements in base chain
+            # with no parents, assign the new options
+            # object and skip to the next base in that
+            # case
+            if not curr_opts.parents[int_model]:
+                curr_opts = int_model._meta
+                continue
+            link_field = curr_opts.get_ancestor_link(int_model)
+            join_info = self.setup_joins([link_field.name], curr_opts, alias)
+            curr_opts = int_model._meta
+            alias = seen[int_model] = join_info.joins[-1]
+        return alias or seen[None]
+
+    def add_annotation(self, annotation, alias, is_summary=False, select=True):
+        """Add a single annotation expression to the Query."""
+        annotation = annotation.resolve_expression(self, allow_joins=True, reuse=None,
+                                                   summarize=is_summary)
+        if select:
+            self.append_annotation_mask([alias])
+        else:
+            self.set_annotation_mask(set(self.annotation_select).difference({alias}))
+        self.annotations[alias] = annotation
+
+    def resolve_expression(self, query, *args, **kwargs):
+        clone = self.clone()
+        # Subqueries need to use a different set of aliases than the outer query.
+        clone.bump_prefix(query)
+        clone.subquery = True
+        clone.where.resolve_expression(query, *args, **kwargs)
+        for key, value in clone.annotations.items():
+            resolved = value.resolve_expression(query, *args, **kwargs)
+            if hasattr(resolved, 'external_aliases'):
+                resolved.external_aliases.update(clone.external_aliases)
+            clone.annotations[key] = resolved
+        # Outer query's aliases are considered external.
+        for alias, table in query.alias_map.items():
+            clone.external_aliases[alias] = (
+                (isinstance(table, Join) and table.join_field.related_model._meta.db_table != alias) or
+                (isinstance(table, BaseTable) and table.table_name != table.table_alias)
+            )
+        return clone
+
+    def get_external_cols(self):
+        exprs = chain(self.annotations.values(), self.where.children)
+        return [
+            col for col in self._gen_cols(exprs, include_external=True)
+            if col.alias in self.external_aliases
+        ]
+
+    def get_group_by_cols(self, alias=None):
+        if alias:
+            return [Ref(alias, self)]
+        external_cols = self.get_external_cols()
+        if any(col.possibly_multivalued for col in external_cols):
+            return [self]
+        return external_cols
+
+    def as_sql(self, compiler, connection):
+        # Some backends (e.g. Oracle) raise an error when a subquery contains
+        # unnecessary ORDER BY clause.
+        if (
+            self.subquery and
+            not connection.features.ignores_unnecessary_order_by_in_subqueries
+        ):
+            self.clear_ordering(force=False)
+        sql, params = self.get_compiler(connection=connection).as_sql()
+        if self.subquery:
+            sql = '(%s)' % sql
+        return sql, params
+
+    def resolve_lookup_value(self, value, can_reuse, allow_joins):
+        if hasattr(value, 'resolve_expression'):
+            value = value.resolve_expression(
+                self, reuse=can_reuse, allow_joins=allow_joins,
+            )
+        elif isinstance(value, (list, tuple)):
+            # The items of the iterable may be expressions and therefore need
+            # to be resolved independently.
+            values = (
+                self.resolve_lookup_value(sub_value, can_reuse, allow_joins)
+                for sub_value in value
+            )
+            type_ = type(value)
+            if hasattr(type_, '_make'):  # namedtuple
+                return type_(*values)
+            return type_(values)
+        return value
+
+    def solve_lookup_type(self, lookup):
+        """
+        Solve the lookup type from the lookup (e.g.: 'foobar__id__icontains').
+        """
+        lookup_splitted = lookup.split(LOOKUP_SEP)
+        if self.annotations:
+            expression, expression_lookups = refs_expression(lookup_splitted, self.annotations)
+            if expression:
+                return expression_lookups, (), expression
+        _, field, _, lookup_parts = self.names_to_path(lookup_splitted, self.get_meta())
+        field_parts = lookup_splitted[0:len(lookup_splitted) - len(lookup_parts)]
+        if len(lookup_parts) > 1 and not field_parts:
+            raise FieldError(
+                'Invalid lookup "%s" for model %s".' %
+                (lookup, self.get_meta().model.__name__)
+            )
+        return lookup_parts, field_parts, False
+
+    def check_query_object_type(self, value, opts, field):
+        """
+        Check whether the object passed while querying is of the correct type.
+        If not, raise a ValueError specifying the wrong object.
+        """
+        if hasattr(value, '_meta'):
+            if not check_rel_lookup_compatibility(value._meta.model, opts, field):
+                raise ValueError(
+                    'Cannot query "%s": Must be "%s" instance.' %
+                    (value, opts.object_name))
+
+    def check_related_objects(self, field, value, opts):
+        """Check the type of object passed to query relations."""
+        if field.is_relation:
+            # Check that the field and the queryset use the same model in a
+            # query like .filter(author=Author.objects.all()). For example, the
+            # opts would be Author's (from the author field) and value.model
+            # would be Author.objects.all() queryset's .model (Author also).
+            # The field is the related field on the lhs side.
+            if (isinstance(value, Query) and not value.has_select_fields and
+                    not check_rel_lookup_compatibility(value.model, opts, field)):
+                raise ValueError(
+                    'Cannot use QuerySet for "%s": Use a QuerySet for "%s".' %
+                    (value.model._meta.object_name, opts.object_name)
+                )
+            elif hasattr(value, '_meta'):
+                self.check_query_object_type(value, opts, field)
+            elif hasattr(value, '__iter__'):
+                for v in value:
+                    self.check_query_object_type(v, opts, field)
+
+    def check_filterable(self, expression):
+        """Raise an error if expression cannot be used in a WHERE clause."""
+        if (
+            hasattr(expression, 'resolve_expression') and
+            not getattr(expression, 'filterable', True)
+        ):
+            raise NotSupportedError(
+                expression.__class__.__name__ + ' is disallowed in the filter '
+                'clause.'
+            )
+        if hasattr(expression, 'get_source_expressions'):
+            for expr in expression.get_source_expressions():
+                self.check_filterable(expr)
+
+    def build_lookup(self, lookups, lhs, rhs):
+        """
+        Try to extract transforms and lookup from given lhs.
+
+        The lhs value is something that works like SQLExpression.
+        The rhs value is what the lookup is going to compare against.
+        The lookups is a list of names to extract using get_lookup()
+        and get_transform().
+        """
+        # __exact is the default lookup if one isn't given.
+        *transforms, lookup_name = lookups or ['exact']
+        for name in transforms:
+            lhs = self.try_transform(lhs, name)
+        # First try get_lookup() so that the lookup takes precedence if the lhs
+        # supports both transform and lookup for the name.
+        lookup_class = lhs.get_lookup(lookup_name)
+        if not lookup_class:
+            if lhs.field.is_relation:
+                raise FieldError('Related Field got invalid lookup: {}'.format(lookup_name))
+            # A lookup wasn't found. Try to interpret the name as a transform
+            # and do an Exact lookup against it.
+            lhs = self.try_transform(lhs, lookup_name)
+            lookup_name = 'exact'
+            lookup_class = lhs.get_lookup(lookup_name)
+            if not lookup_class:
+                return
+
+        lookup = lookup_class(lhs, rhs)
+        # Interpret '__exact=None' as the sql 'is NULL'; otherwise, reject all
+        # uses of None as a query value unless the lookup supports it.
+        if lookup.rhs is None and not lookup.can_use_none_as_rhs:
+            if lookup_name not in ('exact', 'iexact'):
+                raise ValueError("Cannot use None as a query value")
+            return lhs.get_lookup('isnull')(lhs, True)
+
+        # For Oracle '' is equivalent to null. The check must be done at this
+        # stage because join promotion can't be done in the compiler. Using
+        # DEFAULT_DB_ALIAS isn't nice but it's the best that can be done here.
+        # A similar thing is done in is_nullable(), too.
+        if (
+            lookup_name == 'exact' and
+            lookup.rhs == '' and
+            connections[DEFAULT_DB_ALIAS].features.interprets_empty_strings_as_nulls
+        ):
+            return lhs.get_lookup('isnull')(lhs, True)
+
+        return lookup
+
+    def try_transform(self, lhs, name):
+        """
+        Helper method for build_lookup(). Try to fetch and initialize
+        a transform for name parameter from lhs.
+        """
+        transform_class = lhs.get_transform(name)
+        if transform_class:
+            return transform_class(lhs)
+        else:
+            output_field = lhs.output_field.__class__
+            suggested_lookups = difflib.get_close_matches(name, output_field.get_lookups())
+            if suggested_lookups:
+                suggestion = ', perhaps you meant %s?' % ' or '.join(suggested_lookups)
+            else:
+                suggestion = '.'
+            raise FieldError(
+                "Unsupported lookup '%s' for %s or join on the field not "
+                "permitted%s" % (name, output_field.__name__, suggestion)
+            )
+
+    def build_filter(self, filter_expr, branch_negated=False, current_negated=False,
+                     can_reuse=None, allow_joins=True, split_subq=True,
+                     check_filterable=True):
+        """
+        Build a WhereNode for a single filter clause but don't add it
+        to this Query. Query.add_q() will then add this filter to the where
+        Node.
+
+        The 'branch_negated' tells us if the current branch contains any
+        negations. This will be used to determine if subqueries are needed.
+
+        The 'current_negated' is used to determine if the current filter is
+        negated or not and this will be used to determine if IS NULL filtering
+        is needed.
+
+        The difference between current_negated and branch_negated is that
+        branch_negated is set on first negation, but current_negated is
+        flipped for each negation.
+
+        Note that add_filter will not do any negating itself, that is done
+        upper in the code by add_q().
+
+        The 'can_reuse' is a set of reusable joins for multijoins.
+
+        The method will create a filter clause that can be added to the current
+        query. However, if the filter isn't added to the query then the caller
+        is responsible for unreffing the joins used.
+        """
+        if isinstance(filter_expr, dict):
+            raise FieldError("Cannot parse keyword query as dict")
+        if isinstance(filter_expr, Q):
+            return self._add_q(
+                filter_expr,
+                branch_negated=branch_negated,
+                current_negated=current_negated,
+                used_aliases=can_reuse,
+                allow_joins=allow_joins,
+                split_subq=split_subq,
+                check_filterable=check_filterable,
+            )
+        if hasattr(filter_expr, 'resolve_expression'):
+            if not getattr(filter_expr, 'conditional', False):
+                raise TypeError('Cannot filter against a non-conditional expression.')
+            condition = filter_expr.resolve_expression(self, allow_joins=allow_joins)
+            if not isinstance(condition, Lookup):
+                condition = self.build_lookup(['exact'], condition, True)
+            return WhereNode([condition], connector=AND), []
+        arg, value = filter_expr
+        if not arg:
+            raise FieldError("Cannot parse keyword query %r" % arg)
+        lookups, parts, reffed_expression = self.solve_lookup_type(arg)
+
+        if check_filterable:
+            self.check_filterable(reffed_expression)
+
+        if not allow_joins and len(parts) > 1:
+            raise FieldError("Joined field references are not permitted in this query")
+
+        pre_joins = self.alias_refcount.copy()
+        value = self.resolve_lookup_value(value, can_reuse, allow_joins)
+        used_joins = {k for k, v in self.alias_refcount.items() if v > pre_joins.get(k, 0)}
+
+        if check_filterable:
+            self.check_filterable(value)
+
+        if reffed_expression:
+            condition = self.build_lookup(lookups, reffed_expression, value)
+            return WhereNode([condition], connector=AND), []
+
+        opts = self.get_meta()
+        alias = self.get_initial_alias()
+        allow_many = not branch_negated or not split_subq
+
+        try:
+            join_info = self.setup_joins(
+                parts, opts, alias, can_reuse=can_reuse, allow_many=allow_many,
+            )
+
+            # Prevent iterator from being consumed by check_related_objects()
+            if isinstance(value, Iterator):
+                value = list(value)
+            self.check_related_objects(join_info.final_field, value, join_info.opts)
+
+            # split_exclude() needs to know which joins were generated for the
+            # lookup parts
+            self._lookup_joins = join_info.joins
+        except MultiJoin as e:
+            return self.split_exclude(filter_expr, can_reuse, e.names_with_path)
+
+        # Update used_joins before trimming since they are reused to determine
+        # which joins could be later promoted to INNER.
+        used_joins.update(join_info.joins)
+        targets, alias, join_list = self.trim_joins(join_info.targets, join_info.joins, join_info.path)
+        if can_reuse is not None:
+            can_reuse.update(join_list)
+
+        if join_info.final_field.is_relation:
+            # No support for transforms for relational fields
+            num_lookups = len(lookups)
+            if num_lookups > 1:
+                raise FieldError('Related Field got invalid lookup: {}'.format(lookups[0]))
+            if len(targets) == 1:
+                col = self._get_col(targets[0], join_info.final_field, alias)
+            else:
+                col = MultiColSource(alias, targets, join_info.targets, join_info.final_field)
+        else:
+            col = self._get_col(targets[0], join_info.final_field, alias)
+
+        condition = self.build_lookup(lookups, col, value)
+        lookup_type = condition.lookup_name
+        clause = WhereNode([condition], connector=AND)
+
+        require_outer = lookup_type == 'isnull' and condition.rhs is True and not current_negated
+        if current_negated and (lookup_type != 'isnull' or condition.rhs is False) and condition.rhs is not None:
+            require_outer = True
+            if lookup_type != 'isnull':
+                # The condition added here will be SQL like this:
+                # NOT (col IS NOT NULL), where the first NOT is added in
+                # upper layers of code. The reason for addition is that if col
+                # is null, then col != someval will result in SQL "unknown"
+                # which isn't the same as in Python. The Python None handling
+                # is wanted, and it can be gotten by
+                # (col IS NULL OR col != someval)
+                #   <=>
+                # NOT (col IS NOT NULL AND col = someval).
+                if (
+                    self.is_nullable(targets[0]) or
+                    self.alias_map[join_list[-1]].join_type == LOUTER
+                ):
+                    lookup_class = targets[0].get_lookup('isnull')
+                    col = self._get_col(targets[0], join_info.targets[0], alias)
+                    clause.add(lookup_class(col, False), AND)
+                # If someval is a nullable column, someval IS NOT NULL is
+                # added.
+                if isinstance(value, Col) and self.is_nullable(value.target):
+                    lookup_class = value.target.get_lookup('isnull')
+                    clause.add(lookup_class(value, False), AND)
+        return clause, used_joins if not require_outer else ()
+
+    def add_filter(self, filter_lhs, filter_rhs):
+        self.add_q(Q((filter_lhs, filter_rhs)))
+
+    def add_q(self, q_object):
+        """
+        A preprocessor for the internal _add_q(). Responsible for doing final
+        join promotion.
+        """
+        # For join promotion this case is doing an AND for the added q_object
+        # and existing conditions. So, any existing inner join forces the join
+        # type to remain inner. Existing outer joins can however be demoted.
+        # (Consider case where rel_a is LOUTER and rel_a__col=1 is added - if
+        # rel_a doesn't produce any rows, then the whole condition must fail.
+        # So, demotion is OK.
+        existing_inner = {a for a in self.alias_map if self.alias_map[a].join_type == INNER}
+        clause, _ = self._add_q(q_object, self.used_aliases)
+        if clause:
+            self.where.add(clause, AND)
+        self.demote_joins(existing_inner)
+
+    def build_where(self, filter_expr):
+        return self.build_filter(filter_expr, allow_joins=False)[0]
+
+    def clear_where(self):
+        self.where = WhereNode()
+
+    def _add_q(self, q_object, used_aliases, branch_negated=False,
+               current_negated=False, allow_joins=True, split_subq=True,
+               check_filterable=True):
+        """Add a Q-object to the current filter."""
+        connector = q_object.connector
+        current_negated = current_negated ^ q_object.negated
+        branch_negated = branch_negated or q_object.negated
+        target_clause = WhereNode(connector=connector, negated=q_object.negated)
+        joinpromoter = JoinPromoter(q_object.connector, len(q_object.children), current_negated)
+        for child in q_object.children:
+            child_clause, needed_inner = self.build_filter(
+                child, can_reuse=used_aliases, branch_negated=branch_negated,
+                current_negated=current_negated, allow_joins=allow_joins,
+                split_subq=split_subq, check_filterable=check_filterable,
+            )
+            joinpromoter.add_votes(needed_inner)
+            if child_clause:
+                target_clause.add(child_clause, connector)
+        needed_inner = joinpromoter.update_join_types(self)
+        return target_clause, needed_inner
+
+    def build_filtered_relation_q(self, q_object, reuse, branch_negated=False, current_negated=False):
+        """Add a FilteredRelation object to the current filter."""
+        connector = q_object.connector
+        current_negated ^= q_object.negated
+        branch_negated = branch_negated or q_object.negated
+        target_clause = WhereNode(connector=connector, negated=q_object.negated)
+        for child in q_object.children:
+            if isinstance(child, Node):
+                child_clause = self.build_filtered_relation_q(
+                    child, reuse=reuse, branch_negated=branch_negated,
+                    current_negated=current_negated,
+                )
+            else:
+                child_clause, _ = self.build_filter(
+                    child, can_reuse=reuse, branch_negated=branch_negated,
+                    current_negated=current_negated,
+                    allow_joins=True, split_subq=False,
+                )
+            target_clause.add(child_clause, connector)
+        return target_clause
+
+    def add_filtered_relation(self, filtered_relation, alias):
+        filtered_relation.alias = alias
+        lookups = dict(get_children_from_q(filtered_relation.condition))
+        relation_lookup_parts, relation_field_parts, _ = self.solve_lookup_type(filtered_relation.relation_name)
+        if relation_lookup_parts:
+            raise ValueError(
+                "FilteredRelation's relation_name cannot contain lookups "
+                "(got %r)." % filtered_relation.relation_name
+            )
+        for lookup in chain(lookups):
+            lookup_parts, lookup_field_parts, _ = self.solve_lookup_type(lookup)
+            shift = 2 if not lookup_parts else 1
+            lookup_field_path = lookup_field_parts[:-shift]
+            for idx, lookup_field_part in enumerate(lookup_field_path):
+                if len(relation_field_parts) > idx:
+                    if relation_field_parts[idx] != lookup_field_part:
+                        raise ValueError(
+                            "FilteredRelation's condition doesn't support "
+                            "relations outside the %r (got %r)."
+                            % (filtered_relation.relation_name, lookup)
+                        )
+                else:
+                    raise ValueError(
+                        "FilteredRelation's condition doesn't support nested "
+                        "relations deeper than the relation_name (got %r for "
+                        "%r)." % (lookup, filtered_relation.relation_name)
+                    )
+        self._filtered_relations[filtered_relation.alias] = filtered_relation
+
+    def names_to_path(self, names, opts, allow_many=True, fail_on_missing=False):
+        """
+        Walk the list of names and turns them into PathInfo tuples. A single
+        name in 'names' can generate multiple PathInfos (m2m, for example).
+
+        'names' is the path of names to travel, 'opts' is the model Options we
+        start the name resolving from, 'allow_many' is as for setup_joins().
+        If fail_on_missing is set to True, then a name that can't be resolved
+        will generate a FieldError.
+
+        Return a list of PathInfo tuples. In addition return the final field
+        (the last used join field) and target (which is a field guaranteed to
+        contain the same value as the final field). Finally, return those names
+        that weren't found (which are likely transforms and the final lookup).
+        """
+        path, names_with_path = [], []
+        for pos, name in enumerate(names):
+            cur_names_with_path = (name, [])
+            if name == 'pk':
+                name = opts.pk.name
+
+            field = None
+            filtered_relation = None
+            try:
+                field = opts.get_field(name)
+            except FieldDoesNotExist:
+                if name in self.annotation_select:
+                    field = self.annotation_select[name].output_field
+                elif name in self._filtered_relations and pos == 0:
+                    filtered_relation = self._filtered_relations[name]
+                    if LOOKUP_SEP in filtered_relation.relation_name:
+                        parts = filtered_relation.relation_name.split(LOOKUP_SEP)
+                        filtered_relation_path, field, _, _ = self.names_to_path(
+                            parts, opts, allow_many, fail_on_missing,
+                        )
+                        path.extend(filtered_relation_path[:-1])
+                    else:
+                        field = opts.get_field(filtered_relation.relation_name)
+            if field is not None:
+                # Fields that contain one-to-many relations with a generic
+                # model (like a GenericForeignKey) cannot generate reverse
+                # relations and therefore cannot be used for reverse querying.
+                if field.is_relation and not field.related_model:
+                    raise FieldError(
+                        "Field %r does not generate an automatic reverse "
+                        "relation and therefore cannot be used for reverse "
+                        "querying. If it is a GenericForeignKey, consider "
+                        "adding a GenericRelation." % name
+                    )
+                try:
+                    model = field.model._meta.concrete_model
+                except AttributeError:
+                    # QuerySet.annotate() may introduce fields that aren't
+                    # attached to a model.
+                    model = None
+            else:

@@ -1,0 +1,62 @@
+diff --git a/django/db/backends/postgresql/client.py b/django/db/backends/postgresql/client.py
+index cf4df76882..679cc64d8d 100644
+--- a/django/db/backends/postgresql/client.py
++++ b/django/db/backends/postgresql/client.py
+@@ -30,6 +30,22 @@ class DatabaseClient(BaseDatabaseClient):
+         subprocess_env = os.environ.copy()
+         if passwd:
+             subprocess_env['PGPASSWORD'] = str(passwd)
++
++        # Support SSL client certificates and keys by propagating common
++        # libpq environment variables when provided in the connection
++        # parameters. These can be set via DATABASES['OPTIONS'] in
++        # settings (see ticket #<ref>).
++        ssl_mappings = {
++            'sslmode': 'PGSSLMODE',
++            'sslrootcert': 'PGSSLROOTCERT',
++            'sslcert': 'PGSSLCERT',
++            'sslkey': 'PGSSLKEY',
++        }
++        for param_key, env_key in ssl_mappings.items():
++            val = conn_params.get(param_key)
++            if val:
++                subprocess_env[env_key] = str(val)
++
+         try:
+             # Allow SIGINT to pass to psql to abort queries.
+             signal.signal(signal.SIGINT, signal.SIG_IGN)
+diff --git a/tests/dbshell/test_postgresql.py b/tests/dbshell/test_postgresql.py
+index a33e7f6482..b77ed1d600 100644
+--- a/tests/dbshell/test_postgresql.py
++++ b/tests/dbshell/test_postgresql.py
+@@ -18,6 +18,7 @@ class PostgreSqlDbshellCommandTestCase(SimpleTestCase):
+         """
+         def _mock_subprocess_run(*args, env=os.environ, **kwargs):
+             self.subprocess_args = list(*args)
++            self.subprocess_env = env
+             self.pgpassword = env.get('PGPASSWORD')
+             return subprocess.CompletedProcess(self.subprocess_args, 0)
+         with mock.patch('subprocess.run', new=_mock_subprocess_run):
+@@ -94,3 +95,22 @@ class PostgreSqlDbshellCommandTestCase(SimpleTestCase):
+             DatabaseClient.runshell_db({})
+         # dbshell restores the original handler.
+         self.assertEqual(sigint_handler, signal.getsignal(signal.SIGINT))
++
++    def test_ssl_env_vars_are_set_from_options(self):
++        args, env = self._run_it({
++            'database': 'dbname',
++            'user': 'someuser',
++            'password': 'somepassword',
++            'host': 'somehost',
++            'port': '444',
++            'sslmode': 'verify-ca',
++            'sslrootcert': '/path/to/ca.crt',
++            'sslcert': '/path/to/client.crt',
++            'sslkey': '/path/to/client.key',
++        })
++        self.assertEqual(env.get('PGSSLMODE'), 'verify-ca')
++        self.assertEqual(env.get('PGSSLROOTCERT'), '/path/to/ca.crt')
++        self.assertEqual(env.get('PGSSLCERT'), '/path/to/client.crt')
++        self.assertEqual(env.get('PGSSLKEY'), '/path/to/client.key')
++        self.assertEqual(args, ['psql', '-U', 'someuser', '-h', 'somehost', '-p', '444', 'dbname'])
++

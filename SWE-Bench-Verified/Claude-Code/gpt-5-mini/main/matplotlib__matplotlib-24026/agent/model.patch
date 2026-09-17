@@ -1,0 +1,83 @@
+diff --git a/lib/matplotlib/stackplot.py b/lib/matplotlib/stackplot.py
+index c580043eeb..717ec292e3 100644
+--- a/lib/matplotlib/stackplot.py
++++ b/lib/matplotlib/stackplot.py
+@@ -7,6 +7,10 @@ https://stackoverflow.com/q/2225995/
+ """
+ 
+ import numpy as np
++import re
++import itertools
++
++from cycler import Cycler
+ 
+ from matplotlib import _api
+ 
+@@ -69,8 +73,43 @@ def stackplot(axes, x, *args,
+     y = np.row_stack(args)
+ 
+     labels = iter(labels)
++
++    # Prepare color selection. We must not mutate the Axes prop cycle when
++    # given color references like 'C2' (the 'C' style cycle references).
++    # Calling ``axes.set_prop_cycle(color=colors)`` with items such as
++    # 'C2' fails the prop-cycle validator. Instead, resolve any 'C#'
++    # references to concrete colors from the current axes prop_cycle and
++    # use those colors locally for the PolyCollections. If the user passes a
++    # Cycler instance, fall back to set_prop_cycle to preserve expected
++    # behaviour for full cyclers.
++    color_iter = None
+     if colors is not None:
+-        axes.set_prop_cycle(color=colors)
++        if isinstance(colors, Cycler):
++            # A full cycler was provided; use it to set the axes prop cycle
++            # so other artists (and subsequent calls) behave as expected.
++            axes.set_prop_cycle(colors)
++        else:
++            # Resolve 'C#' references against the current axes color cycle,
++            # otherwise keep the provided color as-is. Then create a cyclic
++            # iterator to draw colors from without touching the axes state.
++            try:
++                prop_colors = axes._get_lines.prop_cycler.by_key().get('color', None)
++            except Exception:
++                prop_colors = None
++
++            resolved = []
++            for c in colors:
++                if isinstance(c, str):
++                    m = re.match(r"^C(\\d+)$", c)
++                    if m and prop_colors:
++                        idx = int(m.group(1)) % len(prop_colors)
++                        resolved.append(prop_colors[idx])
++                    else:
++                        resolved.append(c)
++                else:
++                    resolved.append(c)
++
++            color_iter = itertools.cycle(resolved)
+ 
+     # Assume data passed has not been 'stacked', so stack it here.
+     # We'll need a float buffer for the upcoming calculations.
+@@ -107,8 +146,11 @@ def stackplot(axes, x, *args,
+         first_line = center - 0.5 * total
+         stack += first_line
+ 
+-    # Color between x = 0 and the first array.
+-    color = axes._get_lines.get_next_color()
++    # Color between x = 0 and the first array. Get the color either from the
++    # local resolved iterator (if provided) or from the axes line color
++    # generator. Using a local iterator avoids changing the Axes prop cycle,
++    # which keeps colors synchronized across different plot types.
++    color = next(color_iter) if color_iter is not None else axes._get_lines.get_next_color()
+     coll = axes.fill_between(x, first_line, stack[0, :],
+                              facecolor=color, label=next(labels, None),
+                              **kwargs)
+@@ -117,7 +159,7 @@ def stackplot(axes, x, *args,
+ 
+     # Color between array i-1 and array i
+     for i in range(len(y) - 1):
+-        color = axes._get_lines.get_next_color()
++        color = next(color_iter) if color_iter is not None else axes._get_lines.get_next_color()
+         r.append(axes.fill_between(x, stack[i, :], stack[i + 1, :],
+                                    facecolor=color, label=next(labels, None),
+                                    **kwargs))

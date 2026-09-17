@@ -1,0 +1,78 @@
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..9dbca9d09 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -55,11 +55,71 @@ def _wrap_in_pandas_container(
+     if isinstance(data_to_wrap, pd.DataFrame):
+         if columns is not None:
+             data_to_wrap.columns = columns
++        # Only set the index if it matches the length of the output.
++        # Some transformers (for example aggregations) may return a
++        # DataFrame whose number of rows does not match the original
++        # input. In that case, we should not overwrite the transformer's
++        # own index as it would raise a length mismatch error.
+         if index is not None:
+-            data_to_wrap.index = index
++            try:
++                if len(index) == data_to_wrap.shape[0]:
++                    data_to_wrap.index = index
++            except Exception:
++                # If we cannot determine lengths for some reason, fall
++                # back to leaving the transformer's index unchanged.
++                pass
+         return data_to_wrap
+ 
+-    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    # For non-DataFrame outputs (ndarray, Series, list, ...), only pass
++    # index/columns to the DataFrame constructor when their lengths match
++    # the shape of the produced data. This avoids ValueError when a
++    # transformer returns aggregated results with a different number of
++    # rows than the original input.
++    #
++    # Determine number of rows and columns when possible.
++    n_rows = None
++    n_cols = None
++    try:
++        # pandas Series/ndarray have a shape attribute
++        shape = getattr(data_to_wrap, "shape", None)
++        if shape is not None:
++            if len(shape) >= 1:
++                n_rows = shape[0]
++            # If shape is 1D, then the output will have a single column when
++            # converted to a DataFrame, so set n_cols = 1 in that case. If
++            # shape is 2D or higher, set n_cols accordingly.
++            if len(shape) == 1:
++                n_cols = 1
++            elif len(shape) >= 2:
++                n_cols = shape[1]
++    except Exception:
++        n_rows = None
++        n_cols = None
++
++    df_kwargs = {}
++    if index is not None:
++        try:
++            if n_rows is None or len(index) == n_rows:
++                df_kwargs["index"] = index
++        except Exception:
++            # If comparing lengths fails, do not pass index
++            pass
++
++    if columns is not None:
++        try:
++            # If we can determine n_cols and columns length mismatch, avoid
++            # passing columns to prevent pandas raising an error. Otherwise
++            # include columns.
++            if n_cols is None:
++                df_kwargs["columns"] = columns
++            else:
++                if hasattr(columns, "__len__") and len(columns) == n_cols:
++                    df_kwargs["columns"] = columns
++        except Exception:
++            # If anything goes wrong, omit columns and let pandas infer.
++            pass
++
++    return pd.DataFrame(data_to_wrap, **df_kwargs)
+ 
+ 
+ def _get_output_config(method, estimator=None):

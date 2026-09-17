@@ -1,0 +1,55 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index ee45bb941e..6db2127b7d 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -763,8 +763,16 @@ class Field(RegisterLookupMixin):
+             if not getattr(cls, self.attname, None):
+                 setattr(cls, self.attname, self.descriptor_class(self))
+         if self.choices is not None:
+-            setattr(cls, 'get_%s_display' % self.name,
+-                    partialmethod(cls._get_FIELD_display, field=self))
++            # Only set a default get_<field>_display on the model class if the
++            # class (or any of its bases) does not already provide one. This
++            # allows model authors to override get_<field>_display() on their
++            # models. See #<issue> — older Django versions allowed overriding
++            # this method; in 2.2+ a plain setattr unconditionally replaced a
++            # user-defined method.
++            method_name = 'get_%s_display' % self.name
++            if not hasattr(cls, method_name):
++                setattr(cls, method_name,
++                        partialmethod(cls._get_FIELD_display, field=self))
+ 
+     def get_filter_kwargs_for_object(self, obj):
+         """
+diff --git a/tests/model_fields/test_override_get_field_display.py b/tests/model_fields/test_override_get_field_display.py
+new file mode 100644
+index 0000000000..7233bf6ff2
+--- /dev/null
++++ b/tests/model_fields/test_override_get_field_display.py
+@@ -0,0 +1,26 @@
++from django.db import models
++from django.test import SimpleTestCase
++from django.test.utils import isolate_apps
++
++
++@isolate_apps('model_field_override')
++class GetFieldDisplayOverrideTests(SimpleTestCase):
++
++    def test_override_get_FIELD_display(self):
++        """
++        A model-defined get_<field>_display() should override the default
++        generated method provided by Field.contribute_to_class().
++        """
++        attrs = {
++            'c': models.IntegerField(choices=[(1, 'One'), (2, 'Two')]),
++            '__module__': 'model_field_override',
++        }
++
++        def get_c_display(self):
++            return 'overridden'
++
++        attrs['get_c_display'] = get_c_display
++        TestModel = type('TestModel', (models.Model,), attrs)
++        obj = TestModel(c=1)
++        self.assertTrue(hasattr(TestModel, 'get_c_display'))
++        self.assertEqual(obj.get_c_display(), 'overridden')

@@ -1,0 +1,98 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index be0deb90b0..8226a6e29d 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -2448,6 +2448,23 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+     # The 'values to be matched' must be hashable as they will be used
+     # in a dictionary.
+ 
++    # Allow prefetch() to accept sliced querysets by temporarily clearing
++    # their limits before passing them to get_prefetch_queryset(), then
++    # re-applying the limits to the returned related queryset. Some
++    # get_prefetch_queryset() implementations will call filter() on the
++    # provided queryset which raises if the query has been sliced. See
++    # ticket: prefetched sliced querysets should not cause a TypeError.
++    user_qs = lookup.get_current_queryset(level)
++    orig_low = orig_high = None
++    qs_to_pass = user_qs
++    if user_qs is not None and getattr(user_qs, "query", None) is not None and user_qs.query.is_sliced:
++        # Record the original absolute limits and pass a clone with limits
++        # cleared so filters can be applied safely.
++        orig_low = user_qs.query.low_mark
++        orig_high = user_qs.query.high_mark
++        qs_to_pass = user_qs._chain()
++        qs_to_pass.query.clear_limits()
++
+     (
+         rel_qs,
+         rel_obj_attr,
+@@ -2455,7 +2472,19 @@ def prefetch_one_level(instances, prefetcher, lookup, level):
+         single,
+         cache_name,
+         is_descriptor,
+-    ) = prefetcher.get_prefetch_queryset(instances, lookup.get_current_queryset(level))
++    ) = prefetcher.get_prefetch_queryset(instances, qs_to_pass)
++
++    # Re-apply the original limits, if any, to the returned related
++    # queryset so the user's slice semantics are preserved.
++    if orig_low is not None or orig_high is not None:
++        try:
++            if rel_qs is not None and getattr(rel_qs, "query", None) is not None:
++                rel_qs.query.low_mark = orig_low
++                rel_qs.query.high_mark = orig_high
++        except Exception:
++            # If anything goes wrong while restoring limits, fall back to
++            # leaving rel_qs unchanged rather than failing the prefetch.
++            pass
+     # We have to handle the possibility that the QuerySet we just got back
+     # contains some prefetch_related lookups. We don't want to trigger the
+     # prefetch_related functionality by evaluating the query. Rather, we need
+diff --git a/tests/prefetch_related/test_prefetch_related_objects.py b/tests/prefetch_related/test_prefetch_related_objects.py
+index ca1f904c52..8d902204f7 100644
+--- a/tests/prefetch_related/test_prefetch_related_objects.py
++++ b/tests/prefetch_related/test_prefetch_related_objects.py
+@@ -141,6 +141,44 @@ class PrefetchRelatedObjectsTests(TestCase):
+             self.assertCountEqual(book2.the_authors, [self.author1])
+ 
+     def test_prefetch_queryset(self):
++        pass
++
++    def test_prefetch_sliced_queryset(self):
++        """Prefetch should accept a sliced queryset without raising a TypeError.
++
++        Regression test for allowing Prefetch(queryset=sliced_qs) where the
++        provided queryset has limits applied (slice). Historically, calling
++        filter() on a sliced queryset raised a TypeError. Ensure prefetch
++        works and returns only the sliced results.
++        """
++        book1 = Book.objects.get(id=self.book1.id)
++        # Use an explicit order so the slice is deterministic.
++        sliced_qs = Author.objects.order_by('id')[:2]
++        with self.assertNumQueries(1):
++            # Should not raise
++            prefetch_related_objects([book1], Prefetch("authors", queryset=sliced_qs))
++
++        with self.assertNumQueries(0):
++            # The prefetch should have limited the related authors to the slice
++            self.assertCountEqual(book1.authors.all(), [self.author1, self.author2])
++
++    def test_prefetch_queryset(self):
++        # original test kept for compatibility (moved below)
++        book1 = Book.objects.get(id=self.book1.id)
++        with self.assertNumQueries(1):
++            prefetch_related_objects(
++                [book1],
++                Prefetch(
++                    "authors",
++                    queryset=Author.objects.filter(
++                        id__in=[self.author1.id, self.author2.id]
++                    ),
++                ),
++            )
++
++        with self.assertNumQueries(0):
++            self.assertCountEqual(book1.authors.all(), [self.author1, self.author2])
++
+         book1 = Book.objects.get(id=self.book1.id)
+         with self.assertNumQueries(1):
+             prefetch_related_objects(

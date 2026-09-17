@@ -1,0 +1,106 @@
+diff --git a/pylint/utils/utils.py b/pylint/utils/utils.py
+index fa7f7b92f..d7ba7d184 100644
+--- a/pylint/utils/utils.py
++++ b/pylint/utils/utils.py
+@@ -229,7 +229,73 @@ def _splitstrip(string: str, sep: str = ",") -> list[str]:
+     :rtype: str or unicode
+     :return: the unquoted string (or the input string if it wasn't quoted)
+     """
+-    return [word.strip() for word in string.split(sep) if word.strip()]
++    # Split on `sep` but ignore separators that are inside quotes or
++    # inside bracketed constructs such as (), {} or []. This is important
++    # for regular expressions which may contain commas inside quantifiers
++    # (e.g. {1,3}) or character classes. The previous simple split would
++    # mangle such regexes.
++    parts: list[str] = []
++    if not string:
++        return parts
++
++    buf: list[str] = []
++    depth_paren = depth_brace = depth_brack = 0
++    in_single = in_double = False
++    i = 0
++    while i < len(string):
++        ch = string[i]
++        # handle quote toggles (ignore escaped quotes)
++        if ch == "'" and not in_double:
++            # start or end single quote
++            in_single = not in_single
++            buf.append(ch)
++            i += 1
++            continue
++        if ch == '"' and not in_single:
++            in_double = not in_double
++            buf.append(ch)
++            i += 1
++            continue
++
++        if not in_single and not in_double:
++            if ch == "(":
++                depth_paren += 1
++            elif ch == ")":
++                if depth_paren:
++                    depth_paren -= 1
++            elif ch == "{":
++                depth_brace += 1
++            elif ch == "}":
++                if depth_brace:
++                    depth_brace -= 1
++            elif ch == "[":
++                depth_brack += 1
++            elif ch == "]":
++                if depth_brack:
++                    depth_brack -= 1
++
++        # Split only when at top-level (not inside quotes or any brackets)
++        if (
++            ch == sep
++            and not in_single
++            and not in_double
++            and depth_paren == 0
++            and depth_brace == 0
++            and depth_brack == 0
++        ):
++            token = "".join(buf).strip()
++            if token:
++                parts.append(token)
++            buf = []
++        else:
++            buf.append(ch)
++        i += 1
++
++    # append last
++    token = "".join(buf).strip()
++    if token:
++        parts.append(token)
++    return parts
+ 
+ 
+ def _unquote(string: str) -> str:
+diff --git a/tests/config/test_config.py b/tests/config/test_config.py
+index 83c8b072e..938a65631 100644
+--- a/tests/config/test_config.py
++++ b/tests/config/test_config.py
+@@ -135,16 +135,12 @@ def test_csv_regex_error(capsys: CaptureFixture) -> None:
+     """Check that we correctly error when an option is passed and one
+     of its comma-separated regular expressions values is an invalid regular expression.
+     """
+-    with pytest.raises(SystemExit):
+-        Run(
+-            [str(EMPTY_MODULE), r"--bad-names-rgx=(foo{1,3})"],
+-            exit=False,
+-        )
+-    output = capsys.readouterr()
+-    assert (
+-        r"Error in provided regular expression: (foo{1 beginning at index 0: missing ), unterminated subpattern"
+-        in output.err
+-    )
++    # Ensure that regular expressions containing commas (e.g. quantifiers)
++    # are accepted as a single regex value and do not get mangled by naive
++    # CSV splitting. The previous behavior split on commas inside regexes
++    # producing invalid fragments and a confusing error. We expect this to
++    # be handled correctly and not raise a SystemExit.
++    Run([str(EMPTY_MODULE), r"--bad-names-rgx=(foo{1,3})"], exit=False)
+ 
+ 
+ def test_short_verbose(capsys: CaptureFixture) -> None:

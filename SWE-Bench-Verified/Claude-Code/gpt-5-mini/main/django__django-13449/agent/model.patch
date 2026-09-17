@@ -1,0 +1,51 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 90d90119d0..6a03496804 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1305,6 +1305,29 @@ class Window(Expression):
+         expr_sql, params = compiler.compile(self.source_expression)
+         window_sql, window_params = [], []
+ 
++        # On SQLite, expressions with DecimalField output are wrapped with
++        # CAST(... AS NUMERIC) by SQLiteNumericMixin at the source-expression
++        # level. For window expressions we need the CAST around the whole
++        # "<expression> OVER (...)" construct rather than just the inner
++        # function call (see #...). To avoid producing
++        # "CAST(func(...) AS NUMERIC) OVER (...)" (which is invalid SQL),
++        # unwrap the inner CAST (if present) and instead apply the CAST to
++        # the entire OVER clause.
++        wrap_over_with_cast = False
++        try:
++            if connection.vendor == 'sqlite' and self._resolve_output_field().get_internal_type() == 'DecimalField':
++                # If the source expression was already CAST(.. AS NUMERIC),
++                # unwrap it to avoid double-casting, then wrap the full
++                # OVER(...) after constructing it.
++                if expr_sql.startswith('CAST(') and expr_sql.endswith(' AS NUMERIC)'):
++                    # Remove leading 'CAST(' and trailing ' AS NUMERIC)'
++                    expr_sql = expr_sql[len('CAST('):-len(' AS NUMERIC)')]
++                wrap_over_with_cast = True
++        except Exception:
++            # Any error resolving the output field shouldn't prevent normal
++            # SQL generation.
++            wrap_over_with_cast = False
++
+         if self.partition_by is not None:
+             sql_expr, sql_params = self.partition_by.as_sql(
+                 compiler=compiler, connection=connection,
+@@ -1327,10 +1350,14 @@ class Window(Expression):
+         params.extend(window_params)
+         template = template or self.template
+ 
+-        return template % {
++        full_sql = template % {
+             'expression': expr_sql,
+             'window': ''.join(window_sql).strip()
+-        }, params
++        }
++        if wrap_over_with_cast:
++            full_sql = 'CAST(%s AS NUMERIC)' % full_sql
++
++        return full_sql, params
+ 
+     def __str__(self):
+         return '{} OVER ({}{}{})'.format(

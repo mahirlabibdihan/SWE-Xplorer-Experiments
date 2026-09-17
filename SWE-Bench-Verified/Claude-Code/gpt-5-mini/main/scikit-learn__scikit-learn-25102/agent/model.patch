@@ -1,0 +1,151 @@
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..a51384bda 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -12,6 +12,7 @@ def _wrap_in_pandas_container(
+     *,
+     columns,
+     index=None,
++    dtypes=None,
+ ):
+     """Create a Pandas DataFrame.
+ 
+@@ -57,9 +58,26 @@ def _wrap_in_pandas_container(
+             data_to_wrap.columns = columns
+         if index is not None:
+             data_to_wrap.index = index
++        if dtypes is not None:
++            try:
++                # Attempt to preserve dtypes by casting to the provided dtypes
++                data_to_wrap = data_to_wrap.astype(dtypes)
++            except Exception:
++                # If astype fails (e.g., incompatible dtype), fall back silently to
++                # returning the DataFrame as-is. We avoid raising to not break
++                # transformers that rely on set_output.
++                pass
+         return data_to_wrap
+ 
+-    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    df = pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    if dtypes is not None:
++        try:
++            df = df.astype(dtypes)
++        except Exception:
++            # If astype fails, return the DataFrame as created.
++            pass
++    return df
++
+ 
+ 
+ def _get_output_config(method, estimator=None):
+@@ -119,7 +137,9 @@ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+         If the output config is "default" or the estimator is not configured
+         for wrapping return `data_to_wrap` unchanged.
+         If the output config is "pandas", return `data_to_wrap` as a pandas
+-        DataFrame.
++        DataFrame. If the global/local configuration requests dtype preservation
++        (via `transform_output_dtypes`), attempt to preserve the dtypes from the
++        original input when wrapping.
+     """
+     output_config = _get_output_config(method, estimator)
+ 
+@@ -127,15 +147,38 @@ def _wrap_data_with_container(method, data_to_wrap, original_input, estimator):
+         return data_to_wrap
+ 
+     # dense_config == "pandas"
++    # Determine if dtype preservation is requested from estimator's config
++    # or from the global config. We look up a potential key
++    # `_sklearn_output_preserve_dtypes` on the estimator; if not present, we
++    # fall back to the global config flag `transform_output_dtypes` if it exists.
++    dtypes = None
++    est_preserve = getattr(estimator, "_sklearn_output_preserve_dtypes", None)
++    if est_preserve is not None:
++        if est_preserve:
++            dtypes = getattr(original_input, "dtypes", None)
++    else:
++        # Fallback to global config key if available (backwards compatible)
++        try:
++            cfg = get_config()
++            if cfg.get("transform_output_dtypes", False):
++                dtypes = getattr(original_input, "dtypes", None)
++        except Exception:
++            dtypes = None
++
+     return _wrap_in_pandas_container(
+         data_to_wrap=data_to_wrap,
+         index=getattr(original_input, "index", None),
+         columns=estimator.get_feature_names_out,
++        dtypes=dtypes,
+     )
+ 
+ 
+ def _wrap_method_output(f, method):
+-    """Wrapper used by `_SetOutputMixin` to automatically wrap methods."""
++    """Wrapper used by `_SetOutputMixin` to automatically wrap methods.
++
++    This function delegates to `_wrap_data_with_container` which handles the
++    logic for pandas wrapping and optional dtype preservation.
++    """
+ 
+     @wraps(f)
+     def wrapped(self, X, *args, **kwargs):
+@@ -208,7 +251,7 @@ class _SetOutputMixin:
+             setattr(cls, method, wrapped_method)
+ 
+     @available_if(_auto_wrap_is_configured)
+-    def set_output(self, *, transform=None):
++    def set_output(self, *, transform=None, preserve_dtypes=None):
+         """Set output container.
+ 
+         See :ref:`sphx_glr_auto_examples_miscellaneous_plot_set_output.py`
+@@ -228,17 +271,25 @@ class _SetOutputMixin:
+         self : estimator instance
+             Estimator instance.
+         """
+-        if transform is None:
++        # If neither transform nor preserve_dtypes is provided, do nothing
++        if transform is None and preserve_dtypes is None:
+             return self
+ 
+         if not hasattr(self, "_sklearn_output_config"):
+             self._sklearn_output_config = {}
+ 
+-        self._sklearn_output_config["transform"] = transform
++        if transform is not None:
++            self._sklearn_output_config["transform"] = transform
++
++        # Store a flag indicating whether to preserve dtypes when wrapping to
++        # pandas. None means unspecified; True/False explicitly set the
++        # preference on the estimator instance.
++        if preserve_dtypes is not None:
++            setattr(self, "_sklearn_output_preserve_dtypes", bool(preserve_dtypes))
+         return self
+ 
+ 
+-def _safe_set_output(estimator, *, transform=None):
++def _safe_set_output(estimator, *, transform=None, preserve_dtypes=None):
+     """Safely call estimator.set_output and error if it not available.
+ 
+     This is used by meta-estimators to set the output for child estimators.
+@@ -261,11 +312,10 @@ def _safe_set_output(estimator, *, transform=None):
+     estimator : estimator instance
+         Estimator instance.
+     """
+-    set_output_for_transform = (
+-        hasattr(estimator, "transform")
+-        or hasattr(estimator, "fit_transform")
+-        and transform is not None
+-    )
++    (set_output_for_transform := (
++        (hasattr(estimator, "transform") or hasattr(estimator, "fit_transform"))
++        and (transform is not None or preserve_dtypes is not None)
++    ))
+     if not set_output_for_transform:
+         # If estimator can not transform, then `set_output` does not need to be
+         # called.
+@@ -276,4 +326,4 @@ def _safe_set_output(estimator, *, transform=None):
+             f"Unable to configure output for {estimator} because `set_output` "
+             "is not available."
+         )
+-    return estimator.set_output(transform=transform)
++    return estimator.set_output(transform=transform, preserve_dtypes=preserve_dtypes)

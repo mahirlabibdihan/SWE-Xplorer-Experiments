@@ -1,0 +1,53 @@
+diff --git a/sklearn/model_selection/_validation.py b/sklearn/model_selection/_validation.py
+index 95669a212..0df20c189 100644
+--- a/sklearn/model_selection/_validation.py
++++ b/sklearn/model_selection/_validation.py
+@@ -855,8 +855,18 @@ def _fit_and_predict(estimator, X, y, train, test, verbose, fit_params,
+     predictions = func(X_test)
+     if method in ['decision_function', 'predict_proba', 'predict_log_proba']:
+         if isinstance(predictions, list):
++            # Determine classes per label. For meta-estimators like
++            # MultiOutputClassifier the per-label classes are stored in
++            # estimator.estimators_[i].classes_. Fall back to
++            # estimator.classes_ for estimators that expose classes_ as a
++            # sequence of per-label class arrays.
++            if hasattr(estimator, "estimators_"):
++                classes_per_label = [getattr(est, "classes_", None)
++                                     for est in estimator.estimators_]
++            else:
++                classes_per_label = estimator.classes_
+             predictions = [_enforce_prediction_order(
+-                estimator.classes_[i_label], predictions[i_label],
++                classes_per_label[i_label], predictions[i_label],
+                 n_classes=len(set(y[:, i_label])), method=method)
+                 for i_label in range(len(predictions))]
+         else:
+diff --git a/sklearn/model_selection/tests/test_validation.py b/sklearn/model_selection/tests/test_validation.py
+index 6fa2e4fee..d7fb91d53 100644
+--- a/sklearn/model_selection/tests/test_validation.py
++++ b/sklearn/model_selection/tests/test_validation.py
+@@ -1479,6 +1479,24 @@ def test_cross_val_predict_with_method_multilabel_rf():
+             check_cross_val_predict_multilabel(est, X, y, method=method)
+ 
+ 
++def test_cross_val_predict_with_method_multilabel_multioutputclassifier():
++    # Regression test for using MultiOutputClassifier with a base estimator
++    # exposing predict_proba. This used to raise AttributeError because
++    # MultiOutputClassifier does not have a `classes_` attribute and
++    # cross_val_predict previously accessed `estimator.classes_` directly.
++    X, y = make_multilabel_classification(n_samples=50, n_labels=3,
++                                          n_classes=3, n_features=6,
++                                          random_state=0)
++    est = MultiOutputClassifier(LinearDiscriminantAnalysis())
++    # Should not raise
++    preds = cross_val_predict(est, X, y, cv=5, method='predict_proba')
++    # For multioutput, predict_proba returns a list of arrays, one per label
++    assert isinstance(preds, list)
++    assert len(preds) == y.shape[1]
++    for p in preds:
++        assert p.shape[0] == X.shape[0]
++
++
+ def test_cross_val_predict_with_method_rare_class():
+     # Test a multiclass problem where one class will be missing from
+     # one of the CV training sets.

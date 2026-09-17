@@ -1,0 +1,86 @@
+diff --git a/lib/matplotlib/figure.py b/lib/matplotlib/figure.py
+index dab2bc4a5a..a2a1415c75 100644
+--- a/lib/matplotlib/figure.py
++++ b/lib/matplotlib/figure.py
+@@ -2269,22 +2269,70 @@ class SubFigure(FigureBase):
+             Otherwise, it is calculated from the subplotspec.
+         """
+         if bbox is not None:
++            # keep existing behaviour when an explicit bbox is provided
+             self.bbox_relative.p0 = bbox.p0
+             self.bbox_relative.p1 = bbox.p1
+             return
+-        # need to figure out *where* this subplotspec is.
++
++        # If the underlying GridSpec explicitly modified subplot
++        # parameters (e.g. via wspace/hspace passed to Figure.subfigures or
++        # GridSpecFromSubplotSpec), use SubplotSpec.get_position which
++        # honours those values.  Otherwise, preserve the historical
++        # behaviour that computed positions purely from the width/height
++        # ratios (so existing tests and layouts that relied on that stay
++        # unchanged).
+         gs = self._subplotspec.get_gridspec()
+-        wr = np.asarray(gs.get_width_ratios())
+-        hr = np.asarray(gs.get_height_ratios())
+-        dx = wr[self._subplotspec.colspan].sum() / wr.sum()
+-        dy = hr[self._subplotspec.rowspan].sum() / hr.sum()
+-        x0 = wr[:self._subplotspec.colspan.start].sum() / wr.sum()
+-        y0 = 1 - hr[:self._subplotspec.rowspan.stop].sum() / hr.sum()
+-        if self.bbox_relative is None:
+-            self.bbox_relative = Bbox.from_bounds(x0, y0, dx, dy)
++        use_get_position = False
++        if hasattr(gs, 'locally_modified_subplot_params'):
++            if gs.locally_modified_subplot_params():
++                use_get_position = True
++
++        if use_get_position:
++            # get the bbox of this SubplotSpec.  GridSpec/SubplotSpec
++            # positioning can be defined relative to a Figure or a
++            # SubFigure (the ``gs.figure`` attribute).  Compute the
++            # absolute bbox in top-level figure coordinates by querying
++            # positions in the gridspec's own coordinate system and then
++            # mapping up to the top-level figure if necessary.
++            gs = self._subplotspec.get_gridspec()
++            fig_for_positions = gs.figure
++            bbox_local = self._subplotspec.get_position(fig_for_positions)
++            if isinstance(fig_for_positions, SubFigure):
++                # convert from fig_for_positions-relative coords to
++                # top-level figure coords
++                parent_top_bbox = fig_for_positions._subplotspec.get_position(
++                    self.figure)
++                bbox = Bbox.from_bounds(
++                    parent_top_bbox.x0 + bbox_local.x0 * parent_top_bbox.width,
++                    parent_top_bbox.y0 + bbox_local.y0 * parent_top_bbox.height,
++                    bbox_local.width * parent_top_bbox.width,
++                    bbox_local.height * parent_top_bbox.height)
++            else:
++                bbox = bbox_local
++
++            # determine the parent's bbox in figure coordinates. For a top
++            # level Figure parent this is the full figure; for a SubFigure
++            # parent, use its SubplotSpec position.
++            parent = self._parent
++            if isinstance(parent, SubFigure):
++                parent_pos = parent._subplotspec.get_position(self.figure)
++            else:
++                parent_pos = Bbox.from_bounds(0.0, 0.0, 1.0, 1.0)
+         else:
+-            self.bbox_relative.p0 = (x0, y0)
+-            self.bbox_relative.p1 = (x0 + dx, y0 + dy)
++            # preserve historical behaviour: compute from the width/height
++            # ratios so that layouts that expect the old positioning remain
++            # unchanged.
++            wr = np.asarray(gs.get_width_ratios())
++            hr = np.asarray(gs.get_height_ratios())
++            dx = wr[self._subplotspec.colspan].sum() / wr.sum()
++            dy = hr[self._subplotspec.rowspan].sum() / hr.sum()
++            x0 = wr[:self._subplotspec.colspan.start].sum() / wr.sum()
++            y0 = 1 - hr[:self._subplotspec.rowspan.stop].sum() / hr.sum()
++            if self.bbox_relative is None:
++                self.bbox_relative = Bbox.from_bounds(x0, y0, dx, dy)
++            else:
++                self.bbox_relative.p0 = (x0, y0)
++                self.bbox_relative.p1 = (x0 + dx, y0 + dy)
+ 
+     def get_constrained_layout(self):
+         """

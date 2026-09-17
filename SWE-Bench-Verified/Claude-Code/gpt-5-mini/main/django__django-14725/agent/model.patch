@@ -1,0 +1,118 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..652a78bf49 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -9,7 +9,7 @@ from django.core.exceptions import (
+ )
+ from django.forms.fields import ChoiceField, Field
+ from django.forms.forms import BaseForm, DeclarativeFieldsMetaclass
+-from django.forms.formsets import BaseFormSet, formset_factory
++from django.forms.formsets import BaseFormSet, formset_factory, TOTAL_FORM_COUNT
+ from django.forms.utils import ErrorList
+ from django.forms.widgets import (
+     HiddenInput, MultipleHiddenInput, RadioSelect, SelectMultiple,
+@@ -568,6 +568,11 @@ class BaseModelFormSet(BaseFormSet):
+     A ``FormSet`` for editing a queryset and/or adding new objects to it.
+     """
+     model = None
++    # Whether this formset permits creating new model instances. When False,
++    # the formset will not instantiate or save extra forms, preventing server-
++    # side creation of new objects even if a client tampers with management
++    # form data.
++    can_add = True
+ 
+     # Set of fields that must be unique among forms of this set.
+     unique_fields = set()
+@@ -655,6 +660,34 @@ class BaseModelFormSet(BaseFormSet):
+         """Save and return a new model instance for the given form."""
+         return form.save(commit=commit)
+ 
++    def save_new_objects(self, commit=True):
++        """
++        Save new objects for this formset. If adding new objects is disabled
++        via ``can_add``, do not save any new objects and return an empty
++        list. This prevents server-side creation of new instances even if a
++        client tampers with management form data.
++        """
++        if not getattr(self, 'can_add', True):
++            # Do not create new objects when adding is disabled.
++            self.new_objects = []
++            return []
++        return super().save_new_objects(commit=commit)
++
++    def total_form_count(self):
++        """Return the total number of forms in this FormSet.
++
++        If adding new objects is disabled (can_add is False) then don't
++        instantiate any extra forms beyond the initial queryset even if the
++        management form claims more TOTAL_FORMS were submitted. This prevents
++        clients from creating new instances by tampering with the management
++        form.
++        """
++        if self.is_bound and not getattr(self, 'can_add', True):
++            # Bound formset: cap total forms to the number of initial forms.
++            return min(self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.initial_form_count())
++        return super().total_form_count()
++
++
+     def save_existing(self, form, instance, commit=True):
+         """Save and return an existing model instance for the given form."""
+         return form.save(commit=commit)
+@@ -875,7 +908,8 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+-                         absolute_max=None, can_delete_extra=True, renderer=None):
++                         absolute_max=None, can_delete_extra=True, renderer=None),
++                         can_add=True):
+     """Return a FormSet class for the given Django model class."""
+     meta = getattr(form, 'Meta', None)
+     if (getattr(meta, 'fields', fields) is None and
+@@ -896,6 +930,10 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                               absolute_max=absolute_max, can_delete_extra=can_delete_extra,
+                               renderer=renderer)
+     FormSet.model = model
++    # Honor can_add flag on the returned FormSet class so callers can create
++    # edit-only formsets (can_add=False) that don't allow creating new
++    # instances, even if management form data is tampered with.
++    FormSet.can_add = can_add
+     return FormSet
+ 
+ 
+diff --git a/tests/model_formsets/tests.py b/tests/model_formsets/tests.py
+index bb1a8a8a5e..b9b4c0889a 100644
+--- a/tests/model_formsets/tests.py
++++ b/tests/model_formsets/tests.py
+@@ -2021,3 +2021,32 @@ class TestModelFormsetOverridesTroughFormMeta(TestCase):
+         BookFormSet = modelformset_factory(Author, fields='__all__', renderer=renderer)
+         formset = BookFormSet()
+         self.assertEqual(formset.renderer, renderer)
++
++    def test_can_add_false_prevents_new_objects(self):
++        """If can_add is False, new objects supplied by POST data must not be
++        created even if the management form claims extra forms were submitted."""
++        qs = Author.objects.all()
++        # Create one existing author
++        existing = Author.objects.create(name='Existing')
++        # Build a FormSet class with extra=1 but disable adding
++        AuthorFormSet = modelformset_factory(Author, fields="__all__", extra=1)
++        AuthorFormSet.can_add = False
++
++        data = {
++            'form-TOTAL_FORMS': '2',
++            'form-INITIAL_FORMS': '1',
++            'form-MAX_NUM_FORMS': '',
++            'form-0-id': str(existing.id),
++            'form-0-name': 'Existing',
++            # Pretend a client submitted data for an extra form
++            'form-1-id': '',
++            'form-1-name': 'New Author',
++        }
++        formset = AuthorFormSet(data=data, queryset=qs)
++        # The formset should be valid, but saving should not create the new
++        # author because can_add is False.
++        self.assertTrue(formset.is_valid())
++        saved = formset.save()
++        # No new objects were saved
++        self.assertEqual(len(saved), 0)
++        self.assertFalse(Author.objects.filter(name='New Author').exists())

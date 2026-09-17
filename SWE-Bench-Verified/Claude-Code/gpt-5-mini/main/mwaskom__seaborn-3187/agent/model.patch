@@ -1,0 +1,474 @@
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 8915616b..c4886785 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -1554,14 +1554,20 @@ class Plotter:
+             legend_vars = list(data.frame.columns.intersection(list(scales)))
+ 
+         # First pass: Identify the values that will be shown for each variable
++        # schema entries: ((title, id), [vars], (values, labels, offset))
+         schema: list[tuple[
+-            tuple[str, str | int], list[str], tuple[list, list[str]]
++            tuple[str, str | int], list[str], tuple[list, list[str], str | None]
+         ]] = []
+         schema = []
+         for var in legend_vars:
+             var_legend = scales[var]._legend
+             if var_legend is not None:
+-                values, labels = var_legend
++                # Accept either (values, labels) or (values, labels, offset)
++                if len(var_legend) == 3:
++                    values, labels, offset = var_legend
++                else:
++                    values, labels = var_legend
++                    offset = None
+                 for (_, part_id), part_vars, _ in schema:
+                     if data.ids[var] == part_id:
+                         # Allow multiple plot semantics to represent same data variable
+@@ -1569,56 +1575,397 @@ class Plotter:
+                         break
+                 else:
+                     title = self._resolve_label(p, var, data.names[var])
+-                    entry = (title, data.ids[var]), [var], (values, labels)
++                    entry = (title, data.ids[var]), [var], (values, labels, offset)
+                     schema.append(entry)
+ 
+         # Second pass, generate an artist corresponding to each value
+-        contents: list[tuple[tuple[str, str | int], Any, list[str]]] = []
+-        for key, variables, (values, labels) in schema:
++        contents: list[tuple[tuple[str, str | int], Any, list[str], str | None]] = []
++        for key, variables, (values, labels, offset) in schema:
+             artists = []
+             for val in values:
+                 artist = mark._legend_artist(variables, val, scales)
+                 if artist is not None:
+                     artists.append(artist)
+             if artists:
+-                contents.append((key, artists, labels))
++                contents.append((key, artists, labels, offset))
+ 
+         self._legend_contents.extend(contents)
+ 
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++
+     def _make_legend(self, p: Plot) -> None:
+         """Create the legend artist(s) and add onto the figure."""
+         # Combine artists representing same information across layers
+         # Input list has an entry for each distinct variable in each layer
+         # Output dict has an entry for each distinct variable
++        # merged_contents maps (name, id) -> (handles, labels, offset)
+         merged_contents: dict[
+-            tuple[str, str | int], tuple[list[Artist], list[str]],
++            tuple[str, str | int], tuple[list[Artist], list[str], str | None],
+         ] = {}
+-        for key, new_artists, labels in self._legend_contents:
++        for item in self._legend_contents:
++            # Support entries of length 3 (key, artists, labels) and 4 (key, artists, labels, offset)
++            if len(item) == 3:
++                key, new_artists, labels = item
++                offset = None
++            else:
++                key, new_artists, labels, offset = item
++
+             # Key is (name, id); we need the id to resolve variable uniqueness,
+             # but will need the name in the next step to title the legend
+             if key in merged_contents:
+                 # Copy so inplace updates don't propagate back to legend_contents
+                 existing_artists = merged_contents[key][0]
++                existing_offset = merged_contents[key][2]
+                 for i, artist in enumerate(existing_artists):
+                     # Matplotlib accepts a tuple of artists and will overlay them
+                     if isinstance(artist, tuple):
+                         artist += new_artists[i],
+                     else:
+                         existing_artists[i] = artist, new_artists[i]
++                # Preserve offset if already set; otherwise take this one
++                if existing_offset is None and offset:
++                    merged_contents[key] = existing_artists, labels, offset
+             else:
+-                merged_contents[key] = new_artists.copy(), labels
++                merged_contents[key] = new_artists.copy(), labels, offset
+ 
+         # TODO explain
+         loc = "center right" if self._pyplot else "center left"
+ 
+         base_legend = None
+-        for (name, _), (handles, labels) in merged_contents.items():
++        for (name, _), (handles, labels, offset) in merged_contents.items():
++
++            # If we were able to recover a formatter offset, include it in the
++            # legend title so that large-magnitude scales are communicated.
++            title = name if not offset else f"{name} ({offset})"
+ 
+             legend = mpl.legend.Legend(
+                 self._figure,
+                 handles,
+                 labels,
+-                title=name,
++                title=title,
+                 loc=loc,
+                 bbox_to_anchor=(.98, .55),
+             )
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+index 55874bf2..478110bd 100644
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -379,7 +379,34 @@ class ContinuousBase(Scale):
+             locs = axis.major.locator()
+             locs = locs[(vmin <= locs) & (locs <= vmax)]
+             labels = axis.major.formatter.format_ticks(locs)
+-            new._legend = list(locs), list(labels)
++            # Try to retrieve any multiplicative offset the formatter may be
++            # using (e.g., ScalarFormatter displays an offset like "×10^6").
++            # Different Matplotlib versions and formatter implementations expose
++            # this via different APIs, so check a few possibilities.
++            fmt = axis.major.formatter
++            offset = ""
++            try:
++                if hasattr(fmt, "get_offset"):
++                    # Common in some ScalarFormatter implementations
++                    offset = fmt.get_offset()
++                elif hasattr(fmt, "get_offset_text"):
++                    off_obj = fmt.get_offset_text()
++                    # Some implementations return a Text-like object
++                    if hasattr(off_obj, "get_text"):
++                        offset = off_obj.get_text()
++                    else:
++                        offset = str(off_obj)
++                elif hasattr(fmt, "offset"):
++                    offset = str(fmt.offset)
++            except Exception:
++                # Be defensive: if any introspection fails, ignore the offset
++                offset = ""
++
++            # Normalize empty strings to None for storage stability
++            if offset:
++                new._legend = list(locs), list(labels), offset
++            else:
++                new._legend = list(locs), list(labels)
+ 
+         return new
+ 

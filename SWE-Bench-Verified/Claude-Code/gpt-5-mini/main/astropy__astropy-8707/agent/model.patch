@@ -1,0 +1,101 @@
+diff --git a/astropy/io/fits/card.py b/astropy/io/fits/card.py
+index 8c1ac5d73..701f45eae 100644
+--- a/astropy/io/fits/card.py
++++ b/astropy/io/fits/card.py
+@@ -547,12 +547,27 @@ class Card(_Verify):
+     @classmethod
+     def fromstring(cls, image):
+         """
+-        Construct a `Card` object from a (raw) string. It will pad the string
+-        if it is not the length of a card image (80 columns).  If the card
+-        image is longer than 80 columns, assume it contains ``CONTINUE``
+-        card(s).
++        Construct a `Card` object from a (raw) string or bytes. It will pad
++        the string if it is not the length of a card image (80 columns).  If
++        the card image is longer than 80 columns, assume it contains
++        ``CONTINUE`` card(s).
+         """
+ 
++        # Accept both `str` and `bytes`/`bytearray` inputs. Decode bytes to
++        # text using the same helper used throughout the FITS code so that
++        # non-ASCII handling is consistent (warnings/replacement behavior).
++        from .util import decode_ascii as _decode_ascii
++
++        if isinstance(image, (bytes, bytearray)):
++            image = _decode_ascii(bytes(image))
++        # Numpy string/bytes arrays may also be passed through; let
++        # decode_ascii handle them where possible
++        elif not isinstance(image, str):
++            try:
++                image = _decode_ascii(image)
++            except Exception:
++                image = str(image)
++
+         card = cls()
+         card._image = _pad(image)
+         card._verified = False
+diff --git a/astropy/io/fits/header.py b/astropy/io/fits/header.py
+index ad07e6d52..b0d644633 100644
+--- a/astropy/io/fits/header.py
++++ b/astropy/io/fits/header.py
+@@ -334,8 +334,8 @@ class Header:
+ 
+         Parameters
+         ----------
+-        data : str
+-           String containing the entire header.
++        data : str or bytes
++           String or bytes containing the entire header.
+ 
+         sep : str, optional
+             The string separating cards from each other, such as a newline.  By
+@@ -348,6 +348,23 @@ class Header:
+             A new `Header` instance.
+         """
+ 
++        # Accept both `str` and `bytes` inputs.  On Python 3 bytes should be
++        # decoded as ASCII (with replacement/warnings handled by
++        # util.decode_ascii).  This mirrors the behavior of
++        # Header.fromfile/_from_blocks which produce text via decode_ascii.
++        from .util import decode_ascii as _decode_ascii
++
++        if isinstance(data, (bytes, bytearray)):
++            data = _decode_ascii(bytes(data))
++        # Also accept numpy string arrays/byte arrays handled by decode_ascii
++        elif not isinstance(data, str):
++            try:
++                data = _decode_ascii(data)
++            except Exception:
++                # Fall back to converting to str if decode_ascii doesn't know
++                # how to handle the type
++                data = str(data)
++
+         cards = []
+ 
+         # If the card separator contains characters that may validly appear in
+diff --git a/astropy/io/fits/tests/test_bytes_input.py b/astropy/io/fits/tests/test_bytes_input.py
+new file mode 100644
+index 000000000..d05447a7a
+--- /dev/null
++++ b/astropy/io/fits/tests/test_bytes_input.py
+@@ -0,0 +1,20 @@
++import pytest
++from astropy.io import fits
++
++
++def test_header_fromstring_accepts_bytes():
++    card = "SIMPLE  =                    T / file does conform to FITS standard"
++    card = card.ljust(80)
++    end = 'END'.ljust(80)
++    raw = (card + end)
++    b = raw.encode('ascii')
++    h = fits.Header.fromstring(b)
++    assert len(h) == 1
++
++
++def test_card_fromstring_accepts_bytes():
++    card = "SIMPLE  =                    T / file does conform to FITS standard"
++    b = card.encode('ascii')
++    c = fits.Card.fromstring(b)
++    assert c.keyword == 'SIMPLE'
++    assert c.value is True

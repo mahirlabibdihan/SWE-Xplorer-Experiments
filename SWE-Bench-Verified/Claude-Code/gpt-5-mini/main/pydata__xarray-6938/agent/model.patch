@@ -1,0 +1,58 @@
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index c775d05c..2774f17d 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -3772,8 +3772,11 @@ class Dataset(
+         for k, v in self.variables.items():
+             dims = tuple(dims_dict.get(dim, dim) for dim in v.dims)
+             if k in result_dims:
+-                var = v.to_index_variable()
+-                var.dims = dims
++                # ensure we don't mutate the original variable when promoting to
++                # an IndexVariable and changing its dims. Use _replace to create
++                # a new object with the desired dims instead of setting
++                # var.dims in-place which can affect the original Dataset.
++                var = v.to_index_variable()._replace(dims=dims)
+                 if k in self._indexes:
+                     indexes[k] = self._indexes[k]
+                     variables[k] = var
+diff --git a/xarray/tests/test_dataset.py b/xarray/tests/test_dataset.py
+index 9ea47163..6a55774a 100644
+--- a/xarray/tests/test_dataset.py
++++ b/xarray/tests/test_dataset.py
+@@ -2964,6 +2964,35 @@ class TestDataset:
+         assert isinstance(actual.variables["x"], Variable)
+         assert actual.xindexes["y"].equals(expected.xindexes["y"])
+ 
++    def test_swap_dims_does_not_mutate_original(self) -> None:
++        # Regression test for GH issue: ensure swap_dims does not modify
++        # the original Dataset's variable dims when promoting a data var to
++        # a dimension coordinate.
++        nz = 11
++        rng = np.random.RandomState(0)
++        ds = Dataset(
++            data_vars={
++                "y": ("z", rng.rand(nz)),
++                "lev": ("z", np.arange(nz) * 10),
++            },
++        )
++        ds2 = (
++            ds.swap_dims(z="lev")
++            .rename_dims(lev="z")
++            .reset_index("lev")
++            .reset_coords()
++        )
++        # apply swap_dims to ds2, which should not mutate ds2 in-place
++        res = ds2.swap_dims(z="lev")
++        # res should have 'lev' as a dimension coordinate with dim 'lev'
++        assert "lev" in res.dims
++        assert res["lev"].dims == ("lev",)
++        # original ds2 should remain unchanged: its 'lev' variable should still
++        # have dim 'z'
++        assert ds2["lev"].dims == ("z",)
++        # ensure original ds was not mutated either
++        assert ds["lev"].dims == ("z",)
++
+         roundtripped = actual.swap_dims({"y": "x"})
+         assert_identical(original.set_coords("y"), roundtripped)
+ 

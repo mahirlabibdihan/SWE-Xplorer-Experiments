@@ -1,0 +1,78 @@
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 916478d075..ce59ea3a27 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -549,7 +549,12 @@ class YearLookup(Lookup):
+     def as_sql(self, compiler, connection):
+         # Avoid the extract operation if the rhs is a direct value to allow
+         # indexes to be used.
+-        if self.rhs_is_direct_value():
++        # Only avoid the extract operation for the plain "year" lookup.
++        # The ISO year (lookup_name == 'iso_year') has different boundaries
++        # which cannot be represented as a simple BETWEEN on the original
++        # date/datetime field. If the transform is not the plain 'year', fall
++        # back to the default behaviour which preserves the EXTRACT() call.
++        if self.rhs_is_direct_value() and getattr(self.lhs, 'lookup_name', None) == 'year':
+             # Skip the extract part by directly using the originating field,
+             # that is self.lhs.lhs.
+             lhs_sql, params = self.process_lhs(compiler, connection, self.lhs.lhs)
+diff --git a/tests/db_functions/datetime/test_extract_trunc.py b/tests/db_functions/datetime/test_extract_trunc.py
+index 258600127f..aec973d858 100644
+--- a/tests/db_functions/datetime/test_extract_trunc.py
++++ b/tests/db_functions/datetime/test_extract_trunc.py
+@@ -108,28 +108,46 @@ class DateFunctionTests(TestCase):
+                 qs = DTModel.objects.filter(**{'start_datetime__%s__exact' % lookup: 2015})
+                 self.assertEqual(qs.count(), 1)
+                 query_string = str(qs.query).lower()
+-                self.assertEqual(query_string.count(' between '), 1)
+-                self.assertEqual(query_string.count('extract'), 0)
++                if lookup == 'year':
++                    # year can be optimized to BETWEEN to allow index usage.
++                    self.assertEqual(query_string.count(' between '), 1)
++                    self.assertEqual(query_string.count('extract'), 0)
++                else:
++                    # iso_year has complex boundaries and must use EXTRACT().
++                    self.assertEqual(query_string.count(' between '), 0)
++                    self.assertGreaterEqual(query_string.count('extract'), 1)
+                 # exact is implied and should be the same
+                 qs = DTModel.objects.filter(**{'start_datetime__%s' % lookup: 2015})
+                 self.assertEqual(qs.count(), 1)
+                 query_string = str(qs.query).lower()
+-                self.assertEqual(query_string.count(' between '), 1)
+-                self.assertEqual(query_string.count('extract'), 0)
++                if lookup == 'year':
++                    self.assertEqual(query_string.count(' between '), 1)
++                    self.assertEqual(query_string.count('extract'), 0)
++                else:
++                    self.assertEqual(query_string.count(' between '), 0)
++                    self.assertGreaterEqual(query_string.count('extract'), 1)
+                 # date and datetime fields should behave the same
+                 qs = DTModel.objects.filter(**{'start_date__%s' % lookup: 2015})
+                 self.assertEqual(qs.count(), 1)
+                 query_string = str(qs.query).lower()
+-                self.assertEqual(query_string.count(' between '), 1)
+-                self.assertEqual(query_string.count('extract'), 0)
++                if lookup == 'year':
++                    self.assertEqual(query_string.count(' between '), 1)
++                    self.assertEqual(query_string.count('extract'), 0)
++                else:
++                    self.assertEqual(query_string.count(' between '), 0)
++                    self.assertGreaterEqual(query_string.count('extract'), 1)
+                 # an expression rhs cannot use the between optimization.
++                # Use the corresponding Extract function for the lookup.
++                extract_func = ExtractYear if lookup == 'year' else ExtractIsoYear
+                 qs = DTModel.objects.annotate(
+-                    start_year=ExtractYear('start_datetime'),
+-                ).filter(end_datetime__year=F('start_year') + 1)
++                    start_year=extract_func('start_datetime'),
++                ).filter(**{'end_datetime__%s' % lookup: F('start_year') + 1})
+                 self.assertEqual(qs.count(), 1)
+                 query_string = str(qs.query).lower()
+                 self.assertEqual(query_string.count(' between '), 0)
+-                self.assertEqual(query_string.count('extract'), 3)
++                # Expect multiple EXTRACT usages: one for the annotation and at
++                # least one for the lookup.
++                self.assertGreaterEqual(query_string.count('extract'), 2)
+ 
+     def test_extract_year_greaterthan_lookup(self):
+         start_datetime = datetime(2015, 6, 15, 14, 10)

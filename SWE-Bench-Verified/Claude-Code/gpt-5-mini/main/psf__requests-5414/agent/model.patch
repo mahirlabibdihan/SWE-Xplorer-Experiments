@@ -1,0 +1,43 @@
+diff --git a/requests/models.py b/requests/models.py
+index e7d292d5..169090fa 100644
+--- a/requests/models.py
++++ b/requests/models.py
+@@ -354,7 +354,10 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+         try:
+             host = idna.encode(host, uts46=True).decode('utf-8')
+         except idna.IDNAError:
+-            raise UnicodeError
++            # Normalize IDNA errors to InvalidURL for consistency with
++            # prepare_url's error handling. Raising InvalidURL here avoids
++            # leaking a raw UnicodeError to callers.
++            raise InvalidURL('URL has an invalid label.')
+         return host
+ 
+     def prepare_url(self, url, params):
+@@ -384,6 +387,12 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+             scheme, auth, host, port, path, query, fragment = parse_url(url)
+         except LocationParseError as e:
+             raise InvalidURL(*e.args)
++        except UnicodeError:
++            # Some URL parsing / IDNA codec errors can raise UnicodeError
++            # (for example a leading dot in the host: "http://.example.com").
++            # Normalize these into an InvalidURL so callers receive a
++            # requests-specific exception rather than a raw UnicodeError.
++            raise InvalidURL('URL has an invalid label.')
+ 
+         if not scheme:
+             error = ("Invalid URL {0!r}: No schema supplied. Perhaps you meant http://{0}?")
+@@ -394,6 +403,13 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
+         if not host:
+             raise InvalidURL("Invalid URL %r: No host supplied" % url)
+ 
++        # Reject hosts with empty labels such as leading/trailing dots or
++        # consecutive dots (e.g. ".example.com", "example..com"). These
++        # would produce IDNA/encoding errors or be otherwise invalid; map
++        # them to InvalidURL for a consistent requests-level exception.
++        if host.startswith('.') or host.endswith('.') or '..' in host:
++            raise InvalidURL('URL has an invalid label.')
++
+         # In general, we want to try IDNA encoding the hostname if the string contains
+         # non-ASCII characters. This allows users to automatically get the correct IDNA
+         # behaviour. For strings containing only ASCII characters, we need to also verify

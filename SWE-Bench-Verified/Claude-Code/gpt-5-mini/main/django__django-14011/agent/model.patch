@@ -1,0 +1,112 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index 14dab517c9..e90a2dee5c 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -11,6 +11,7 @@ import logging
+ import socket
+ import socketserver
+ import sys
++import threading
+ from wsgiref import simple_server
+ 
+ from django.core.exceptions import ImproperlyConfigured
+@@ -78,9 +79,59 @@ class WSGIServer(simple_server.WSGIServer):
+ 
+ 
+ class ThreadedWSGIServer(socketserver.ThreadingMixIn, WSGIServer):
+-    """A threaded version of the WSGIServer"""
++    """A threaded version of the WSGIServer. Track request threads so tests
++    can wait for them to finish on shutdown. The ThreadingMixIn in the stdlib
++    does not expose its thread list, so we maintain our own list of active
++    request threads and override process_request to append/pop them.
++    """
+     daemon_threads = True
+ 
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        # Protected list of active request threads.
++        self._request_threads = []
++
++    def process_request(self, request, client_address):
++        """Start a request handler in a new thread and track it."""
++        t = threading.Thread(target=self.process_request_thread,
++                             args=(request, client_address))
++        t.daemon = self.daemon_threads
++        self._request_threads.append(t)
++        t.start()
++
++    def process_request_thread(self, request, client_address):
++        try:
++            super().process_request_thread(request, client_address)
++        finally:
++            # Remove the thread object from the tracking list when done.
++            try:
++                self._request_threads.remove(threading.current_thread())
++            except ValueError:
++                pass
++
++    def shutdown(self):
++        # Call the parent shutdown to stop serve_forever loop
++        super().shutdown()
++        # Wait for request threads to finish
++        for t in list(getattr(self, '_request_threads', [])):
++            try:
++                t.join(timeout=0.1)
++            except Exception:
++                pass
++        # If any remain, do a short busy-wait with small sleeps to avoid
++        # hanging indefinitely.
++        import time
++        while getattr(self, '_request_threads', []):
++            for t in list(self._request_threads):
++                try:
++                    t.join(timeout=0.1)
++                except Exception:
++                    pass
++            time.sleep(0.01)
++
++    # Ensure compatibility: keep daemon_threads attribute
++    # and any other ThreadingMixIn expectations.
++
+ 
+ class ServerHandler(simple_server.ServerHandler):
+     http_version = '1.1'
+diff --git a/django/test/testcases.py b/django/test/testcases.py
+index 92f566b7b0..b6c399ada3 100644
+--- a/django/test/testcases.py
++++ b/django/test/testcases.py
+@@ -1511,6 +1511,34 @@ class LiveServerThread(threading.Thread):
+             self.error = e
+             self.is_ready.set()
+         finally:
++            # If the server tracked request threads, wait for them to finish
++            # before closing database connections to avoid races where the
++            # request threads still use DB connections while the main thread
++            # tears down the test databases.
++            try:
++                request_threads = getattr(self, 'httpd', None)
++                if request_threads is not None:
++                    request_threads = getattr(self.httpd, '_request_threads', None)
++                if request_threads:
++                    # Join tracked threads with short timeouts to allow a graceful
++                    # shutdown while not blocking indefinitely.
++                    for t in list(request_threads):
++                        try:
++                            t.join(timeout=0.1)
++                        except Exception:
++                            pass
++                    # If any remain, wait in a loop until they're gone.
++                    import time
++                    while self.httpd._request_threads:
++                        for t in list(self.httpd._request_threads):
++                            try:
++                                t.join(timeout=0.1)
++                            except Exception:
++                                pass
++                        time.sleep(0.01)
++            except Exception:
++                # Best effort only; fall through to closing connections.
++                pass
+             connections.close_all()
+ 
+     def _create_server(self):

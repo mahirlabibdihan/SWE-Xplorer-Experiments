@@ -1,0 +1,65 @@
+diff --git a/django/urls/resolvers.py b/django/urls/resolvers.py
+index 9b00e24509..d0c1b7529e 100644
+--- a/django/urls/resolvers.py
++++ b/django/urls/resolvers.py
+@@ -31,9 +31,33 @@ from .utils import get_callable
+ 
+ class ResolverMatch:
+     def __init__(self, func, args, kwargs, url_name=None, app_names=None, namespaces=None, route=None, tried=None):
+-        self.func = func
+-        self.args = args
+-        self.kwargs = kwargs
++        # Handle functools.partial specially so that the resolved
++        # representation exposes the underlying function and any
++        # pre-specified arguments/keywords. A partial's args are
++        # prepended to the call-time args, and its keywords are
++        # merged with call-time kwargs (call-time kwargs win).
++        if isinstance(func, functools.partial):
++            # keep the original partial object as the callable
++            # (it will be called at dispatch time), but unwrap it
++            # for generating the path/representation and for
++            # exposing the effective args/kwargs.
++            self.func = func
++            # Prepend partial args to the resolver args
++            self.args = tuple(func.args) + tuple(args) if func.args else tuple(args)
++            # Merge partial keywords with resolver kwargs, resolver
++            # kwargs should override partial keywords (matching
++            # functools.partial call-time behavior).
++            merged = {}
++            if getattr(func, 'keywords', None):
++                merged.update(func.keywords)
++            if kwargs:
++                merged.update(kwargs)
++            self.kwargs = merged
++            func_for_path = func.func
++        else:
++            self.func = func
++            self.args = args
++            self.kwargs = kwargs
+         self.url_name = url_name
+         self.route = route
+         self.tried = tried
+@@ -45,12 +69,20 @@ class ResolverMatch:
+         self.namespaces = [x for x in namespaces if x] if namespaces else []
+         self.namespace = ':'.join(self.namespaces)
+ 
+-        if not hasattr(func, '__name__'):
++        # Use the unwrapped function for the path where possible so that
++        # functools.partial views show the underlying function name
++        # instead of 'functools.partial'.
++        try:
++            check_func = func_for_path if 'func_for_path' in locals() else func
++        except Exception:
++            check_func = func
++
++        if not hasattr(check_func, '__name__'):
+             # A class-based view
+-            self._func_path = func.__class__.__module__ + '.' + func.__class__.__name__
++            self._func_path = check_func.__class__.__module__ + '.' + check_func.__class__.__name__
+         else:
+             # A function-based view
+-            self._func_path = func.__module__ + '.' + func.__name__
++            self._func_path = check_func.__module__ + '.' + check_func.__name__
+ 
+         view_path = url_name or self._func_path
+         self.view_name = ':'.join(self.namespaces + [view_path])

@@ -1,0 +1,53 @@
+diff --git a/django/db/migrations/serializer.py b/django/db/migrations/serializer.py
+index 7d226955d5..b4365ca225 100644
+--- a/django/db/migrations/serializer.py
++++ b/django/db/migrations/serializer.py
+@@ -90,10 +90,32 @@ class DeconstructableSerializer(BaseSerializer):
+ 
+     @staticmethod
+     def _serialize_path(path):
+-        module, name = path.rsplit(".", 1)
++        """
++        Determine the appropriate import for a given dotted path and return
++        the name to use in serialization along with the necessary import
++        statement. This handles nested class qualnames (e.g. "mod.Outer.Inner")
++        by finding the longest importable module prefix (e.g. "mod").
++        """
++        # Prefer the longest module prefix that is importable. This avoids
++        # generating imports like "import package.module.EnclosingClass",
++        # which are invalid. Use importlib.util.find_spec to check for a
++        # module without importing it.
++        import importlib.util
++
++        parts = path.split('.')
++        for i in range(len(parts), 0, -1):
++            candidate = '.'.join(parts[:i])
++            if importlib.util.find_spec(candidate) is not None:
++                module = candidate
++                break
++        else:
++            # Fallback to splitting off the last component.
++            module, _ = path.rsplit('.', 1)
++
++        # Preserve the full path as the name, but emit a sensible import.
+         if module == "django.db.models":
+             imports = {"from django.db import models"}
+-            name = "models.%s" % name
++            name = "models.%s" % path.split('.')[-1]
+         else:
+             imports = {"import %s" % module}
+             name = path
+@@ -269,6 +291,13 @@ class TypeSerializer(BaseSerializer):
+             if module == builtins.__name__:
+                 return self.value.__name__, set()
+             else:
++                # Use __qualname__ when available so nested classes retain their
++                # enclosing path (e.g. Outer.Inner). Fall back to __name__ if
++                # the qualname contains '<' (which indicates a local class)
++                # or is otherwise unsuitable for import paths.
++                qualname = getattr(self.value, "__qualname__", self.value.__name__)
++                if "<" not in qualname:
++                    return "%s.%s" % (module, qualname), {"import %s" % module}
+                 return "%s.%s" % (module, self.value.__name__), {"import %s" % module}
+ 
+ 

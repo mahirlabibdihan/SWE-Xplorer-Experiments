@@ -1,0 +1,108 @@
+diff --git a/django/core/management/commands/inspectdb.py b/django/core/management/commands/inspectdb.py
+index f9b4bfb477..00493b87e9 100644
+--- a/django/core/management/commands/inspectdb.py
++++ b/django/core/management/commands/inspectdb.py
+@@ -65,7 +65,12 @@ class Command(BaseCommand):
+             if options['include_views']:
+                 types.add('v')
+ 
+-            for table_name in (options['table'] or sorted(info.name for info in table_info if info.type in types)):
++            # First collect introspection data for all tables to allow
++            # resolving `to_field` for foreign keys that reference a non-PK
++            # column on another table.
++            target_tables = options['table'] or sorted(info.name for info in table_info if info.type in types)
++            table_data = {}
++            for table_name in target_tables:
+                 if table_name_filter is not None and callable(table_name_filter):
+                     if not table_name_filter(table_name):
+                         continue
+@@ -85,10 +90,55 @@ class Command(BaseCommand):
+                     ]
+                     table_description = connection.introspection.get_table_description(cursor, table_name)
+                 except Exception as e:
++                    # Save the error so we can later emit the same message in
++                    # the generation pass.
++                    table_data[table_name] = {'error': e}
++                    continue
++
++                table_data[table_name] = {
++                    'relations': relations,
++                    'constraints': constraints,
++                    'primary_key_column': primary_key_column,
++                    'unique_columns': unique_columns,
++                    'table_description': table_description,
++                }
++
++            # Build column -> field name mapping for each table so we can
++            # correctly emit `to_field` referencing the related model field
++            # name (not just the column name).
++            table_column_to_field = {}
++            for table_name, data in list(table_data.items()):
++                if 'error' in data:
++                    continue
++                used_column_names = []
++                mapping = {}
++                relations = data['relations']
++                for row in data['table_description']:
++                    att_name, params, notes = self.normalize_col_name(
++                        row.name, used_column_names, row.name in relations
++                    )
++                    used_column_names.append(att_name)
++                    mapping[row.name] = att_name
++                table_column_to_field[table_name] = mapping
++
++            # Now output models using the collected data.
++            for table_name in target_tables:
++                if table_name_filter is not None and callable(table_name_filter):
++                    if not table_name_filter(table_name):
++                        continue
++                data = table_data.get(table_name)
++                if data is None or 'error' in data:
++                    e = data['error'] if data is not None else 'unknown'
+                     yield "# Unable to inspect table '%s'" % table_name
+                     yield "# The error was: %s" % e
+                     continue
+ 
++                relations = data['relations']
++                constraints = data['constraints']
++                primary_key_column = data['primary_key_column']
++                unique_columns = data['unique_columns']
++                table_description = data['table_description']
++
+                 yield ''
+                 yield ''
+                 yield 'class %s(models.Model):' % table2model(table_name)
+@@ -120,10 +170,31 @@ class Command(BaseCommand):
+                             rel_type = 'OneToOneField'
+                         else:
+                             rel_type = 'ForeignKey'
++                        rel_table = relations[column_name][1]
+                         rel_to = (
+-                            "self" if relations[column_name][1] == table_name
+-                            else table2model(relations[column_name][1])
++                            "self" if rel_table == table_name
++                            else table2model(rel_table)
+                         )
++                        # If the foreign key targets a non-primary key column on
++                        # the referenced table, set `to_field` to the related
++                        # model field name (fall back to the column name).
++                        ref_column = relations[column_name][0]
++                        ref_pk = None
++                        if rel_table in table_data and 'primary_key_column' in table_data[rel_table]:
++                            ref_pk = table_data[rel_table]['primary_key_column']
++                        elif rel_table not in table_data:
++                            # Try to get the primary key column for tables not
++                            # previously inspected (outside selected set).
++                            try:
++                                ref_pk = connection.introspection.get_primary_key_column(cursor, rel_table)
++                            except Exception:
++                                ref_pk = None
++                        if ref_column and ref_pk and ref_column != ref_pk:
++                            # Map the referenced column to the field name if
++                            # available, otherwise use the column name.
++                            mapped = table_column_to_field.get(rel_table, {}).get(ref_column, ref_column)
++                            extra_params['to_field'] = mapped
++
+                         if rel_to in known_models:
+                             field_type = '%s(%s' % (rel_type, rel_to)
+                         else:

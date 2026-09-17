@@ -1,0 +1,61 @@
+diff --git a/astropy/units/format/cds.py b/astropy/units/format/cds.py
+index 307e987ed..20223b79f 100644
+--- a/astropy/units/format/cds.py
++++ b/astropy/units/format/cds.py
+@@ -182,11 +182,16 @@ class CDS(Base):
+         def p_division_of_units(p):
+             """
+             division_of_units : DIVISION unit_expression
+-                              | unit_expression DIVISION combined_units
++                              | unit_expression DIVISION unit_expression
++                              | division_of_units DIVISION unit_expression
+             """
++            # Handle leading division (e.g. "/m" => 1/m)
+             if len(p) == 3:
+                 p[0] = p[2] ** -1
+             else:
++                # Make division left-associative: in the recursive case
++                # p[1] is already the left-hand side (possibly a division_of_units)
++                # and p[3] is the next unit expression to divide by.
+                 p[0] = p[1] / p[3]
+ 
+         def p_unit_expression(p):
+@@ -260,7 +265,10 @@ class CDS(Base):
+         def p_error(p):
+             raise ValueError()
+ 
+-        return parsing.yacc(tabmodule="cds_parsetab", package="astropy/units")
++        # Prefer building the parser in-memory from the current grammar rather
++        # than importing a possibly stale generated tab module. Passing
++        # tabmodule=None causes PLY to construct the parser at runtime.
++        return parsing.yacc(tabmodule=None, package="astropy/units")
+ 
+     @classmethod
+     def _get_unit(cls, t):
+diff --git a/astropy/units/tests/test_cds_division.py b/astropy/units/tests/test_cds_division.py
+new file mode 100644
+index 000000000..ef969298c
+--- /dev/null
++++ b/astropy/units/tests/test_cds_division.py
+@@ -0,0 +1,21 @@
++# Test CDS unit parsing for chained divisions
++from astropy.units import Unit
++
++
++def _unit_map(u):
++    # Map unit cds-format-name -> integer power
++    return {b.get_format_name("cds"): int(p) for b, p in zip(u.bases, u.powers)}
++
++
++def test_chained_divisions():
++    # Ensure a/b/c is parsed as (a/b)/c, i.e., left-associative divisions
++    u = Unit("J/m/s/kpc2", format="cds")
++    m = _unit_map(u)
++    assert m == {"J": 1, "m": -1, "s": -1, "kpc": -2}
++
++
++def test_leading_division():
++    # Leading division like "/m/s" should be parsed as 1/(m*s)
++    u = Unit("/m/s", format="cds")
++    m = _unit_map(u)
++    assert m == {"m": -1, "s": -1}

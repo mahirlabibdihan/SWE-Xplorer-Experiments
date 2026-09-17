@@ -1,0 +1,80 @@
+diff --git a/lib/matplotlib/offsetbox.py b/lib/matplotlib/offsetbox.py
+index 1dee8a23d9..dff670e990 100644
+--- a/lib/matplotlib/offsetbox.py
++++ b/lib/matplotlib/offsetbox.py
+@@ -1505,6 +1505,9 @@ class DraggableBase:
+         if not ref_artist.pickable():
+             ref_artist.set_picker(True)
+         self.got_artist = False
++        # The canvas and callback ids are runtime-only handles that are
++        # not picklable (different backends, Qt objects, etc.). Store them
++        # for normal operation but exclude them from the pickled state.
+         self.canvas = self.ref_artist.figure.canvas
+         self._use_blit = use_blit and self.canvas.supports_blit
+         self.cids = [
+@@ -1514,6 +1517,38 @@ class DraggableBase:
+                 'button_release_event', self.on_release),
+         ]
+ 
++    def __getstate__(self):
++        """Return state for pickling.
++
++        Exclude non-picklable runtime-only attributes such as the
++        FigureCanvas and callback ids. This allows a Figure that has a
++        draggable legend/annotation to be pickled without raising because
++        the backend canvas can't be pickled.
++        """
++        state = self.__dict__.copy()
++        # Remove or neutralize attributes that reference the canvas or
++        # callback connections which are not picklable.
++        for key in ("canvas", "cids", "background", "_c1"):
++            if key in state:
++                # Keep a placeholder so setstate can restore a sane value.
++                state[key] = None
++        return state
++
++    def __setstate__(self, state):
++        """Restore state after unpickling.
++
++        After unpickling we leave the runtime-only attributes as None. If the
++        user wants to re-enable dragging they should call
++        ``Legend.set_draggable(True)`` (or equivalent) which will create new
++        runtime connections bound to the current FigureCanvas.
++        """
++        self.__dict__.update(state)
++        # Ensure runtime attributes are present and neutral.
++        if getattr(self, "cids", None) is None:
++            self.cids = []
++        if getattr(self, "canvas", None) is None:
++            self.canvas = None
++
+     def on_motion(self, evt):
+         if self._check_still_parented() and self.got_artist:
+             dx = evt.x - self.mouse_x
+@@ -1562,14 +1597,24 @@ class DraggableBase:
+ 
+     def disconnect(self):
+         """Disconnect the callbacks."""
++        # If canvas is not present (e.g., after unpickling), nothing to do.
++        if self.canvas is None:
++            return
+         for cid in self.cids:
+-            self.canvas.mpl_disconnect(cid)
++            try:
++                self.canvas.mpl_disconnect(cid)
++            except Exception:
++                # Be defensive: ignore any errors during disconnect.
++                pass
+         try:
+             c1 = self._c1
+         except AttributeError:
+             pass
+         else:
+-            self.canvas.mpl_disconnect(c1)
++            try:
++                self.canvas.mpl_disconnect(c1)
++            except Exception:
++                pass
+ 
+     def save_offset(self):
+         pass

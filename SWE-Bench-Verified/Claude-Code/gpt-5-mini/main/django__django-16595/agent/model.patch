@@ -1,0 +1,57 @@
+diff --git a/django/db/migrations/operations/fields.py b/django/db/migrations/operations/fields.py
+index cd3aab43ad..01c3eea4e1 100644
+--- a/django/db/migrations/operations/fields.py
++++ b/django/db/migrations/operations/fields.py
+@@ -247,6 +247,16 @@ class AlterField(FieldOperation):
+         return "alter_%s_%s" % (self.model_name_lower, self.name_lower)
+ 
+     def reduce(self, operation, app_label):
++        # If another AlterField on the same field follows, the earlier one
++        # can be replaced by the later one. This mirrors the behaviour of
++        # AddField.reduce where an AlterField following an AddField absorbs
++        # the change. It allows multiple AlterField operations that only
++        # modify field attributes to collapse into the last AlterField.
++        if isinstance(operation, AlterField) and self.is_same_field_operation(
++            operation
++        ):
++            return [operation]
++
+         if isinstance(operation, RemoveField) and self.is_same_field_operation(
+             operation
+         ):
+diff --git a/tests/migrations/test_optimizer.py b/tests/migrations/test_optimizer.py
+index 6485009eb4..eeef134ba5 100644
+--- a/tests/migrations/test_optimizer.py
++++ b/tests/migrations/test_optimizer.py
+@@ -1152,3 +1152,31 @@ class OptimizerTests(SimpleTestCase):
+                 ),
+             ]
+         )
++
++    def test_multiple_alterfield_collapse(self):
++        """
++        Multiple successive AlterField operations on the same field should
++        collapse into the final AlterField.
++        """
++        operations = [
++            migrations.AlterField("Book", "title", models.CharField(max_length=256, null=True)),
++            migrations.AlterField("Book", "title", models.CharField(max_length=128, null=True)),
++            migrations.AlterField(
++                "Book",
++                "title",
++                models.CharField(max_length=128, null=True, help_text="help"),
++            ),
++            migrations.AlterField(
++                "Book",
++                "title",
++                models.CharField(max_length=128, null=True, help_text="help", default=None),
++            ),
++        ]
++        expected = [
++            migrations.AlterField(
++                "Book",
++                "title",
++                models.CharField(max_length=128, null=True, help_text="help", default=None),
++            ),
++        ]
++        self.assertOptimizesTo(operations, expected)

@@ -1,0 +1,63 @@
+diff --git a/requests/auth.py b/requests/auth.py
+index a3de123..4e578c4 100644
+--- a/requests/auth.py
++++ b/requests/auth.py
+@@ -105,7 +105,7 @@ class HTTPDigestAuth(AuthBase):
+ 
+         A1 = '%s:%s:%s' % (self.username, realm, self.password)
+         A2 = '%s:%s' % (method, path)
+-        
++
+         HA1 = hash_utf8(A1)
+         HA2 = hash_utf8(A2)
+ 
+@@ -120,13 +120,33 @@ class HTTPDigestAuth(AuthBase):
+         s += os.urandom(8)
+ 
+         cnonce = (hashlib.sha1(s).hexdigest()[:16])
+-        noncebit = "%s:%s:%s:%s:%s" % (nonce, ncvalue, cnonce, qop, HA2)
++
++        # Choose the qop to use for the response. The server may provide a
++        # comma-separated list; the client must pick one (prefer 'auth').
++        qop_value = None
++        if qop:
++            # qop may be a comma-separated list of tokens
++            qop_tokens = [token.strip() for token in qop.split(',')]
++            if 'auth' in qop_tokens:
++                qop_value = 'auth'
++            elif 'auth-int' in qop_tokens:
++                qop_value = 'auth-int'
++            else:
++                # use the first token as a fallback
++                qop_value = qop_tokens[0]
++
++        # noncebit must use the chosen qop token (unquoted) for the digest
++        if qop_value:
++            noncebit = "%s:%s:%s:%s:%s" % (nonce, ncvalue, cnonce, qop_value, HA2)
++        else:
++            noncebit = "%s:%s:%s:%s:%s" % (nonce, ncvalue, cnonce, qop, HA2)
++
+         if _algorithm == 'MD5-SESS':
+             HA1 = hash_utf8('%s:%s:%s' % (HA1, nonce, cnonce))
+ 
+         if qop is None:
+             respdig = KD(HA1, "%s:%s" % (nonce, HA2))
+-        elif qop == 'auth' or 'auth' in qop.split(','):
++        elif qop_value == 'auth' or (qop_value is None and (qop == 'auth' or 'auth' in qop.split(','))):
+             respdig = KD(HA1, noncebit)
+         else:
+             # XXX handle auth-int.
+@@ -143,8 +163,11 @@ class HTTPDigestAuth(AuthBase):
+             base += ', algorithm="%s"' % algorithm
+         if entdig:
+             base += ', digest="%s"' % entdig
+-        if qop:
+-            base += ', qop=auth, nc=%s, cnonce="%s"' % (ncvalue, cnonce)
++        if qop_value:
++            # Quote the qop value in the Authorization header per RFC2617 and
++            # to match behavior of common clients (curl). Use the chosen token
++            # (e.g. "auth") and include nc and cnonce.
++            base += ', qop="%s", nc=%s, cnonce="%s"' % (qop_value, ncvalue, cnonce)
+ 
+         return 'Digest %s' % (base)
+ 

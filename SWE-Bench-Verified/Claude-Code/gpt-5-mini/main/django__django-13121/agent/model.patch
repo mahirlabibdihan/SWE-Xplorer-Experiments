@@ -1,0 +1,56 @@
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 2e283a3193..a4987e8819 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -579,8 +579,49 @@ class BaseDatabaseOperations:
+         return []
+ 
+     def convert_durationfield_value(self, value, expression, connection):
+-        if value is not None:
+-            return datetime.timedelta(0, 0, value)
++        """Convert a value from the database to a datetime.timedelta.
++
++        Non-native duration backends (e.g. SQLite, MySQL) store durations as
++        microseconds. The database driver may return that value as an int,
++        decimal.Decimal, bytes, or str. Be permissive when converting so that
++        different DB-API behaviors are handled correctly.
++        """
++        if value is None:
++            return None
++        # If the backend already returned a timedelta, just pass it through.
++        if isinstance(value, datetime.timedelta):
++            return value
++        # Decode bytes if necessary.
++        if isinstance(value, (bytes, bytearray)):
++            try:
++                value = value.decode()
++            except Exception:
++                # Fall back to converting the raw value to int below.
++                pass
++        # Try parsing textual duration formats first (ISO, PostgreSQL-style,
++        # or Django's preferred '%d %H:%M:%S.%f'). This covers cases where
++        # the DB returned a string representation of an interval.
++        if isinstance(value, str):
++            try:
++                from django.utils.dateparse import parse_duration
++
++                parsed = parse_duration(value)
++            except Exception:
++                parsed = None
++            if parsed is not None:
++                return parsed
++        # Otherwise, interpret the value as microseconds and build a
++        # timedelta. Be tolerant of decimal.Decimal and other numeric-like
++        # values.
++        try:
++            if isinstance(value, decimal.Decimal):
++                microseconds = int(value)
++            else:
++                microseconds = int(float(value)) if isinstance(value, float) else int(value)
++        except (TypeError, ValueError, decimal.InvalidOperation) as exc:
++            # As a last resort, raise the original exception for visibility.
++            raise
++        return datetime.timedelta(microseconds=microseconds)
+ 
+     def check_expression_support(self, expression):
+         """

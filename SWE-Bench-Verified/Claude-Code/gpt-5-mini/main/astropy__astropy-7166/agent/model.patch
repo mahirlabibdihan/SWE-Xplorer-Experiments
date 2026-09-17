@@ -1,0 +1,153 @@
+diff --git a/astropy/utils/misc.py b/astropy/utils/misc.py
+index de3fb01d1..cddaa6e35 100644
+--- a/astropy/utils/misc.py
++++ b/astropy/utils/misc.py
+@@ -528,14 +528,88 @@ class InheritDocstrings(type):
+                 not key.startswith('_'))
+ 
+         for key, val in dct.items():
+-            if (inspect.isfunction(val) and
+-                is_public_member(key) and
+-                val.__doc__ is None):
+-                for base in cls.__mro__[1:]:
+-                    super_method = getattr(base, key, None)
+-                    if super_method is not None:
+-                        val.__doc__ = super_method.__doc__
+-                        break
++            # Determine if this attribute is a function-like object whose
++            # __doc__ should be inherited.  This includes plain functions,
++            # classmethod/staticmethod wrappers and properties.
++            if not is_public_member(key):
++                continue
++
++            func = None
++            # Plain function defined in class body
++            if inspect.isfunction(val):
++                func = val
++            # classmethod and staticmethod wrap the function in __func__
++            elif isinstance(val, (classmethod, staticmethod)):
++                func = getattr(val, "__func__", None)
++            # property: inherit the docstring onto the fget function
++            elif isinstance(val, property):
++                func = getattr(val, 'fget', None)
++
++            if func is None or func.__doc__ is not None:
++                # Nothing to do for non-function attributes or if docstring
++                # is already present.
++                continue
++
++            # Walk MRO to find a base attribute with a docstring to inherit
++            for base in cls.__mro__[1:]:
++                super_attr = getattr(base, key, None)
++                if super_attr is None:
++                    continue
++
++                base_doc = None
++                # Unwrap descriptors on the base to find a docstring source
++                if isinstance(super_attr, (classmethod, staticmethod)):
++                    base_func = getattr(super_attr, "__func__", None)
++                    base_doc = getattr(base_func, "__doc__", None)
++                elif isinstance(super_attr, property):
++                    # property.__doc__ normally proxies to fget.__doc__
++                    base_doc = getattr(super_attr, "__doc__", None)
++                    if base_doc is None:
++                        base_fget = getattr(super_attr, 'fget', None)
++                        base_doc = getattr(base_fget, '__doc__', None)
++                else:
++                    # functions, methods or other callables
++                    base_doc = getattr(super_attr, '__doc__', None)
++
++                if base_doc:
++                    try:
++                        # For descriptors like property/classmethod/staticmethod,
++                        # the docstring may be held on the descriptor itself, so
++                        # update the class dict entry to a new descriptor that
++                        # carries the docstring. For plain functions, assigning
++                        # to __doc__ is sufficient.
++                        if isinstance(val, property):
++                            # Recreate property with the inherited doc on the
++                            # class so that the attribute reflects the docstring.
++                            new_prop = property(func, val.fset, val.fdel, base_doc)
++                            try:
++                                setattr(cls, key, new_prop)
++                            except Exception:
++                                # If setting fails, fall back to leaving it
++                                # unchanged.
++                                pass
++                        elif isinstance(val, classmethod):
++                            func.__doc__ = base_doc
++                            try:
++                                setattr(cls, key, classmethod(func))
++                            except Exception:
++                                pass
++                        elif isinstance(val, staticmethod):
++                            func.__doc__ = base_doc
++                            try:
++                                setattr(cls, key, staticmethod(func))
++                            except Exception:
++                                pass
++                        else:
++                            try:
++                                func.__doc__ = base_doc
++                            except Exception:
++                                pass
++                    except Exception:
++                        # Be robust: if we can't assign the docstring for any
++                        # reason, just skip it.
++                        pass
++                    break
+ 
+         super().__init__(name, bases, dct)
+ 
+diff --git a/astropy/utils/tests/test_misc.py b/astropy/utils/tests/test_misc.py
+index 4f632e8d1..e03976c47 100644
+--- a/astropy/utils/tests/test_misc.py
++++ b/astropy/utils/tests/test_misc.py
+@@ -89,6 +89,47 @@ def test_inherit_docstrings():
+         assert Subclass.__call__.__doc__ == "FOO"
+ 
+ 
++def test_inherit_docstrings_property_and_methods():
++    # Test that properties, classmethods and staticmethods inherit docstrings
++    class Base(metaclass=misc.InheritDocstrings):
++        @property
++        def value(self):
++            "Base property doc"
++            return 1
++
++        @classmethod
++        def clsmeth(cls):
++            "Base classmethod doc"
++            return cls
++
++        @staticmethod
++        def statmeth():
++            "Base staticmethod doc"
++            return 'x'
++
++    class Sub(Base):
++        @property
++        def value(self):
++            return 2
++
++        @classmethod
++        def clsmeth(cls):
++            return cls
++
++        @staticmethod
++        def statmeth():
++            return 'y'
++
++    # Only run these assertions if the base docstrings are present on this
++    # Python implementation
++    if Base.value.__doc__ is not None:
++        assert Sub.value.__doc__ == Base.value.__doc__
++    if Base.clsmeth.__doc__ is not None:
++        assert Sub.clsmeth.__doc__ == Base.clsmeth.__doc__
++    if Base.statmeth.__doc__ is not None:
++        assert Sub.statmeth.__doc__ == Base.statmeth.__doc__
++
++
+ def test_set_locale():
+     # First, test if the required locales are available
+     current = locale.setlocale(locale.LC_ALL)

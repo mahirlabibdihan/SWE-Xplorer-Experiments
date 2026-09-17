@@ -1,0 +1,38 @@
+diff --git a/django/db/backends/mysql/operations.py b/django/db/backends/mysql/operations.py
+index 50f85e0621..98549c21ef 100644
+--- a/django/db/backends/mysql/operations.py
++++ b/django/db/backends/mysql/operations.py
+@@ -69,9 +69,30 @@ class DatabaseOperations(BaseDatabaseOperations):
+             return "DATE(%s)" % (field_name)
+ 
+     def _convert_field_to_tz(self, field_name, tzname):
+-        if settings.USE_TZ:
+-            field_name = "CONVERT_TZ(%s, 'UTC', '%s')" % (field_name, tzname)
+-        return field_name
++        """
++        Convert a datetime/time field from the database timezone to tzname using
++        MySQL's CONVERT_TZ(). Previously the source timezone was hard-coded to
++        'UTC' which ignored a per-database TIME_ZONE setting and caused
++        lookups like __date to behave incorrectly for non-UTC legacy databases.
++
++        If time zone support is disabled or tzname is None, return the
++        unmodified field. If the database timezone name matches tzname, no
++        conversion is necessary.
++        """
++        if not settings.USE_TZ or not tzname:
++            return field_name
++
++        # The database wrapper exposes a timezone_name property (string) that
++        # reflects the TIME_ZONE setting for that connection (or 'UTC'). Use
++        # it as the source timezone for CONVERT_TZ rather than assuming UTC.
++        db_tzname = getattr(self.connection, 'timezone_name', 'UTC')
++        # When source and target timezones are identical, avoid calling
++        # CONVERT_TZ() — this also avoids requiring the MySQL timezone tables
++        # to be populated for trivial cases.
++        if db_tzname == tzname:
++            return field_name
++
++        return "CONVERT_TZ(%s, '%s', '%s')" % (field_name, db_tzname, tzname)
+ 
+     def datetime_cast_date_sql(self, field_name, tzname):
+         field_name = self._convert_field_to_tz(field_name, tzname)

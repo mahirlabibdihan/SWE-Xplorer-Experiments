@@ -1,0 +1,54 @@
+diff --git a/django/core/handlers/wsgi.py b/django/core/handlers/wsgi.py
+index c2b7cc2b6f..111dc8e74e 100644
+--- a/django/core/handlers/wsgi.py
++++ b/django/core/handlers/wsgi.py
+@@ -140,10 +140,31 @@ class WSGIHandler(base.BaseHandler):
+             *response.items(),
+             *(("Set-Cookie", c.output(header="")) for c in response.cookies.values()),
+         ]
++        # For HEAD requests, don't send a response body. Still ensure
++        # Content-Length is set as if a GET was performed for non-streaming
++        # responses so the client can determine the length without a body.
++        is_head = environ.get("REQUEST_METHOD", "").upper() == "HEAD"
++        if is_head:
++            try:
++                if not getattr(response, "streaming", False) and "Content-Length" not in response.headers:
++                    # Non-streaming response: set Content-Length to the
++                    # length of the content so HEAD responses match GET
++                    # headers (without the body).
++                    response.headers["Content-Length"] = str(len(response.content))
++            except Exception:
++                # Be conservative: if computing the length fails, don't set
++                # the header and proceed to close the response.
++                pass
++
+         start_response(status, response_headers)
++
++        # If `wsgi.file_wrapper` is available we normally wrap file-like
++        # responses to gain zero-copy behavior. However, for HEAD requests
++        # we must not stream the file, so avoid wrapping in that case and
++        # simply close the response and return an empty iterable.
+         if getattr(response, "file_to_stream", None) is not None and environ.get(
+             "wsgi.file_wrapper"
+-        ):
++        ) and not is_head:
+             # If `wsgi.file_wrapper` is used the WSGI server does not call
+             # .close on the response, but on the file wrapper. Patch it to use
+             # response.close instead which takes care of closing all files.
+@@ -151,6 +172,16 @@ class WSGIHandler(base.BaseHandler):
+             response = environ["wsgi.file_wrapper"](
+                 response.file_to_stream, response.block_size
+             )
++
++        if is_head:
++            # Ensure any resources the response holds are released and return
++            # an empty iterable so no body is sent to the client.
++            try:
++                response.close()
++            except Exception:
++                pass
++            return []
++
+         return response
+ 
+ 

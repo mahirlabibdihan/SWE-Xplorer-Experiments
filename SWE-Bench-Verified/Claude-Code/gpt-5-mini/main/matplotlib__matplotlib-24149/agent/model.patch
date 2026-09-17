@@ -1,0 +1,57 @@
+diff --git a/lib/matplotlib/cbook/__init__.py b/lib/matplotlib/cbook/__init__.py
+index 34c6ddb861..0bb9e276ed 100644
+--- a/lib/matplotlib/cbook/__init__.py
++++ b/lib/matplotlib/cbook/__init__.py
+@@ -1746,7 +1746,23 @@ def _safe_first_finite(obj, *, skip_nonfinite=True):
+         raise RuntimeError("matplotlib does not "
+                            "support generators as input")
+     else:
+-        return next(val for val in obj if safe_isfinite(val))
++        # Iterate to find the first finite value. If none is found, fall
++        # back to returning the first element (even if it is non-finite).
++        # Previously this used ``next(... )`` which raised StopIteration
++        # for sequences containing only non-finite values (e.g. [np.nan]),
++        # causing callers (such as Axes._convert_dx) to fail. Returning the
++        # first element in that case preserves the historical behavior of
++        # treating the first element as the reference even if it is NaN.
++        for val in obj:
++            if safe_isfinite(val):
++                return val
++        # No finite values found; try to return the first element.
++        try:
++            return obj[0]
++        except Exception:
++            # If the object is not indexable (shouldn't happen here),
++            # raise a RuntimeError similar to the iterator branch above.
++            raise RuntimeError("matplotlib does not support generators as input")
+ 
+ 
+ def sanitize_sequence(data):
+diff --git a/lib/matplotlib/tests/test_axes_bar_nan.py b/lib/matplotlib/tests/test_axes_bar_nan.py
+new file mode 100644
+index 0000000000..ffb05f9eee
+--- /dev/null
++++ b/lib/matplotlib/tests/test_axes_bar_nan.py
+@@ -0,0 +1,22 @@
++import numpy as np
++import matplotlib
++matplotlib.use('Agg')
++import matplotlib.pyplot as plt
++
++
++def test_bar_all_nan_does_not_raise():
++    """Ensure ax.bar doesn't raise when x positions are all NaN.
++
++    Regression test for an issue where cbook._safe_first_finite would
++    raise StopIteration for sequences with only non-finite values,
++    causing Axes._convert_dx (and thus ax.bar) to error.
++    """
++    fig, ax = plt.subplots()
++    # This previously raised StopIteration / propagated as an error.
++    bars = ax.bar([np.nan], [np.nan])
++    # We expect a BarContainer with a single Rectangle; its x and height may
++    # be NaN but the call should succeed.
++    assert len(bars) == 1
++    rect = bars[0]
++    assert np.isnan(rect.get_x()) or rect.get_x() is None
++    assert np.isnan(rect.get_height()) or rect.get_height() is None

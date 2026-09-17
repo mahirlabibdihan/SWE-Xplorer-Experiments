@@ -1,0 +1,85 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index ce18098fd2..27dffe4eef 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1123,15 +1123,29 @@ class Query(BaseExpression):
+                     self.check_query_object_type(v, opts, field)
+ 
+     def check_filterable(self, expression):
+-        """Raise an error if expression cannot be used in a WHERE clause."""
+-        if not getattr(expression, 'filterable', True):
+-            raise NotSupportedError(
+-                expression.__class__.__name__ + ' is disallowed in the filter '
+-                'clause.'
+-            )
+-        if hasattr(expression, 'get_source_expressions'):
+-            for expr in expression.get_source_expressions():
+-                self.check_filterable(expr)
++        """Raise an error if expression cannot be used in a WHERE clause.
++
++        Only expression-like objects (subclasses of BaseExpression or objects
++        that expose get_source_expressions) should be inspected for the
++        ``filterable`` attribute. Plain Python objects (for example model
++        instances) can legitimately define an attribute named ``filterable``
++        and must not be treated as SQL expressions.
++        """
++        # Only inspect expression-like objects. This prevents accidental
++        # attribute-name collisions (see case where a model instance has a
++        # BooleanField named "filterable").
++        is_expression_like = isinstance(expression, BaseExpression) or hasattr(
++            expression, 'get_source_expressions'
++        )
++        if is_expression_like:
++            if not getattr(expression, 'filterable', True):
++                raise NotSupportedError(
++                    expression.__class__.__name__ + ' is disallowed in the filter '
++                    'clause.'
++                )
++            if hasattr(expression, 'get_source_expressions'):
++                for expr in expression.get_source_expressions():
++                    self.check_filterable(expr)
+ 
+     def build_lookup(self, lookups, lhs, rhs):
+         """
+diff --git a/tests/regressions/test_check_filterable.py b/tests/regressions/test_check_filterable.py
+new file mode 100644
+index 0000000000..ce88416ac9
+--- /dev/null
++++ b/tests/regressions/test_check_filterable.py
+@@ -0,0 +1,36 @@
++import pytest
++
++from django.db import NotSupportedError
++from django.db.models.expressions import BaseExpression
++from django.db.models.sql.query import Query
++
++
++class DummyExpression(BaseExpression):
++    """A minimal expression-like object exposing filterable=False."""
++
++    def __init__(self):
++        self.filterable = False
++
++    def get_source_expressions(self):
++        return []
++
++
++def test_non_expression_with_filterable_attribute_is_allowed():
++    """Plain Python objects with an attribute named 'filterable' should not be
++    treated as SQL expressions and therefore should not trigger
++    NotSupportedError."""
++    q = Query(None)
++
++    class Plain:
++        filterable = False
++
++    # Should not raise
++    q.check_filterable(Plain())
++
++
++def test_expression_with_filterable_false_raises():
++    """Objects that are expression-like and have filterable=False should raise
++    NotSupportedError as before."""
++    q = Query(None)
++    with pytest.raises(NotSupportedError):
++        q.check_filterable(DummyExpression())

@@ -1,0 +1,91 @@
+diff --git a/sphinx/directives/other.py b/sphinx/directives/other.py
+index 19f7c0a8d..f88678c4e 100644
+--- a/sphinx/directives/other.py
++++ b/sphinx/directives/other.py
+@@ -369,14 +369,82 @@ class Include(BaseInclude, SphinxDirective):
+     """
+ 
+     def run(self) -> list[Node]:
+-        if self.arguments[0].startswith('<') and \
+-           self.arguments[0].endswith('>'):
+-            # docutils "standard" includes, do not do path processing
++        # If this is a <...> standard include, fall back to docutils behavior
++        if self.arguments[0].startswith('<') and self.arguments[0].endswith('>'):
+             return super().run()
++
++        # Resolve to absolute filename and record as included
+         rel_filename, filename = self.env.relfn2path(self.arguments[0])
+         self.arguments[0] = filename
+         self.env.note_included(filename)
+-        return super().run()
++
++        # For 'literal', 'code' and 'parser' options, delegate to BaseInclude
++        # which handles those cases itself (literal blocks, code blocks, or
++        # parsing into a dummy document).
++        if 'literal' in self.options or 'code' in self.options or 'parser' in self.options:
++            return super().run()
++
++        # For the common case of including reST source, read the included file
++        # ourselves so we can emit Sphinx's "source-read" event and allow
++        # extensions to modify the included text before it is inserted into
++        # the state's input stream. This ensures that handlers connected to
++        # 'source-read' see and can modify the content of included files.
++        from docutils import io as _io, statemachine as _statemachine
++
++        path = filename
++        encoding = self.options.get('encoding', self.state.document.settings.input_encoding)
++        e_handler = self.state.document.settings.input_encoding_error_handler
++        tab_width = self.options.get('tab-width', self.state.document.settings.tab_width)
++
++        try:
++            include_file = _io.FileInput(source_path=path, encoding=encoding, error_handler=e_handler)
++        except UnicodeEncodeError:
++            raise self.warning(f'"{self.name}" directive path: Cannot encode input file path "{path}" (wrong locale?).')
++        except OSError as error:
++            raise self.severe(f'Problems with "{self.name}" directive path:\n{_io.error_string(error)}.')
++        else:
++            # record dependencies like docutils' Include
++            self.state.document.settings.record_dependencies.add(path)
++
++        try:
++            rawtext = include_file.read()
++        except UnicodeError as error:
++            raise self.severe(f'Problem with "{self.name}" directive:\n' + _io.error_string(error))
++
++        # Let Sphinx extensions modify the included source via the
++        # "source-read" event.  The event handler may replace the
++        # text by writing into the list arg; follow the same convention
++        # used in SphinxStandaloneReader.read_source.
++        doc = self.env.path2doc(path)
++        arg = [rawtext]
++        # If doc is None (no docname mapping), pass the including document's
++        # docname so that handlers still get a meaningful docname.
++        docname_for_event = doc or self.env.docname
++        self.env.events.emit('source-read', docname_for_event, arg)
++        rawtext = arg[0]
++
++        # Append end marker and insert into the parser state machine
++        include_lines = _statemachine.string2lines(rawtext, tab_width, convert_whitespace=True)
++        include_lines += ['', ".. end of inclusion from \"%s\"" % path]
++
++        # Basic check for line length similarly to docutils' Include
++        for i, line in enumerate(include_lines):
++            if len(line) > self.state.document.settings.line_length_limit:
++                raise self.warning('"%s": line %d exceeds the line-length-limit.' % (path, i+1))
++
++        # Insert the processed lines into the parser's input stream so they'll
++        # be parsed as if they were part of the including document.
++        self.state_machine.insert_input(include_lines, path)
++
++        # update include-log in the including document (docutils' behavior)
++        # log entries are tuples (<source>, <clip-options>)
++        clip_options = (None, None, None, None)
++        include_log = self.state.document.include_log
++        if not include_log:  # new document, initialize with document source
++            include_log.append((self.state.document.current_source, (None, None, None, None)))
++        include_log.append((path, clip_options))
++
++        return []
+ 
+ 
+ def setup(app: Sphinx) -> dict[str, Any]:

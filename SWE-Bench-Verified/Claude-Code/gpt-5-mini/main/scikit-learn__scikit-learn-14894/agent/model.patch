@@ -1,0 +1,78 @@
+diff --git a/sklearn/svm/base.py b/sklearn/svm/base.py
+index 64cebe837..9e7d17f73 100644
+--- a/sklearn/svm/base.py
++++ b/sklearn/svm/base.py
+@@ -286,12 +286,29 @@ class BaseLibSVM(BaseEstimator, metaclass=ABCMeta):
+             n_class = 1
+         n_SV = self.support_vectors_.shape[0]
+ 
+-        dual_coef_indices = np.tile(np.arange(n_SV), n_class)
+-        dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
+-                                     dual_coef_indices.size / n_class)
+-        self.dual_coef_ = sp.csr_matrix(
+-            (dual_coef_data, dual_coef_indices, dual_coef_indptr),
+-            (n_class, n_SV))
++        # Handle the degenerate case where there are no support vectors.
++        # In that case dual_coef_ should be an empty CSR matrix with shape
++        # (n_class, 0). Constructing the indptr with a step of
++        # (dual_coef_indices.size / n_class) would cause a ZeroDivisionError
++        # when n_SV == 0, so short-circuit to build an explicit empty CSR.
++        if n_SV == 0:
++            # CSR representation expects (data, indices, indptr) where
++            # indptr has length n_rows + 1. For an empty matrix with
++            # n_class rows and 0 columns, indptr should be zeros of length
++            # n_class + 1.
++            empty_data = np.array([], dtype=np.float64)
++            empty_indices = np.array([], dtype=np.int32)
++            empty_indptr = np.zeros(n_class + 1, dtype=np.int32)
++            self.dual_coef_ = sp.csr_matrix(
++                (empty_data, empty_indices, empty_indptr),
++                shape=(n_class, n_SV))
++        else:
++            dual_coef_indices = np.tile(np.arange(n_SV), n_class)
++            dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
++                                         dual_coef_indices.size / n_class)
++            self.dual_coef_ = sp.csr_matrix(
++                (dual_coef_data, dual_coef_indices, dual_coef_indptr),
++                (n_class, n_SV))
+ 
+     def predict(self, X):
+         """Perform regression on samples in X.
+diff --git a/sklearn/svm/tests/test_sparse_empty_support_vectors.py b/sklearn/svm/tests/test_sparse_empty_support_vectors.py
+new file mode 100644
+index 000000000..350518273
+--- /dev/null
++++ b/sklearn/svm/tests/test_sparse_empty_support_vectors.py
+@@ -0,0 +1,32 @@
++import numpy as np
++from scipy import sparse
++from sklearn.svm import SVR
++
++
++def test_sparse_fit_with_empty_support_vectors():
++    # Reproducer: sparse input where libsvm may return no support vectors
++    x_train = np.array([[0, 1, 0, 0],
++                        [0, 0, 0, 1],
++                        [0, 0, 1, 0],
++                        [0, 0, 0, 1]])
++    y_train = np.array([0.04, 0.04, 0.10, 0.16])
++
++    model = SVR(C=316.227766017, cache_size=200, coef0=0.0, degree=3,
++                epsilon=0.1, gamma=1.0, kernel='linear', max_iter=15000,
++                shrinking=True, tol=0.001, verbose=False)
++
++    # dense fit should work
++    model.fit(x_train, y_train)
++
++    # convert to sparse and ensure fit does not raise and dual_coef_ is CSR
++    xtrain = sparse.csr_matrix(x_train)
++    model.fit(xtrain, y_train)
++
++    # dual_coef_ should be a scipy.sparse.csr_matrix with correct shape
++    assert hasattr(model, "dual_coef_")
++    from scipy.sparse import csr_matrix
++    assert isinstance(model.dual_coef_, csr_matrix)
++    # for regression, n_class == 1 and if no support vectors, second dimension == 0
++    assert model.dual_coef_.shape[0] == 1
++    # number of columns equals number of support vectors
++    assert model.dual_coef_.shape[1] == model.support_vectors_.shape[0]

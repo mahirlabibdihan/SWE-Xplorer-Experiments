@@ -1,0 +1,63 @@
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..085f6bcd1 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -4662,18 +4662,41 @@ class DefinitionParser(BaseParser):
+                       integer_literal_re, octal_literal_re]:
+             pos = self.pos
+             if self.match(regex):
++                # consume builtin suffix characters (f, l, u, etc.)
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
++
++                # user-defined literal suffix (identifier) may follow numeric literals
++                # e.g., 1q_s, 6.626e-34q_J
++                if self.match(identifier_re):
++                    # include identifier suffix in the literal text
++                    return ASTNumberLiteral(self.definition[pos:self.pos])
++
+                 return ASTNumberLiteral(self.definition[pos:self.pos])
+ 
+         string = self._parse_string()
+         if string is not None:
++            # string literal may be followed by a user-defined literal suffix
++            # e.g., "hello"_udl
++            start_pos = self.pos - len(string)
++            # after _parse_string, self.pos points after the closing quote
++            if self.match(identifier_re):
++                # include the suffix in the returned literal text
++                full = self.definition[start_pos:self.pos]
++                return ASTStringLiteral(full)
+             return ASTStringLiteral(string)
+ 
+         # character-literal
++        pos = self.pos
+         if self.match(char_literal_re):
+             prefix = self.last_match.group(1)  # may be None when no prefix
+             data = self.last_match.group(2)
++            # If a user-defined literal suffix follows a character literal
++            # (e.g., 'a'_udl), include the suffix and return as string-like
++            # literal node so display keeps the suffix intact.
++            if self.match(identifier_re):
++                full = self.definition[pos:self.pos]
++                return ASTStringLiteral(full)
+             try:
+                 return ASTCharLiteral(prefix, data)
+             except UnicodeDecodeError as e:
+@@ -4682,7 +4705,15 @@ class DefinitionParser(BaseParser):
+                 self.fail("Can not handle character literal"
+                           " resulting in multiple decoded characters.")
+ 
+-        # TODO: user-defined lit
++        # user-defined literal: if we reach here, none of the above matched, but a
++        # user-defined literal may be present (e.g., a numeric literal parsing that
++        # wasn't covered). Try a fallback: if an identifier-like token appears here,
++        # treat it as a user-defined literal (best-effort)
++        if self.match(identifier_re):
++            # return the identifier as a literal-like node so the parser doesn't
++            # choke further up. This is a weak fallback but prevents hard failures.
++            return ASTStringLiteral(self.matched_text)
++
+         return None
+ 
+     def _parse_fold_or_paren_expression(self) -> ASTExpression:

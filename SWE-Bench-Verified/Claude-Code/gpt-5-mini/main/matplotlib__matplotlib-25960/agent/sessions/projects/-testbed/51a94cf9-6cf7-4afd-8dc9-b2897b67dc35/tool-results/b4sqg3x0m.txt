@@ -1,0 +1,841 @@
+        The *subfigure* concept is new in v3.4, and the API is still provisional.
+    """
+
+    def __init__(self, parent, subplotspec, *,
+                 facecolor=None,
+                 edgecolor=None,
+                 linewidth=0.0,
+                 frameon=None,
+                 **kwargs):
+        """
+        Parameters
+        ----------
+        parent : `.Figure` or `.SubFigure`
+            Figure or subfigure that contains the SubFigure.  SubFigures
+            can be nested.
+
+        subplotspec : `.gridspec.SubplotSpec`
+            Defines the region in a parent gridspec where the subfigure will
+            be placed.
+
+        facecolor : default: ``"none"``
+            The figure patch face color; transparent by default.
+
+        edgecolor : default: :rc:`figure.edgecolor`
+            The figure patch edge color.
+
+        linewidth : float
+            The linewidth of the frame (i.e. the edge linewidth of the figure
+            patch).
+
+        frameon : bool, default: :rc:`figure.frameon`
+            If ``False``, suppress drawing the figure background patch.
+
+        Other Parameters
+        ----------------
+        **kwargs : `.SubFigure` properties, optional
+
+            %(SubFigure:kwdoc)s
+        """
+        super().__init__(**kwargs)
+        if facecolor is None:
+            facecolor = "none"
+        if edgecolor is None:
+            edgecolor = mpl.rcParams['figure.edgecolor']
+        if frameon is None:
+            frameon = mpl.rcParams['figure.frameon']
+
+        self._subplotspec = subplotspec
+        self._parent = parent
+        self.figure = parent.figure
+
+        # subfigures use the parent axstack
+        self._axstack = parent._axstack
+        self.subplotpars = parent.subplotpars
+        self.dpi_scale_trans = parent.dpi_scale_trans
+        self._axobservers = parent._axobservers
+        self.canvas = parent.canvas
+        self.transFigure = parent.transFigure
+        self.bbox_relative = None
+        self._redo_transform_rel_fig()
+        self.figbbox = self._parent.figbbox
+        self.bbox = TransformedBbox(self.bbox_relative,
+                                    self._parent.transSubfigure)
+        self.transSubfigure = BboxTransformTo(self.bbox)
+
+        self.patch = Rectangle(
+            xy=(0, 0), width=1, height=1, visible=frameon,
+            facecolor=facecolor, edgecolor=edgecolor, linewidth=linewidth,
+            # Don't let the figure patch influence bbox calculation.
+            in_layout=False, transform=self.transSubfigure)
+        self._set_artist_props(self.patch)
+        self.patch.set_antialiased(False)
+
+    @property
+    def dpi(self):
+        return self._parent.dpi
+
+    @dpi.setter
+    def dpi(self, value):
+        self._parent.dpi = value
+
+    def get_dpi(self):
+        """
+        Return the resolution of the parent figure in dots-per-inch as a float.
+        """
+        return self._parent.dpi
+
+    def set_dpi(self, val):
+        """
+        Set the resolution of parent figure in dots-per-inch.
+
+        Parameters
+        ----------
+        val : float
+        """
+        self._parent.dpi = val
+        self.stale = True
+
+    def _get_renderer(self):
+        return self._parent._get_renderer()
+
+    def _redo_transform_rel_fig(self, bbox=None):
+        """
+        Make the transSubfigure bbox relative to Figure transform.
+
+        Parameters
+        ----------
+        bbox : bbox or None
+            If not None, then the bbox is used for relative bounding box.
+            Otherwise, it is calculated from the subplotspec.
+        """
+        if bbox is not None:
+            self.bbox_relative.p0 = bbox.p0
+            self.bbox_relative.p1 = bbox.p1
+            return
+        # need to figure out *where* this subplotspec is.
+        gs = self._subplotspec.get_gridspec()
+        wr = np.asarray(gs.get_width_ratios())
+        hr = np.asarray(gs.get_height_ratios())
+        dx = wr[self._subplotspec.colspan].sum() / wr.sum()
+        dy = hr[self._subplotspec.rowspan].sum() / hr.sum()
+        x0 = wr[:self._subplotspec.colspan.start].sum() / wr.sum()
+        y0 = 1 - hr[:self._subplotspec.rowspan.stop].sum() / hr.sum()
+        if self.bbox_relative is None:
+            self.bbox_relative = Bbox.from_bounds(x0, y0, dx, dy)
+        else:
+            self.bbox_relative.p0 = (x0, y0)
+            self.bbox_relative.p1 = (x0 + dx, y0 + dy)
+
+    def get_constrained_layout(self):
+        """
+        Return whether constrained layout is being used.
+
+        See :ref:`constrainedlayout_guide`.
+        """
+        return self._parent.get_constrained_layout()
+
+    def get_constrained_layout_pads(self, relative=False):
+        """
+        Get padding for ``constrained_layout``.
+
+        Returns a list of ``w_pad, h_pad`` in inches and
+        ``wspace`` and ``hspace`` as fractions of the subplot.
+
+        See :ref:`constrainedlayout_guide`.
+
+        Parameters
+        ----------
+        relative : bool
+            If `True`, then convert from inches to figure relative.
+        """
+        return self._parent.get_constrained_layout_pads(relative=relative)
+
+    def get_layout_engine(self):
+        return self._parent.get_layout_engine()
+
+    @property
+    def axes(self):
+        """
+        List of Axes in the SubFigure.  You can access and modify the Axes
+        in the SubFigure through this list.
+
+        Modifying this list has no effect. Instead, use `~.SubFigure.add_axes`,
+        `~.SubFigure.add_subplot` or `~.SubFigure.delaxes` to add or remove an
+        Axes.
+
+        Note: The `.SubFigure.axes` property and `~.SubFigure.get_axes` method
+        are equivalent.
+        """
+        return self._localaxes[:]
+
+    get_axes = axes.fget
+
+    def draw(self, renderer):
+        # docstring inherited
+
+        # draw the figure bounding box, perhaps none for white figure
+        if not self.get_visible():
+            return
+
+        artists = self._get_draw_artists(renderer)
+
+        try:
+            renderer.open_group('subfigure', gid=self.get_gid())
+            self.patch.draw(renderer)
+            mimage._draw_list_compositing_images(
+                renderer, self, artists, self.figure.suppressComposite)
+            for sfig in self.subfigs:
+                sfig.draw(renderer)
+            renderer.close_group('subfigure')
+
+        finally:
+            self.stale = False
+
+
+@_docstring.interpd
+class Figure(FigureBase):
+    """
+    The top level container for all the plot elements.
+
+    Attributes
+    ----------
+    patch
+        The `.Rectangle` instance representing the figure background patch.
+
+    suppressComposite
+        For multiple images, the figure will make composite images
+        depending on the renderer option_image_nocomposite function.  If
+        *suppressComposite* is a boolean, this will override the renderer.
+    """
+
+    def __str__(self):
+        return "Figure(%gx%g)" % tuple(self.bbox.size)
+
+    def __repr__(self):
+        return "<{clsname} size {h:g}x{w:g} with {naxes} Axes>".format(
+            clsname=self.__class__.__name__,
+            h=self.bbox.size[0], w=self.bbox.size[1],
+            naxes=len(self.axes),
+        )
+
+    def __init__(self,
+                 figsize=None,
+                 dpi=None,
+                 *,
+                 facecolor=None,
+                 edgecolor=None,
+                 linewidth=0.0,
+                 frameon=None,
+                 subplotpars=None,  # rc figure.subplot.*
+                 tight_layout=None,  # rc figure.autolayout
+                 constrained_layout=None,  # rc figure.constrained_layout.use
+                 layout=None,
+                 **kwargs
+                 ):
+        """
+        Parameters
+        ----------
+        figsize : 2-tuple of floats, default: :rc:`figure.figsize`
+            Figure dimension ``(width, height)`` in inches.
+
+        dpi : float, default: :rc:`figure.dpi`
+            Dots per inch.
+
+        facecolor : default: :rc:`figure.facecolor`
+            The figure patch facecolor.
+
+        edgecolor : default: :rc:`figure.edgecolor`
+            The figure patch edge color.
+
+        linewidth : float
+            The linewidth of the frame (i.e. the edge linewidth of the figure
+            patch).
+
+        frameon : bool, default: :rc:`figure.frameon`
+            If ``False``, suppress drawing the figure background patch.
+
+        subplotpars : `SubplotParams`
+            Subplot parameters. If not given, the default subplot
+            parameters :rc:`figure.subplot.*` are used.
+
+        tight_layout : bool or dict, default: :rc:`figure.autolayout`
+            Whether to use the tight layout mechanism. See `.set_tight_layout`.
+
+            .. admonition:: Discouraged
+
+                The use of this parameter is discouraged. Please use
+                ``layout='tight'`` instead for the common case of
+                ``tight_layout=True`` and use `.set_tight_layout` otherwise.
+
+        constrained_layout : bool, default: :rc:`figure.constrained_layout.use`
+            This is equal to ``layout='constrained'``.
+
+            .. admonition:: Discouraged
+
+                The use of this parameter is discouraged. Please use
+                ``layout='constrained'`` instead.
+
+        layout : {'constrained', 'compressed', 'tight', 'none', `.LayoutEngine`, \
+None}, default: None
+            The layout mechanism for positioning of plot elements to avoid
+            overlapping Axes decorations (labels, ticks, etc). Note that
+            layout managers can have significant performance penalties.
+
+            - 'constrained': The constrained layout solver adjusts axes sizes
+              to avoid overlapping axes decorations.  Can handle complex plot
+              layouts and colorbars, and is thus recommended.
+
+              See :ref:`constrainedlayout_guide`
+              for examples.
+
+            - 'compressed': uses the same algorithm as 'constrained', but
+              removes extra space between fixed-aspect-ratio Axes.  Best for
+              simple grids of axes.
+
+            - 'tight': Use the tight layout mechanism. This is a relatively
+              simple algorithm that adjusts the subplot parameters so that
+              decorations do not overlap. See `.Figure.set_tight_layout` for
+              further details.
+
+            - 'none': Do not use a layout engine.
+
+            - A `.LayoutEngine` instance. Builtin layout classes are
+              `.ConstrainedLayoutEngine` and `.TightLayoutEngine`, more easily
+              accessible by 'constrained' and 'tight'.  Passing an instance
+              allows third parties to provide their own layout engine.
+
+            If not given, fall back to using the parameters *tight_layout* and
+            *constrained_layout*, including their config defaults
+            :rc:`figure.autolayout` and :rc:`figure.constrained_layout.use`.
+
+        Other Parameters
+        ----------------
+        **kwargs : `.Figure` properties, optional
+
+            %(Figure:kwdoc)s
+        """
+        super().__init__(**kwargs)
+        self.figure = self
+        self._layout_engine = None
+
+        if layout is not None:
+            if (tight_layout is not None):
+                _api.warn_external(
+                    "The Figure parameters 'layout' and 'tight_layout' cannot "
+                    "be used together. Please use 'layout' only.")
+            if (constrained_layout is not None):
+                _api.warn_external(
+                    "The Figure parameters 'layout' and 'constrained_layout' "
+                    "cannot be used together. Please use 'layout' only.")
+            self.set_layout_engine(layout=layout)
+        elif tight_layout is not None:
+            if constrained_layout is not None:
+                _api.warn_external(
+                    "The Figure parameters 'tight_layout' and "
+                    "'constrained_layout' cannot be used together. Please use "
+                    "'layout' parameter")
+            self.set_layout_engine(layout='tight')
+            if isinstance(tight_layout, dict):
+                self.get_layout_engine().set(**tight_layout)
+        elif constrained_layout is not None:
+            if isinstance(constrained_layout, dict):
+                self.set_layout_engine(layout='constrained')
+                self.get_layout_engine().set(**constrained_layout)
+            elif constrained_layout:
+                self.set_layout_engine(layout='constrained')
+
+        else:
+            # everything is None, so use default:
+            self.set_layout_engine(layout=layout)
+
+        # Callbacks traditionally associated with the canvas (and exposed with
+        # a proxy property), but that actually need to be on the figure for
+        # pickling.
+        self._canvas_callbacks = cbook.CallbackRegistry(
+            signals=FigureCanvasBase.events)
+        connect = self._canvas_callbacks._connect_picklable
+        self._mouse_key_ids = [
+            connect('key_press_event', backend_bases._key_handler),
+            connect('key_release_event', backend_bases._key_handler),
+            connect('key_release_event', backend_bases._key_handler),
+            connect('button_press_event', backend_bases._mouse_handler),
+            connect('button_release_event', backend_bases._mouse_handler),
+            connect('scroll_event', backend_bases._mouse_handler),
+            connect('motion_notify_event', backend_bases._mouse_handler),
+        ]
+        self._button_pick_id = connect('button_press_event', self.pick)
+        self._scroll_pick_id = connect('scroll_event', self.pick)
+
+        if figsize is None:
+            figsize = mpl.rcParams['figure.figsize']
+        if dpi is None:
+            dpi = mpl.rcParams['figure.dpi']
+        if facecolor is None:
+            facecolor = mpl.rcParams['figure.facecolor']
+        if edgecolor is None:
+            edgecolor = mpl.rcParams['figure.edgecolor']
+        if frameon is None:
+            frameon = mpl.rcParams['figure.frameon']
+
+        if not np.isfinite(figsize).all() or (np.array(figsize) < 0).any():
+            raise ValueError('figure size must be positive finite not '
+                             f'{figsize}')
+        self.bbox_inches = Bbox.from_bounds(0, 0, *figsize)
+
+        self.dpi_scale_trans = Affine2D().scale(dpi)
+        # do not use property as it will trigger
+        self._dpi = dpi
+        self.bbox = TransformedBbox(self.bbox_inches, self.dpi_scale_trans)
+        self.figbbox = self.bbox
+        self.transFigure = BboxTransformTo(self.bbox)
+        self.transSubfigure = self.transFigure
+
+        self.patch = Rectangle(
+            xy=(0, 0), width=1, height=1, visible=frameon,
+            facecolor=facecolor, edgecolor=edgecolor, linewidth=linewidth,
+            # Don't let the figure patch influence bbox calculation.
+            in_layout=False)
+        self._set_artist_props(self.patch)
+        self.patch.set_antialiased(False)
+
+        FigureCanvasBase(self)  # Set self.canvas.
+
+        if subplotpars is None:
+            subplotpars = SubplotParams()
+
+        self.subplotpars = subplotpars
+
+        self._axstack = _AxesStack()  # track all figure axes and current axes
+        self.clear()
+
+    def pick(self, mouseevent):
+        if not self.canvas.widgetlock.locked():
+            super().pick(mouseevent)
+
+    def _check_layout_engines_compat(self, old, new):
+        """
+        Helper for set_layout engine
+
+        If the figure has used the old engine and added a colorbar then the
+        value of colorbar_gridspec must be the same on the new engine.
+        """
+        if old is None or new is None:
+            return True
+        if old.colorbar_gridspec == new.colorbar_gridspec:
+            return True
+        # colorbar layout different, so check if any colorbars are on the
+        # figure...
+        for ax in self.axes:
+            if hasattr(ax, '_colorbar'):
+                # colorbars list themselves as a colorbar.
+                return False
+        return True
+
+    def set_layout_engine(self, layout=None, **kwargs):
+        """
+        Set the layout engine for this figure.
+
+        Parameters
+        ----------
+        layout: {'constrained', 'compressed', 'tight', 'none'} or \
+`LayoutEngine` or None
+
+            - 'constrained' will use `~.ConstrainedLayoutEngine`
+            - 'compressed' will also use `~.ConstrainedLayoutEngine`, but with
+              a correction that attempts to make a good layout for fixed-aspect
+              ratio Axes.
+            - 'tight' uses `~.TightLayoutEngine`
+            - 'none' removes layout engine.
+
+            If `None`, the behavior is controlled by :rc:`figure.autolayout`
+            (which if `True` behaves as if 'tight' was passed) and
+            :rc:`figure.constrained_layout.use` (which if `True` behaves as if
+            'constrained' was passed).  If both are `True`,
+            :rc:`figure.autolayout` takes priority.
+
+            Users and libraries can define their own layout engines and pass
+            the instance directly as well.
+
+        kwargs: dict
+            The keyword arguments are passed to the layout engine to set things
+            like padding and margin sizes.  Only used if *layout* is a string.
+
+        """
+        if layout is None:
+            if mpl.rcParams['figure.autolayout']:
+                layout = 'tight'
+            elif mpl.rcParams['figure.constrained_layout.use']:
+                layout = 'constrained'
+            else:
+                self._layout_engine = None
+                return
+        if layout == 'tight':
+            new_layout_engine = TightLayoutEngine(**kwargs)
+        elif layout == 'constrained':
+            new_layout_engine = ConstrainedLayoutEngine(**kwargs)
+        elif layout == 'compressed':
+            new_layout_engine = ConstrainedLayoutEngine(compress=True,
+                                                        **kwargs)
+        elif layout == 'none':
+            if self._layout_engine is not None:
+                new_layout_engine = PlaceHolderLayoutEngine(
+                    self._layout_engine.adjust_compatible,
+                    self._layout_engine.colorbar_gridspec
+                )
+            else:
+                new_layout_engine = None
+        elif isinstance(layout, LayoutEngine):
+            new_layout_engine = layout
+        else:
+            raise ValueError(f"Invalid value for 'layout': {layout!r}")
+
+        if self._check_layout_engines_compat(self._layout_engine,
+                                             new_layout_engine):
+            self._layout_engine = new_layout_engine
+        else:
+            raise RuntimeError('Colorbar layout of new layout engine not '
+                               'compatible with old engine, and a colorbar '
+                               'has been created.  Engine not changed.')
+
+    def get_layout_engine(self):
+        return self._layout_engine
+
+    # TODO: I'd like to dynamically add the _repr_html_ method
+    # to the figure in the right context, but then IPython doesn't
+    # use it, for some reason.
+
+    def _repr_html_(self):
+        # We can't use "isinstance" here, because then we'd end up importing
+        # webagg unconditionally.
+        if 'WebAgg' in type(self.canvas).__name__:
+            from matplotlib.backends import backend_webagg
+            return backend_webagg.ipython_inline_display(self)
+
+    def show(self, warn=True):
+        """
+        If using a GUI backend with pyplot, display the figure window.
+
+        If the figure was not created using `~.pyplot.figure`, it will lack
+        a `~.backend_bases.FigureManagerBase`, and this method will raise an
+        AttributeError.
+
+        .. warning::
+
+            This does not manage an GUI event loop. Consequently, the figure
+            may only be shown briefly or not shown at all if you or your
+            environment are not managing an event loop.
+
+            Use cases for `.Figure.show` include running this from a GUI
+            application (where there is persistently an event loop running) or
+            from a shell, like IPython, that install an input hook to allow the
+            interactive shell to accept input while the figure is also being
+            shown and interactive.  Some, but not all, GUI toolkits will
+            register an input hook on import.  See :ref:`cp_integration` for
+            more details.
+
+            If you're in a shell without input hook integration or executing a
+            python script, you should use `matplotlib.pyplot.show` with
+            ``block=True`` instead, which takes care of starting and running
+            the event loop for you.
+
+        Parameters
+        ----------
+        warn : bool, default: True
+            If ``True`` and we are not running headless (i.e. on Linux with an
+            unset DISPLAY), issue warning when called on a non-GUI backend.
+
+        """
+        if self.canvas.manager is None:
+            raise AttributeError(
+                "Figure.show works only for figures managed by pyplot, "
+                "normally created by pyplot.figure()")
+        try:
+            self.canvas.manager.show()
+        except NonGuiException as exc:
+            if warn:
+                _api.warn_external(str(exc))
+
+    @property
+    def axes(self):
+        """
+        List of Axes in the Figure. You can access and modify the Axes in the
+        Figure through this list.
+
+        Do not modify the list itself. Instead, use `~Figure.add_axes`,
+        `~.Figure.add_subplot` or `~.Figure.delaxes` to add or remove an Axes.
+
+        Note: The `.Figure.axes` property and `~.Figure.get_axes` method are
+        equivalent.
+        """
+        return self._axstack.as_list()
+
+    get_axes = axes.fget
+
+    def _get_renderer(self):
+        if hasattr(self.canvas, 'get_renderer'):
+            return self.canvas.get_renderer()
+        else:
+            return _get_renderer(self)
+
+    def _get_dpi(self):
+        return self._dpi
+
+    def _set_dpi(self, dpi, forward=True):
+        """
+        Parameters
+        ----------
+        dpi : float
+
+        forward : bool
+            Passed on to `~.Figure.set_size_inches`
+        """
+        if dpi == self._dpi:
+            # We don't want to cause undue events in backends.
+            return
+        self._dpi = dpi
+        self.dpi_scale_trans.clear().scale(dpi)
+        w, h = self.get_size_inches()
+        self.set_size_inches(w, h, forward=forward)
+
+    dpi = property(_get_dpi, _set_dpi, doc="The resolution in dots per inch.")
+
+    def get_tight_layout(self):
+        """Return whether `.tight_layout` is called when drawing."""
+        return isinstance(self.get_layout_engine(), TightLayoutEngine)
+
+    @_api.deprecated("3.6", alternative="set_layout_engine",
+                     pending=True)
+    def set_tight_layout(self, tight):
+        """
+        [*Discouraged*] Set whether and how `.tight_layout` is called when
+        drawing.
+
+        .. admonition:: Discouraged
+
+            This method is discouraged in favor of `~.set_layout_engine`.
+
+        Parameters
+        ----------
+        tight : bool or dict with keys "pad", "w_pad", "h_pad", "rect" or None
+            If a bool, sets whether to call `.tight_layout` upon drawing.
+            If ``None``, use :rc:`figure.autolayout` instead.
+            If a dict, pass it as kwargs to `.tight_layout`, overriding the
+            default paddings.
+        """
+        if tight is None:
+            tight = mpl.rcParams['figure.autolayout']
+        _tight = 'tight' if bool(tight) else 'none'
+        _tight_parameters = tight if isinstance(tight, dict) else {}
+        self.set_layout_engine(_tight, **_tight_parameters)
+        self.stale = True
+
+    def get_constrained_layout(self):
+        """
+        Return whether constrained layout is being used.
+
+        See :ref:`constrainedlayout_guide`.
+        """
+        return isinstance(self.get_layout_engine(), ConstrainedLayoutEngine)
+
+    @_api.deprecated("3.6", alternative="set_layout_engine('constrained')",
+                     pending=True)
+    def set_constrained_layout(self, constrained):
+        """
+        [*Discouraged*] Set whether ``constrained_layout`` is used upon
+        drawing.
+
+        If None, :rc:`figure.constrained_layout.use` value will be used.
+
+        When providing a dict containing the keys ``w_pad``, ``h_pad``
+        the default ``constrained_layout`` paddings will be
+        overridden.  These pads are in inches and default to 3.0/72.0.
+        ``w_pad`` is the width padding and ``h_pad`` is the height padding.
+
+        .. admonition:: Discouraged
+
+            This method is discouraged in favor of `~.set_layout_engine`.
+
+        Parameters
+        ----------
+        constrained : bool or dict or None
+        """
+        if constrained is None:
+            constrained = mpl.rcParams['figure.constrained_layout.use']
+        _constrained = 'constrained' if bool(constrained) else 'none'
+        _parameters = constrained if isinstance(constrained, dict) else {}
+        self.set_layout_engine(_constrained, **_parameters)
+        self.stale = True
+
+    @_api.deprecated(
+         "3.6", alternative="figure.get_layout_engine().set()",
+         pending=True)
+    def set_constrained_layout_pads(self, **kwargs):
+        """
+        Set padding for ``constrained_layout``.
+
+        Tip: The parameters can be passed from a dictionary by using
+        ``fig.set_constrained_layout(**pad_dict)``.
+
+        See :ref:`constrainedlayout_guide`.
+
+        Parameters
+        ----------
+        w_pad : float, default: :rc:`figure.constrained_layout.w_pad`
+            Width padding in inches.  This is the pad around Axes
+            and is meant to make sure there is enough room for fonts to
+            look good.  Defaults to 3 pts = 0.04167 inches
+
+        h_pad : float, default: :rc:`figure.constrained_layout.h_pad`
+            Height padding in inches. Defaults to 3 pts.
+
+        wspace : float, default: :rc:`figure.constrained_layout.wspace`
+            Width padding between subplots, expressed as a fraction of the
+            subplot width.  The total padding ends up being w_pad + wspace.
+
+        hspace : float, default: :rc:`figure.constrained_layout.hspace`
+            Height padding between subplots, expressed as a fraction of the
+            subplot width. The total padding ends up being h_pad + hspace.
+
+        """
+        if isinstance(self.get_layout_engine(), ConstrainedLayoutEngine):
+            self.get_layout_engine().set(**kwargs)
+
+    @_api.deprecated("3.6", alternative="fig.get_layout_engine().get()",
+                     pending=True)
+    def get_constrained_layout_pads(self, relative=False):
+        """
+        Get padding for ``constrained_layout``.
+
+        Returns a list of ``w_pad, h_pad`` in inches and
+        ``wspace`` and ``hspace`` as fractions of the subplot.
+        All values are None if ``constrained_layout`` is not used.
+
+        See :ref:`constrainedlayout_guide`.
+
+        Parameters
+        ----------
+        relative : bool
+            If `True`, then convert from inches to figure relative.
+        """
+        if not isinstance(self.get_layout_engine(), ConstrainedLayoutEngine):
+            return None, None, None, None
+        info = self.get_layout_engine().get()
+        w_pad = info['w_pad']
+        h_pad = info['h_pad']
+        wspace = info['wspace']
+        hspace = info['hspace']
+
+        if relative and (w_pad is not None or h_pad is not None):
+            renderer = self._get_renderer()
+            dpi = renderer.dpi
+            w_pad = w_pad * dpi / renderer.width
+            h_pad = h_pad * dpi / renderer.height
+
+        return w_pad, h_pad, wspace, hspace
+
+    def set_canvas(self, canvas):
+        """
+        Set the canvas that contains the figure
+
+        Parameters
+        ----------
+        canvas : FigureCanvas
+        """
+        self.canvas = canvas
+
+    @_docstring.interpd
+    def figimage(self, X, xo=0, yo=0, alpha=None, norm=None, cmap=None,
+                 vmin=None, vmax=None, origin=None, resize=False, **kwargs):
+        """
+        Add a non-resampled image to the figure.
+
+        The image is attached to the lower or upper left corner depending on
+        *origin*.
+
+        Parameters
+        ----------
+        X
+            The image data. This is an array of one of the following shapes:
+
+            - (M, N): an image with scalar data.  Color-mapping is controlled
+              by *cmap*, *norm*, *vmin*, and *vmax*.
+            - (M, N, 3): an image with RGB values (0-1 float or 0-255 int).
+            - (M, N, 4): an image with RGBA values (0-1 float or 0-255 int),
+              i.e. including transparency.
+
+        xo, yo : int
+            The *x*/*y* image offset in pixels.
+
+        alpha : None or float
+            The alpha blending value.
+
+        %(cmap_doc)s
+
+            This parameter is ignored if *X* is RGB(A).
+
+        %(norm_doc)s
+
+            This parameter is ignored if *X* is RGB(A).
+
+        %(vmin_vmax_doc)s
+
+            This parameter is ignored if *X* is RGB(A).
+
+        origin : {'upper', 'lower'}, default: :rc:`image.origin`
+            Indicates where the [0, 0] index of the array is in the upper left
+            or lower left corner of the axes.
+
+        resize : bool
+            If *True*, resize the figure to match the given image size.
+
+        Returns
+        -------
+        `matplotlib.image.FigureImage`
+
+        Other Parameters
+        ----------------
+        **kwargs
+            Additional kwargs are `.Artist` kwargs passed on to `.FigureImage`.
+
+        Notes
+        -----
+        figimage complements the Axes image (`~matplotlib.axes.Axes.imshow`)
+        which will be resampled to fit the current Axes.  If you want
+        a resampled image to fill the entire figure, you can define an
+        `~matplotlib.axes.Axes` with extent [0, 0, 1, 1].
+
+        Examples
+        --------
+        ::
+
+            f = plt.figure()
+            nx = int(f.get_figwidth() * f.dpi)
+            ny = int(f.get_figheight() * f.dpi)
+            data = np.random.random((ny, nx))
+            f.figimage(data)
+            plt.show()
+        """
+        if resize:
+            dpi = self.get_dpi()
+            figsize = [x / dpi for x in (X.shape[1], X.shape[0])]
+            self.set_size_inches(figsize, forward=True)
+
+        im = mimage.FigureImage(self, cmap=cmap, norm=norm,
+                                offsetx=xo, offsety=yo,
+                                origin=origin, **kwargs)
+        im.stale_callback = _stale_figure_callback
+
+        im.set_array(X)
+        im.set_alpha(alpha)
+        if norm is None:
+            im.set_clim(vmin, vmax)
+        self.images.append(im)
+        im._remove_method = self.images.remove
+        self.stale = True
+        return im
+
+    def set_size_inches(self, w, h=None, forward=True):
+        """
+        Set the figure size in inches.
+

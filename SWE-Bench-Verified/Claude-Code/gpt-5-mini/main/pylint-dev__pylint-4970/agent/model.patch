@@ -1,0 +1,64 @@
+diff --git a/pylint/checkers/similar.py b/pylint/checkers/similar.py
+index c65b1c89..fb5cfe74 100644
+--- a/pylint/checkers/similar.py
++++ b/pylint/checkers/similar.py
+@@ -394,6 +394,14 @@ class Similar:
+ 
+     def _compute_sims(self) -> List[Tuple[int, Set[LinesChunkLimits_T]]]:
+         """compute similarities in appended files"""
++        # If the checker/SIMILAR instance has been disabled by setting the
++        # minimum lines to 0 or less, short-circuit and return no
++        # similarities. The SimilarChecker sets _disabled when the
++        # configuration value is <= 0; standalone Similar instances (used by the
++        # CLI) indicate disabling by setting min_lines to 0.
++        if getattr(self, "_disabled", False) or getattr(self, "min_lines", 1) <= 0:
++            return []
++
+         no_duplicates: Dict[int, List[Set[LinesChunkLimits_T]]] = defaultdict(list)
+ 
+         for commonality in self._iter_sims():
+@@ -792,6 +800,20 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+             ignore_imports=self.config.ignore_imports,
+             ignore_signatures=self.config.ignore_signatures,
+         )
++        # If min_similarity_lines is set to 0 or a negative value, treat the
++        # checker as disabled. Some tooling (e.g. flake8) uses 0 to mean
++        # "disable this check"; match that behaviour here instead of having
++        # the algorithm treat 0 as a valid window size which produces
++        # unexpected duplicates.
++        val = getattr(self.config, "min_similarity_lines", DEFAULT_MIN_SIMILARITY_LINE)
++        if isinstance(val, int) and val <= 0:
++            self._disabled = True
++            # keep a safe positive min_lines value; it won't be used because
++            # the _disabled guard prevents computation.
++            self.min_lines = DEFAULT_MIN_SIMILARITY_LINE
++        else:
++            self._disabled = False
++            self.min_lines = val
+         self.stats = None
+ 
+     def set_option(self, optname, value, action=None, optdict=None):
+@@ -801,7 +823,22 @@ class SimilarChecker(BaseChecker, Similar, MapReduceMixin):
+         """
+         BaseChecker.set_option(self, optname, value, action, optdict)
+         if optname == "min-similarity-lines":
+-            self.min_lines = self.config.min_similarity_lines
++            # When the configuration sets min-similarity-lines to 0 or a
++            # negative number, treat that as disabling the similarity
++            # checker. Historically the code used the numerical value
++            # directly which made 0 behave as a window size (causing every
++            # line to be considered a duplicate). Matching linters like
++            # flake8, 0 should disable the check.
++            val = self.config.min_similarity_lines
++            if isinstance(val, int) and val <= 0:
++                self._disabled = True
++                # Keep min_lines at a safe positive value to avoid runtime
++                # errors if some internal code uses it. It won't be used
++                # because of the _disabled guard.
++                self.min_lines = DEFAULT_MIN_SIMILARITY_LINE
++            else:
++                self._disabled = False
++                self.min_lines = val
+         elif optname == "ignore-comments":
+             self.ignore_comments = self.config.ignore_comments
+         elif optname == "ignore-docstrings":

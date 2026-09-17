@@ -1,0 +1,47 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 967a91fdc8..25ba388fec 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -861,7 +861,42 @@ class AddIndex(IndexOperation):
+     def migration_name_fragment(self):
+         return "%s_%s" % (self.model_name_lower, self.index.name.lower())
+ 
++    def reduce(self, operation, app_label):
++        """Try to optimize AddIndex with a following operation.
++
++        - AddIndex + RemoveIndex(same name) -> no-op
++        - AddIndex + RenameIndex(old_name == this.index.name) -> AddIndex with the new name
++        """
++        # Add followed by remove of the same index can be dropped.
++        from .models import RemoveIndex, RenameIndex  # local import to avoid forward ref issues
++        if (
++            isinstance(operation, RemoveIndex)
++            and self.model_name_lower == operation.model_name_lower
++            and operation.name == self.index.name
++        ):
++            return []
++
++        # Add followed by rename of the index name: just change the index name
++        # on the AddIndex operation.
++        if (
++            isinstance(operation, RenameIndex)
++            and self.model_name_lower == operation.model_name_lower
++            and operation.old_name
++            and operation.old_name.lower() == self.index.name.lower()
++        ):
++            # Build a new index preserving attributes but with the new name.
++            idx_cls = self.index.__class__
++            new_index = idx_cls(
++                fields=getattr(self.index, "fields", None),
++                name=operation.new_name,
++                db_tablespace=getattr(self.index, "db_tablespace", None),
++                expressions=getattr(self.index, "expressions", None),
++                condition=getattr(self.index, "condition", None),
++                opclasses=getattr(self.index, "opclasses", None),
++            )
++            return [AddIndex(self.model_name, new_index)]
+ 
++        return super().reduce(operation, app_label)
+ class RemoveIndex(IndexOperation):
+     """Remove an index from a model."""
+ 

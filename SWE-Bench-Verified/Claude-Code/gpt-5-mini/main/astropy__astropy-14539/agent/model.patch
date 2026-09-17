@@ -1,0 +1,63 @@
+diff --git a/astropy/io/fits/diff.py b/astropy/io/fits/diff.py
+index 100cdf1b8..a3f910d8b 100644
+--- a/astropy/io/fits/diff.py
++++ b/astropy/io/fits/diff.py
+@@ -1460,8 +1460,56 @@ class TableDataDiff(_BaseDiff):
+                     ],
+                 )
+             else:
+-                diffs = np.where(arra != arrb)
+-
++                # Robust per-row comparison for non-floating columns.
++                # Using element-wise `arra != arrb` can misbehave for
++                # variable-length array (VLA) columns or object arrays
++                # where comparisons may return arrays or sequences rather
++                # than a single boolean.  Compare each row/value pair
++                # explicitly to avoid false positives when comparing an
++                # object to itself.
++                def _elem_equal(a, b, rtol=self.rtol, atol=self.atol):
++                    """Return True if elements a and b should be considered equal.
++
++                    Handles scalars, sequences (lists/tuples), and numpy
++                    arrays including floating-point arrays (using allclose).
++                    """
++                    try:
++                        aa = np.asarray(a)
++                        bb = np.asarray(b)
++                    except Exception:
++                        # Fallback: compare with == and coerce to bool
++                        try:
++                            eq = a == b
++                            if isinstance(eq, np.ndarray):
++                                return bool(eq.all())
++                            return bool(eq)
++                        except Exception:
++                            return False
++
++                    # If shapes differ they are not equal
++                    if aa.shape != bb.shape:
++                        return False
++
++                    # If either array is floating point, use allclose
++                    if np.issubdtype(aa.dtype, np.inexact) or np.issubdtype(
++                        bb.dtype, np.inexact
++                    ):
++                        try:
++                            return bool(np.allclose(aa, bb, rtol=rtol, atol=atol, equal_nan=True))
++                        except Exception:
++                            # Fall back to array_equal if allclose fails
++                            return bool(np.array_equal(aa, bb))
++
++                    # For non-floating types use array_equal
++                    return bool(np.array_equal(aa, bb))
++
++                diffs_idx = []
++                for i, (va, vb) in enumerate(zip(arra, arrb)):
++                    if not _elem_equal(va, vb):
++                        diffs_idx.append(i)
++                diffs = (np.array(diffs_idx, dtype=int),)
++
++            # Count unique differing row indices
+             self.diff_total += len(set(diffs[0]))
+ 
+             if self.numdiffs >= 0:

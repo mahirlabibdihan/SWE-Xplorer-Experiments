@@ -1,0 +1,31 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 29e33c075f..8a4cdfe0c4 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -1423,6 +1423,26 @@ class SQLDeleteCompiler(SQLCompiler):
+         Create the SQL for this query. Return the SQL string and list of
+         parameters.
+         """
++        # For trivial deletes (no WHERE, no slicing/limits, no subqueries,
++        # and no select_for_update), prefer the simple ``DELETE FROM table``
++        # form. This avoids producing a subquery like
++        # ``WHERE pk IN (SELECT pk FROM table)`` which causes two references
++        # to the same table in a single statement. That form breaks
++        # LOCK TABLES usage on MySQL/MariaDB and can be a significant
++        # performance regression for large tables. See #<issue>.
++        try:
++            where_sql, where_params = (self.compile(self.query.where)
++                                      if self.query.where is not None else ('', ()))
++        except Exception:
++            # Be conservative: fall back to the existing behaviour if
++            # compiling the where clause raises for any reason.
++            where_sql = None
++        # If the where clause is empty (i.e. deleting all rows) and there
++        # are no limits, subqueries, or select_for_update, use the simple
++        # DELETE FROM form regardless of the alias counts.
++        if where_sql == '' and not self.query.high_mark and not self.query.low_mark and not getattr(self.query, 'combinator', None) and not getattr(self.query, 'select_for_update', False) and not getattr(self.query, 'subquery', False):
++            return self._as_sql(self.query)
++
+         if self.single_alias:
+             return self._as_sql(self.query)
+         innerq = self.query.clone()

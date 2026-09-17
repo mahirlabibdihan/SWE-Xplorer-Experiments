@@ -1,0 +1,97 @@
+diff --git a/sphinx/extension.py b/sphinx/extension.py
+index 7ec6c8518..9021d8da4 100644
+--- a/sphinx/extension.py
++++ b/sphinx/extension.py
+@@ -14,6 +14,16 @@ from sphinx.config import Config
+ from sphinx.errors import VersionRequirementError
+ from sphinx.locale import __
+ from sphinx.util import logging
++try:
++    from packaging.version import parse as parse_version
++except Exception:
++    # packaging may not be available in some minimal environments.  Fall back
++    # to distutils.version.LooseVersion which provides lexical version
++    # comparison good enough for most common version strings.
++    from distutils.version import LooseVersion as _LooseVersion
++    parse_version = lambda v: _LooseVersion(str(v))  # type: ignore
++    # Note: distutils may consider some PEP 440 forms differently; using
++    # packaging when available is preferred.
+ 
+ if TYPE_CHECKING:
+     from sphinx.application import Sphinx
+@@ -51,12 +61,33 @@ def verify_needs_extensions(app: "Sphinx", config: Config) -> None:
+                               'but it is not loaded.'), extname)
+             continue
+ 
+-        if extension.version == 'unknown version' or reqversion > extension.version:
++        # If the extension didn't expose a version we cannot verify it
++        if extension.version == 'unknown version':
+             raise VersionRequirementError(__('This project needs the extension %s at least in '
+                                              'version %s and therefore cannot be built with '
+                                              'the loaded version (%s).') %
+                                           (extname, reqversion, extension.version))
+ 
++        # Compare versions using packaging.version to avoid string-based
++        # comparisons like '0.6' > '0.10'.  Cast to str to handle numeric
++        # or Version objects stored in config metadata.
++        try:
++            if parse_version(str(extension.version)) < parse_version(str(reqversion)):
++                raise VersionRequirementError(__('This project needs the extension %s at least in '
++                                                 'version %s and therefore cannot be built with '
++                                                 'the loaded version (%s).') %
++                                              (extname, reqversion, extension.version))
++        except Exception:
++            # In case packaging.version.parse raises for some unexpected format,
++            # fall back to the original string comparison which will at least
++            # preserve previous behaviour rather than crash.
++            if str(reqversion) > str(extension.version):
++                raise VersionRequirementError(__('This project needs the extension %s at least in '
++                                                 'version %s and therefore cannot be built with '
++                                                 'the loaded version (%s).') %
++                                              (extname, reqversion, extension.version))
++
++
+ 
+ def setup(app: "Sphinx") -> Dict[str, Any]:
+     app.connect('config-inited', verify_needs_extensions, priority=800)
+diff --git a/tests/test_extension_needs.py b/tests/test_extension_needs.py
+new file mode 100644
+index 000000000..ba0eb448b
+--- /dev/null
++++ b/tests/test_extension_needs.py
+@@ -0,0 +1,35 @@
++import pytest
++
++from sphinx.extension import verify_needs_extensions, Extension
++from sphinx.config import Config
++from sphinx.errors import VersionRequirementError
++
++
++class DummyApp:
++    def __init__(self):
++        self.extensions = {}
++
++
++class DummyConfig(Config):
++    def __init__(self, needs_extensions):
++        super().__init__({}, {})
++        self.needs_extensions = needs_extensions
++
++
++def test_verify_needs_extensions_accepts_higher_minor_version():
++    app = DummyApp()
++    # extension reports version 0.10, requirement is 0.6 -> should pass
++    app.extensions['sphinx_gallery.gen_gallery'] = Extension('sphinx_gallery.gen_gallery', None, version='0.10')
++    config = DummyConfig({'sphinx_gallery.gen_gallery': '0.6'})
++
++    # should not raise
++    verify_needs_extensions(app, config)
++
++
++def test_verify_needs_extensions_rejects_lower_version():
++    app = DummyApp()
++    app.extensions['sphinx_gallery.gen_gallery'] = Extension('sphinx_gallery.gen_gallery', None, version='0.5')
++    config = DummyConfig({'sphinx_gallery.gen_gallery': '0.6'})
++
++    with pytest.raises(VersionRequirementError):
++        verify_needs_extensions(app, config)

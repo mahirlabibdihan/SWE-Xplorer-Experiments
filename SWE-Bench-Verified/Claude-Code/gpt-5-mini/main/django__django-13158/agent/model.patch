@@ -1,0 +1,47 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 07d6ffd4ca..e30a19efc2 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -919,6 +919,16 @@ class QuerySet:
+     def none(self):
+         """Return an empty QuerySet."""
+         clone = self._chain()
++        # If this QuerySet is a combined query (has a combinator such as
++        # UNION/INTERSECT/EXCEPT), setting the top-level query to empty is
++        # not sufficient because SQLCompiler builds the SQL from
++        # query.combined_queries when a combinator is present. Replace the
++        # underlying Query object with a fresh one so that any combinator
++        # metadata (combined_queries/combinator) is cleared and set_empty()
++        # will reliably produce an empty queryset.
++        if clone.query.combinator:
++            # sql is imported at module level (from django.db.models import sql)
++            clone.query = sql.Query(self.model)
+         clone.query.set_empty()
+         return clone
+ 
+diff --git a/tests/model_forms/test_modelchoicefield.py b/tests/model_forms/test_modelchoicefield.py
+index 8f41ce9c40..fd575f2604 100644
+--- a/tests/model_forms/test_modelchoicefield.py
++++ b/tests/model_forms/test_modelchoicefield.py
+@@ -373,3 +373,21 @@ class ModelChoiceFieldTests(TestCase):
+         )
+         with self.assertNumQueries(2):
+             template.render(Context({'form': CategoriesForm()}))
++
++    def test_modelmultiplechoicefield_none_with_union(self):
++        """Ensure that ModelMultipleChoiceField.clean returns an empty
++        QuerySet when the field's queryset is a combined (union) QuerySet
++        and the submitted value is empty.
++        """
++        # Create several Publication instances
++        for i in range(1, 8):
++            Publication.objects.create(title='pub%s' % i, date_published=datetime.date.today())
++
++        qs = Publication.objects.filter(pk__lt=2).union(Publication.objects.filter(pk__gt=5))
++        field = forms.ModelMultipleChoiceField(qs, required=False)
++
++        # Simulate an empty submission (empty string as from form data)
++        cleaned = field.clean('')
++        # Should be a QuerySet and should be empty
++        self.assertFalse(bool(cleaned))
++        self.assertEqual(list(cleaned), [])
