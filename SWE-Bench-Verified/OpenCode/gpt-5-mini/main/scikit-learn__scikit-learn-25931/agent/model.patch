@@ -1,0 +1,55 @@
+diff --git a/sklearn/ensemble/_iforest.py b/sklearn/ensemble/_iforest.py
+index 4d6c1c3f0..fbc91859e 100644
+--- a/sklearn/ensemble/_iforest.py
++++ b/sklearn/ensemble/_iforest.py
+@@ -345,7 +345,13 @@ class IsolationForest(OutlierMixin, BaseBagging):
+             return self
+ 
+         # else, define offset_ wrt contamination parameter
+-        self.offset_ = np.percentile(self.score_samples(X), 100.0 * self.contamination)
++        # Avoid calling ``score_samples`` here because it validates the input
++        # again which may trigger feature-name related warnings when `X` was
++        # originally a DataFrame. We already validated `X` above and it is the
++        # validated ndarray, so compute scores directly using the internal
++        # implementation.
++        scores = -self._compute_chunked_score_samples(X)
++        self.offset_ = np.percentile(scores, 100.0 * self.contamination)
+ 
+         return self
+ 
+diff --git a/sklearn/ensemble/tests/test_iforest.py b/sklearn/ensemble/tests/test_iforest.py
+index 5f046540f..13b7c33ab 100644
+--- a/sklearn/ensemble/tests/test_iforest.py
++++ b/sklearn/ensemble/tests/test_iforest.py
+@@ -23,6 +23,7 @@ from sklearn.model_selection import train_test_split
+ from sklearn.datasets import load_diabetes, load_iris, make_classification
+ from sklearn.utils import check_random_state
+ from sklearn.metrics import roc_auc_score
++import pandas as pd
+ 
+ from scipy.sparse import csc_matrix, csr_matrix
+ from unittest.mock import Mock, patch
+@@ -326,6 +327,23 @@ def test_iforest_with_n_jobs_does_not_segfault():
+     IsolationForest(n_estimators=10, max_samples=256, n_jobs=2).fit(X)
+ 
+ 
++def test_no_feature_names_warning_on_fit_with_contamination_dataframe():
++    # Regression test for warning emitted when fitting with a DataFrame and
++    # contamination != 'auto'. The estimator previously called score_samples
++    # on the already-validated ndarray which led to a feature-names warning.
++    X = pd.DataFrame({"a": [-1.1, 0.3, 0.5, 100.0]})
++    clf = IsolationForest(random_state=0, contamination=0.05)
++
++    import warnings
++
++    with warnings.catch_warnings(record=True) as rec:
++        warnings.simplefilter("always")
++        clf.fit(X)
++    # Ensure no warnings about feature names were emitted
++    msgs = [str(w.message) for w in rec]
++    assert not any("X does not have valid feature names" in m for m in msgs)
++
++
+ # TODO(1.4): remove in 1.4
+ def test_base_estimator_property_deprecated():
+     X = np.array([[1, 2], [3, 4]])

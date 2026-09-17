@@ -1,0 +1,61 @@
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index aef290f6..7624ec4b 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -270,11 +270,28 @@ class DataArrayRolling(Rolling["DataArray"]):
+     def __iter__(self) -> Iterator[tuple[RollingKey, DataArray]]:
+         if self.ndim > 1:
+             raise ValueError("__iter__ is only supported for 1d-rolling")
+-        stops = np.arange(1, len(self.window_labels) + 1)
+-        starts = stops - int(self.window[0])
+-        starts[: int(self.window[0])] = 0
++        n = len(self.window_labels)
++
++        # Compute left padding used by rolling_window to align windows. For
++        # center=True, left pad = window//2, otherwise left pad = window-1.
++        # This mirrors Variable.rolling_window padding so that iteration yields
++        # the same windows as other rolling methods (e.g. .mean(), .construct()).
++        w = int(self.window[0])
++        if self.center[0]:
++            left = w // 2
++        else:
++            left = w - 1
++
++        idx = np.arange(n)
++        starts = idx - left
++        stops = starts + w
++
++        # clip to array bounds
++        starts = np.clip(starts, 0, n)
++        stops = np.clip(stops, 0, n)
++
+         for (label, start, stop) in zip(self.window_labels, starts, stops):
+-            window = self.obj.isel({self.dim[0]: slice(start, stop)})
++            window = self.obj.isel({self.dim[0]: slice(int(start), int(stop))})
+ 
+             counts = window.count(dim=self.dim[0])
+             window = window.where(counts >= self.min_periods)
+diff --git a/xarray/tests/test_rolling.py b/xarray/tests/test_rolling.py
+index 2d6efff7..8a3a9d86 100644
+--- a/xarray/tests/test_rolling.py
++++ b/xarray/tests/test_rolling.py
+@@ -72,6 +72,19 @@ class TestDataArrayRolling:
+         # argument substitution worked
+         assert "`mean`" in rolling_obj.mean.__doc__
+ 
++    def test_rolling_iter_center(self) -> None:
++        # Ensure manual iteration over DataArrayRolling respects center=True
++        my_data = xr.DataArray(np.arange(1, 10), dims="x")
++
++        # Option 1: center-justified rolling mean
++        result1 = my_data.rolling(x=3, center=True).mean().values
++
++        # Option 2: manual iteration over rolling should produce same sequence
++        my_data_rolling = my_data.rolling(x=3, center=True)
++        result2 = [window.mean().values.item() if window.size else np.nan for label, window in my_data_rolling]
++
++        np.testing.assert_allclose(result1, np.array(result2), equal_nan=True)
++
+     def test_rolling_properties(self, da) -> None:
+         rolling_obj = da.rolling(time=4)
+ 

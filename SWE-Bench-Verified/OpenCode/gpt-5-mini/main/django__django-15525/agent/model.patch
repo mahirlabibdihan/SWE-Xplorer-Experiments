@@ -1,0 +1,46 @@
+diff --git a/django/core/serializers/base.py b/django/core/serializers/base.py
+index da85cb4b92..4b69e932c8 100644
+--- a/django/core/serializers/base.py
++++ b/django/core/serializers/base.py
+@@ -336,7 +336,14 @@ def build_instance(Model, data, db):
+         and hasattr(default_manager, "get_by_natural_key")
+         and hasattr(Model, "natural_key")
+     ):
+-        natural_key = Model(**data).natural_key()
++        # Build a temporary instance and set its DB state so that any
++        # natural_key() implementation that follows foreign key relations
++        # will resolve related objects against the correct database
++        # (the one we're deserializing into). See #xxxx.
++        temp_obj = Model(**data)
++        # Ensure the instance's state knows which DB to use for lookups.
++        temp_obj._state.db = db
++        natural_key = temp_obj.natural_key()
+         try:
+             data[Model._meta.pk.attname] = Model._meta.pk.to_python(
+                 default_manager.db_manager(db).get_by_natural_key(*natural_key).pk
+diff --git a/tests/fixtures/tests.py b/tests/fixtures/tests.py
+index e66007d2d4..4b2cc0facc 100644
+--- a/tests/fixtures/tests.py
++++ b/tests/fixtures/tests.py
+@@ -1256,6 +1256,21 @@ class ForwardReferenceTests(DumpDataAssertMixin, TestCase):
+             natural_foreign_keys=True,
+         )
+ 
++    def test_forward_reference_fk_natural_key_non_default_db(self):
++        # Similar to test_forward_reference_fk_natural_key but ensure loading
++        # into a non-default database works when natural keys use FKs.
++        management.call_command(
++            "loaddata",
++            "forward_reference_fk_natural_key.json",
++            verbosity=0,
++            database="other",
++        )
++        # Objects should exist on the 'other' DB
++        t1 = NaturalKeyThing.objects.using("other").get_by_natural_key("t1")
++        t2 = NaturalKeyThing.objects.using("other").get_by_natural_key("t2")
++        self.assertEqual(t1.other_thing, t2)
++        self.assertEqual(t2.other_thing, t1)
++
+     def test_forward_reference_m2m(self):
+         management.call_command("loaddata", "forward_reference_m2m.json", verbosity=0)
+         self.assertEqual(NaturalKeyThing.objects.count(), 3)

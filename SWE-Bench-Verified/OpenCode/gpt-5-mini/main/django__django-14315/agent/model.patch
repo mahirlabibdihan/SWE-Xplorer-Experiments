@@ -1,0 +1,77 @@
+diff --git a/django/db/backends/base/client.py b/django/db/backends/base/client.py
+index 339f1e863c..4583fbdb4d 100644
+--- a/django/db/backends/base/client.py
++++ b/django/db/backends/base/client.py
+@@ -21,6 +21,10 @@ class BaseDatabaseClient:
+ 
+     def runshell(self, parameters):
+         args, env = self.settings_to_cmd_args_env(self.connection.settings_dict, parameters)
+-        if env:
++        # If settings_to_cmd_args_env() returns None, let subprocess.run use the
++        # default environment (os.environ). If it returns a mapping (even an
++        # empty one), merge it on top of os.environ so that provided values
++        # override the environment without discarding existing variables.
++        if env is not None:
+             env = {**os.environ, **env}
+         subprocess.run(args, env=env, check=True)
+diff --git a/tests/backends/base/test_client.py b/tests/backends/base/test_client.py
+index 4573bbe97b..c9e2e3d2c9 100644
+--- a/tests/backends/base/test_client.py
++++ b/tests/backends/base/test_client.py
+@@ -14,3 +14,56 @@ class SimpleDatabaseClientTests(SimpleTestCase):
+         )
+         with self.assertRaisesMessage(NotImplementedError, msg):
+             self.client.settings_to_cmd_args_env(None, None)
++
++    def test_runshell_uses_os_environ_when_env_is_empty_mapping(self):
++        """If settings_to_cmd_args_env returns an empty mapping, runshell should
++        merge it with os.environ rather than passing an empty environment.
++        """
++        from unittest import mock
++
++        class DummyClient(BaseDatabaseClient):
++            executable_name = 'dummy'
++
++            @classmethod
++            def settings_to_cmd_args_env(cls, settings_dict, parameters):
++                return (['echo'], {})
++
++        client = DummyClient(connection=connection)
++
++        captured = {}
++
++        def _fake_run(args, env=None, check=False):
++            # record what env was passed
++            captured['env'] = env
++
++        with mock.patch('subprocess.run', new=_fake_run):
++            client.runshell([])
++
++        # env should be a mapping containing at least the current PATH
++        self.assertIsInstance(captured.get('env'), dict)
++        self.assertTrue('PATH' in captured['env'] or 'Path' in captured['env'])
++
++    def test_runshell_passes_none_when_env_is_none(self):
++        """If settings_to_cmd_args_env returns None for env, runshell should
++        pass None to subprocess.run so the default environment is used.
++        """
++        from unittest import mock
++
++        class DummyClient2(BaseDatabaseClient):
++            executable_name = 'dummy'
++
++            @classmethod
++            def settings_to_cmd_args_env(cls, settings_dict, parameters):
++                return (['echo'], None)
++
++        client = DummyClient2(connection=connection)
++
++        captured = {}
++
++        def _fake_run(args, env=None, check=False):
++            captured['env'] = env
++
++        with mock.patch('subprocess.run', new=_fake_run):
++            client.runshell([])
++
++        self.assertIsNone(captured.get('env'))

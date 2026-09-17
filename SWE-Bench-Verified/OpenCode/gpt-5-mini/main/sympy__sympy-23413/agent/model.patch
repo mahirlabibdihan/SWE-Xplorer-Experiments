@@ -1,0 +1,76 @@
+diff --git a/sympy/matrices/tests/test_normalforms.py b/sympy/matrices/tests/test_normalforms.py
+index 8e7dc0469d..66aa19f6f3 100644
+--- a/sympy/matrices/tests/test_normalforms.py
++++ b/sympy/matrices/tests/test_normalforms.py
+@@ -68,6 +68,21 @@ def test_hermite_normal():
+     m = Matrix([[8, 28, 68, 116, 164], [3, 11, 19, 31, 43], [5, 13, 23, 37, 47]])
+     hnf = Matrix([[4, 0, 0], [0, 2, 1], [0, 0, 1]])
+     assert hermite_normal_form(m) == hnf
++
++
++def test_hermite_flip_transpose_row_style():
++    # Regression test for a case where performing a row-style HNF via
++    # flip/transpose could lose a row (incorrectly identifying the
++    # matrix as rank-deficient). We reproduce the user's sequence of
++    # operations without relying on NumPy.
++    orig = Matrix([[5, 8, 12], [0, 0, 1]])
++    # flip both axes: reverse rows and reverse columns of each row
++    flipped = Matrix([row[::-1] for row in orig.tolist()[::-1]])
++    # compute HNF of the transpose, then transpose back and flip again
++    mid = hermite_normal_form(flipped.T).T
++    result = Matrix([row[::-1] for row in mid.tolist()[::-1]])
++    expected = Matrix([[5, 8, 0], [0, 0, 1]])
++    assert result == expected
+     assert hermite_normal_form(m, D=8) == hnf
+     assert hermite_normal_form(m, D=ZZ(8)) == hnf
+     assert hermite_normal_form(m, D=Integer(8)) == hnf
+diff --git a/sympy/polys/matrices/normalforms.py b/sympy/polys/matrices/normalforms.py
+index 30f5534b08..4cc47f5e16 100644
+--- a/sympy/polys/matrices/normalforms.py
++++ b/sympy/polys/matrices/normalforms.py
+@@ -208,6 +208,18 @@ def _hermite_normal_form(A):
+     # way up. The total number of rows we will consider is min(m, n), where
+     # A is an m x n matrix.
+     m, n = A.shape
++    # record the rank of the input matrix so that we can ensure the
++    # computed HNF has the correct number of pivot columns. In some
++    # degenerate configurations (for example when using flips/transposes
++    # to compute a row-style HNF) the reduction below can incorrectly
++    # produce fewer pivot columns than the matrix rank; in that case we
++    # expand the selected column range to restore the expected rank.
++    try:
++        input_rank = A.rank()
++    except Exception:
++        # If rank() is not available for the input representation fall
++        # back to assuming full possible rank. This is conservative.
++        input_rank = min(m, n)
+     rows = min(m, n)
+     A = A.to_dense().rep.copy()
+     # Our goal is to put pivot entries in the rightmost columns.
+@@ -243,9 +255,23 @@ def _hermite_normal_form(A):
+             for j in range(k + 1, n):
+                 q = A[i][j] // b
+                 add_columns(A, j, k, 1, -q, 0, 1)
+-    # Finally, the HNF consists of those columns of A in which we succeeded in making
+-    # a nonzero pivot.
+-    return DomainMatrix.from_rep(A)[:, k:]
++    # Finally, the HNF consists of those columns of A in which we succeeded
++    # in making a nonzero pivot. However, due to corner-cases the reduction
++    # can sometimes produce fewer pivot columns than the actual rank of the
++    # input; ensure we include enough columns so that the resulting matrix
++    # has rank equal to the input rank (or as many as possible).
++    H = DomainMatrix.from_rep(A)[:, k:]
++    # If the computed H has smaller rank than the input then include more
++    # columns (by moving k left) until the ranks match or we run out of
++    # columns.
++    try:
++        while k > 0 and H.rank() < input_rank:
++            k -= 1
++            H = DomainMatrix.from_rep(A)[:, k:]
++    except Exception:
++        # If rank computation fails for some reason, return the current H.
++        pass
++    return H
+ 
+ 
+ def _hermite_normal_form_modulo_D(A, D):

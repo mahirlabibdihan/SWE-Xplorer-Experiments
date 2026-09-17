@@ -1,0 +1,63 @@
+diff --git a/django/utils/numberformat.py b/django/utils/numberformat.py
+index 88b35fc435..9e3d75ee46 100644
+--- a/django/utils/numberformat.py
++++ b/django/utils/numberformat.py
+@@ -27,9 +27,30 @@ def format(number, decimal_sep, decimal_pos=None, grouping=0, thousand_sep='',
+     # sign
+     sign = ''
+     if isinstance(number, Decimal):
++        # If a decimal_pos is provided and the absolute value of the number is
++        # smaller than what can be represented with that many decimal places
++        # (i.e. it would be truncated to zero), return the appropriately
++        # zero-padded string instead of formatting in scientific notation.
++        # This avoids returning exponential notation for very small numbers
++        # when the caller explicitly asked for a fixed number of decimals.
++        _, digits, exponent = number.as_tuple()
++        if decimal_pos is not None:
++            # If abs(number) < 10**(-decimal_pos) then formatting to
++            # `decimal_pos` places would yield zero (all zeros in fractional
++            # places). Return that immediately to avoid scientific notation
++            # and the costly generation of a long string with '{:f}'.
++            try:
++                threshold = Decimal(1).scaleb(-decimal_pos)
++            except Exception:
++                threshold = Decimal('1e-%d' % decimal_pos)
++            if number.copy_abs() < threshold:
++                # Build zero representation: '0' or '0.<zeros>' with sign.
++                if decimal_pos:
++                    return mark_safe(sign + '0' + decimal_sep + ('0' * decimal_pos))
++                return mark_safe(sign + '0')
++
+         # Format values with more than 200 digits (an arbitrary cutoff) using
+         # scientific notation to avoid high memory usage in {:f}'.format().
+-        _, digits, exponent = number.as_tuple()
+         if abs(exponent) + len(digits) > 200:
+             number = '{:e}'.format(number)
+             coefficient, exponent = number.split('e')
+@@ -39,8 +60,7 @@ def format(number, decimal_sep, decimal_pos=None, grouping=0, thousand_sep='',
+                 thousand_sep, force_grouping, use_l10n,
+             )
+             return '{}e{}'.format(coefficient, exponent)
+-        else:
+-            str_number = '{:f}'.format(number)
++        str_number = '{:f}'.format(number)
+     else:
+         str_number = str(number)
+     if str_number[0] == '-':
+diff --git a/tests/utils_tests/test_numberformat.py b/tests/utils_tests/test_numberformat.py
+index 3d656025ab..4f0efe6bee 100644
+--- a/tests/utils_tests/test_numberformat.py
++++ b/tests/utils_tests/test_numberformat.py
+@@ -100,6 +100,12 @@ class TestNumberFormat(SimpleTestCase):
+             with self.subTest(value=value):
+                 self.assertEqual(nformat(Decimal(value), '.', decimal_pos), expected_value)
+ 
++    def test_very_small_decimal_with_decimal_pos(self):
++        # Ensure extremely small numbers with an explicit decimal_pos are
++        # rendered as zero padded strings rather than scientific notation.
++        self.assertEqual(nformat(Decimal('1e-199'), '.', decimal_pos=2), '0.00')
++        self.assertEqual(nformat(Decimal('1e-200'), '.', decimal_pos=2), '0.00')
++
+     def test_decimal_subclass(self):
+         class EuroDecimal(Decimal):
+             """

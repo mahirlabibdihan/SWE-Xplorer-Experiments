@@ -1,0 +1,55 @@
+diff --git a/django/core/servers/basehttp.py b/django/core/servers/basehttp.py
+index fef5532e58..ffad09b3f2 100644
+--- a/django/core/servers/basehttp.py
++++ b/django/core/servers/basehttp.py
+@@ -147,6 +147,50 @@ class ServerHandler(simple_server.ServerHandler):
+         self.get_stdin().read()
+         super().close()
+ 
++    def write(self, data):
++        """Suppress response body for HTTP HEAD requests.
++
++        According to RFC 2616/9112, responses to HEAD requests must not
++        include a message body. Some WSGI apps may still attempt to write
++        bytes (via the write() callable returned by start_response) or
++        return an iterable of body bytes. Ensure the development server
++        doesn't transmit those bytes.
++        """
++        # If this is a HEAD request, never write body bytes to the client.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            # Ensure headers are sent (without any body). If headers
++            # haven't been sent yet, send them now so the client can
++            # receive the response metadata.
++            if not self.headers_sent:
++                # Don't count any bytes as sent for HEAD responses.
++                self.bytes_sent = 0
++                self.send_headers()
++            return
++        # Fallback to normal behavior for other methods.
++        return super().write(data)
++
++    def finish_response(self):
++        """Override to avoid iterating over body for HEAD requests."""
++        # If this is a HEAD request, send headers but skip sending any body.
++        if self.environ.get("REQUEST_METHOD") == "HEAD":
++            try:
++                # If the result is a file wrapper, avoid attempting sendfile
++                # since that would transmit a body. Just finish the headers
++                # and close any returned iterable.
++                if not self.result_is_file() or not self.sendfile():
++                    # finish_content will ensure headers are sent and set a
++                    # Content-Length of 0 if the application didn't provide one.
++                    self.finish_content()
++            except:
++                if hasattr(self.result, "close"):
++                    self.result.close()
++                raise
++            else:
++                self.close()
++                return
++        # Non-HEAD requests: normal behavior.
++        return super().finish_response()
++
+ 
+ class WSGIRequestHandler(simple_server.WSGIRequestHandler):
+     protocol_version = "HTTP/1.1"

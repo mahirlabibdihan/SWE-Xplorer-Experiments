@@ -1,0 +1,89 @@
+diff --git a/django/db/models/fields/related_descriptors.py b/django/db/models/fields/related_descriptors.py
+index d5aa968400..76f52bd8bb 100644
+--- a/django/db/models/fields/related_descriptors.py
++++ b/django/db/models/fields/related_descriptors.py
+@@ -145,7 +145,12 @@ class ForwardManyToOneDescriptor:
+         if not remote_field.multiple:
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                remote_field.set_cached_value(rel_obj, instance)
++                # Don't overwrite an already cached value to avoid clobbering
++                # instances that were populated by nested prefetches (see
++                # ticket: deferred fields incorrect when following prefetches
++                # back to the parent object).
++                if not remote_field.is_cached(rel_obj):
++                    remote_field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.field.get_cache_name(), False
+ 
+     def get_object(self, instance):
+@@ -377,7 +382,12 @@ class ReverseOneToOneDescriptor:
+         # we must manage the reverse relation cache manually.
+         for rel_obj in queryset:
+             instance = instances_dict[rel_obj_attr(rel_obj)]
+-            self.related.field.set_cached_value(rel_obj, instance)
++            # Only set the cached value if it hasn't already been populated
++            # by another prefetch. This preserves more-specific instances
++            # (for example, instances with different deferred-field sets)
++            # attached by nested prefetches.
++            if not self.related.field.is_cached(rel_obj):
++                self.related.field.set_cached_value(rel_obj, instance)
+         return queryset, rel_obj_attr, instance_attr, True, self.related.get_cache_name(), False
+ 
+     def __get__(self, instance, cls=None):
+@@ -647,7 +657,11 @@ def create_reverse_many_to_one_manager(superclass, rel):
+             # the reverse relation manually.
+             for rel_obj in queryset:
+                 instance = instances_dict[rel_obj_attr(rel_obj)]
+-                setattr(rel_obj, self.field.name, instance)
++                # Avoid overwriting an existing cached forward accessor
++                # as it might have been populated by a nested prefetch
++                # with a different queryset instance.
++                if not self.field.is_cached(rel_obj):
++                    setattr(rel_obj, self.field.name, instance)
+             cache_name = self.field.remote_field.get_cache_name()
+             return queryset, rel_obj_attr, instance_attr, False, cache_name, False
+ 
+diff --git a/tests/defer/tests.py b/tests/defer/tests.py
+index d897c5fa42..bf8406c99e 100644
+--- a/tests/defer/tests.py
++++ b/tests/defer/tests.py
+@@ -5,6 +5,7 @@ from .models import (
+     BigChild, Child, ChildProxy, Primary, RefreshPrimaryProxy, Secondary,
+     ShadowChild,
+ )
++from django.db.models import Prefetch
+ 
+ 
+ class AssertionMixin:
+@@ -253,6 +254,31 @@ class TestDefer2(AssertionMixin, TestCase):
+             bc_deferred.id
+         self.assertEqual(bc_deferred.pk, bc_deferred.id)
+ 
++    def test_only_related_queryset_prefetch_back_to_parent(self):
++        """
++        Regression test: ensure deferred fields from an inner prefetched
++        queryset are preserved when the relation points back to the parent
++        object (following a prefetch back to the parent).
++        """
++        # Use Item and RelatedItem models to simulate User/Profile behavior.
++        item = RelatedItem.objects.create(item=Item.objects.create(name='t1', text='x', value=42, other_value=0))
++        # Create the outer queryset that only loads 'name' and a nested prefetch
++        qs = Item.objects.only('name').prefetch_related(
++            Prefetch(
++                'relateditem_set',
++                queryset=RelatedItem.objects.prefetch_related(
++                    Prefetch('item', queryset=Item.objects.only('value'))
++                ),
++            )
++        )
++        with self.assertNumQueries(3):
++            obj = qs.first()
++        # Accessing the prefetched back-reference's field shouldn't hit the DB
++        with self.assertNumQueries(0):
++            # relateditem_set is a manager, get the first related item and then its item.value
++            rel = obj.relateditem_set.all()[0]
++            self.assertEqual(rel.item.value, 42)
++
+     def test_eq(self):
+         s1 = Secondary.objects.create(first="x1", second="y1")
+         s1_defer = Secondary.objects.only('pk').get(pk=s1.pk)

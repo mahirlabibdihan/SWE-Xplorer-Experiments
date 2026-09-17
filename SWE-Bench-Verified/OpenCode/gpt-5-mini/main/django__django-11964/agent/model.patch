@@ -1,0 +1,50 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index d610dc86f0..4301000ffb 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -785,8 +785,27 @@ class Field(RegisterLookupMixin):
+         return self.__class__.__name__
+ 
+     def pre_save(self, model_instance, add):
+-        """Return field's value just before saving."""
+-        return getattr(model_instance, self.attname)
++        """Return field's value just before saving.
++
++        Also ensure the value on the model instance is converted/prepared
++        (e.g. enum.TextChoices/IntegerChoices members are converted to their
++        underlying value) so that newly-created model instances reflect the
++        same Python type as instances loaded from the database.
++        """
++        value = getattr(model_instance, self.attname)
++        # Prepare the value for database interaction (this will call
++        # to_python/get_prep_value as appropriate for the field).
++        prepared = self.get_prep_value(value)
++        # Update the model instance with the prepared value so that the
++        # in-memory object matches what will be stored/retrieved from the DB.
++        try:
++            setattr(model_instance, self.attname, prepared)
++        except Exception:
++            # Be conservative: if an attribute can't be set, don't raise as
++            # it's not critical for saving. The original value will still be
++            # returned so saving proceeds as before.
++            pass
++        return prepared
+ 
+     def get_prep_value(self, value):
+         """Perform preliminary non-db specific value checks and conversions."""
+diff --git a/tests/model_fields/test_charfield.py b/tests/model_fields/test_charfield.py
+index cf3ce0c4c5..eb4a6e7353 100644
+--- a/tests/model_fields/test_charfield.py
++++ b/tests/model_fields/test_charfield.py
+@@ -34,6 +34,11 @@ class TestCharField(TestCase):
+             F = 'Festival!'
+ 
+         p1 = Post.objects.create(title=Event.C, body=Event.F)
++        # The in-memory instance returned by create() should reflect the
++        # prepared Python type (strings for TextChoices) without needing a
++        # refresh_from_db().
++        self.assertIsInstance(p1.title, str)
++        self.assertIsInstance(p1.body, str)
+         p1.refresh_from_db()
+         self.assertEqual(p1.title, 'Carnival!')
+         self.assertEqual(p1.body, 'Festival!')

@@ -1,0 +1,62 @@
+diff --git a/django/contrib/auth/forms.py b/django/contrib/auth/forms.py
+index d73d1c8495..c29c813c02 100644
+--- a/django/contrib/auth/forms.py
++++ b/django/contrib/auth/forms.py
+@@ -141,6 +141,15 @@ class UserCreationForm(forms.ModelForm):
+         user.set_password(self.cleaned_data["password1"])
+         if commit:
+             user.save()
++            # Ensure ManyToMany data from the form is saved when committing.
++            # ModelForm.save() normally calls save_m2m() when commit is True,
++            # but UserCreationForm overrides save() and must call it too.
++            try:
++                self.save_m2m()
++            except AttributeError:
++                # If the form doesn't have any many-to-many data, save_m2m
++                # may not be present. Ignore in that case.
++                pass
+         return user
+ 
+ 
+diff --git a/tests/auth_tests/test_forms.py b/tests/auth_tests/test_forms.py
+index 78078316e8..b11977325d 100644
+--- a/tests/auth_tests/test_forms.py
++++ b/tests/auth_tests/test_forms.py
+@@ -252,6 +252,37 @@ class UserCreationFormTest(TestDataMixin, TestCase):
+         form = CustomUserCreationForm(data)
+         self.assertTrue(form.is_valid())
+ 
++    @override_settings(AUTH_USER_MODEL="auth_tests.CustomUserWithM2M")
++    def test_user_creation_saves_many_to_many_fields(self):
++        # Ensure that ManyToMany fields on a custom user model are saved
++        # when using UserCreationForm.save(commit=True).
++        from .models.with_many_to_many import Organization, CustomUserWithM2M
++
++        # Create some organizations to attach to the user.
++        org1 = Organization.objects.create(name="Org 1")
++        org2 = Organization.objects.create(name="Org 2")
++
++        class CustomUserCreationForm(UserCreationForm):
++            class Meta(UserCreationForm.Meta):
++                model = CustomUserWithM2M
++                fields = ("username", "orgs")
++
++        data = {
++            "username": "m2muser",
++            "password1": "test123",
++            "password2": "test123",
++            "orgs": [org1.pk, org2.pk],
++        }
++        form = CustomUserCreationForm(data)
++        self.assertTrue(form.is_valid())
++        user = form.save()
++        # Refresh from DB and check m2m relation saved.
++        self.assertQuerysetEqual(
++            user.orgs.order_by("pk"),
++            [org1, org2],
++            transform=lambda x: x,
++        )
++
+     def test_password_whitespace_not_stripped(self):
+         data = {
+             "username": "testuser",

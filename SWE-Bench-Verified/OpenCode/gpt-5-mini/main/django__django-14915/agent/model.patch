@@ -1,0 +1,69 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 5dcf923c12..39960ddc5d 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -1171,6 +1171,14 @@ class ModelChoiceIteratorValue:
+             other = other.value
+         return self.value == other
+ 
++    def __hash__(self):
++        # Allow ModelChoiceIteratorValue to be used in hashed collections
++        # (e.g. membership checks against dict keys or set operations).
++        # Equality compares against the wrapped value, so ensure hashing is
++        # consistent with that behaviour by delegating to the wrapped value's
++        # hash.
++        return hash(self.value)
++
+ 
+ class ModelChoiceIterator:
+     def __init__(self, field):
+diff --git a/tests/model_forms/test_modelchoicefield.py b/tests/model_forms/test_modelchoicefield.py
+index 2a0c05d803..855861b212 100644
+--- a/tests/model_forms/test_modelchoicefield.py
++++ b/tests/model_forms/test_modelchoicefield.py
+@@ -6,6 +6,7 @@ from django.forms.models import ModelChoiceIterator
+ from django.forms.widgets import CheckboxSelectMultiple
+ from django.template import Context, Template
+ from django.test import TestCase
++import json
+ 
+ from .models import Article, Author, Book, Category, Writer
+ 
+@@ -302,9 +303,36 @@ class ModelChoiceFieldTests(TestCase):
+                 '<div><label><input type="checkbox" name="name" value="%d" '
+                 'data-slug="third-test">Third</label></div>'
+                 '</div>'
+-            ) % (self.c1.pk, self.c2.pk, self.c3.pk),
++        ) % (self.c1.pk, self.c2.pk, self.c3.pk),
+         )
+ 
++    def test_modelchoiceiteratorvalue_hashable_for_membership(self):
++        """
++        Ensure ModelChoiceIteratorValue is hashable so widgets can use it in
++        membership checks against dicts or sets (e.g. "if value in self.show_fields").
++        """
++        show_fields = {
++            self.c1.pk: ['first_name'],
++            self.c2.pk: ['last_name'],
++        }
++
++        class CustomCheckboxSelectMultiple(CheckboxSelectMultiple):
++            def create_option(self, name, value, label, selected, index, subindex=None, attrs=None):
++                option = super().create_option(name, value, label, selected, index, subindex, attrs)
++                # value is a ModelChoiceIteratorValue instance; membership checks
++                # against a dict should work without raising TypeError.
++                if value in show_fields:
++                    option['attrs']['data-fields'] = json.dumps(show_fields[value])
++                return option
++
++        class CustomModelMultipleChoiceField(forms.ModelMultipleChoiceField):
++            widget = CustomCheckboxSelectMultiple
++
++        field = CustomModelMultipleChoiceField(Category.objects.all())
++        rendered = field.widget.render('name', [])
++        # Ensure the data-fields attributes were rendered for matching options
++        self.assertIn('data-fields', rendered)
++
+     def test_custom_choice_iterator_passes_model_to_widget(self):
+         class CustomModelChoiceValue:
+             def __init__(self, value, obj):

@@ -1,0 +1,63 @@
+diff --git a/sympy/physics/units/tests/test_quantities.py b/sympy/physics/units/tests/test_quantities.py
+index 25a68c7be5..2186e759a1 100644
+--- a/sympy/physics/units/tests/test_quantities.py
++++ b/sympy/physics/units/tests/test_quantities.py
+@@ -377,6 +377,24 @@ def test_factor_and_dimension():
+         assert (3000, Dimension(1)) == Quantity._collect_factor_and_dimension(3000)
+ 
+ 
++def test_exp_with_dimensionless_unit_expr():
++    # Regression test for bug where exponent dimensionless expressions
++    # inside a Function were not recognised as dimensionless.
++    from sympy.physics import units
++    from sympy.functions.elementary.exponential import exp
++
++    expr = units.second / (units.ohm * units.farad)
++    # sanity: the expression should be dimensionless
++    dim = SI._collect_factor_and_dimension(expr)[1]
++    assert SI.get_dimension_system().is_dimensionless(dim)
++
++    # Using this expression as exponent of exp() and adding to a number
++    # must not raise and the overall dimension should be dimensionless.
++    buggy_expr = 100 + exp(expr)
++    factor, dim = SI._collect_factor_and_dimension(buggy_expr)
++    assert SI.get_dimension_system().is_dimensionless(dim)
++
++
+ @XFAIL
+ def test_factor_and_dimension_with_Abs():
+     with warns_deprecated_sympy():
+diff --git a/sympy/physics/units/unitsystem.py b/sympy/physics/units/unitsystem.py
+index 3daf84c108..b220197063 100644
+--- a/sympy/physics/units/unitsystem.py
++++ b/sympy/physics/units/unitsystem.py
+@@ -190,10 +190,25 @@ def _collect_factor_and_dimension(self, expr):
+                 dim /= idim**count
+             return factor, dim
+         elif isinstance(expr, Function):
+-            fds = [self._collect_factor_and_dimension(
+-                arg) for arg in expr.args]
+-            return (expr.func(*(f[0] for f in fds)),
+-                    *(d[1] for d in fds))
++            # Collect factor and dimension for each argument
++            fds = [self._collect_factor_and_dimension(arg) for arg in expr.args]
++            factors = [f[0] for f in fds]
++            dims = [f[1] for f in fds]
++
++            # If all arguments are dimensionless, the function result is
++            # dimensionless (e.g. exp, sin, log). Return a pair (factor, dim).
++            if all(self.get_dimension_system().is_dimensionless(d) for d in dims):
++                return expr.func(*factors), Dimension(1)
++
++            # If there is a single argument which is not dimensionless, most
++            # functions (like Abs) return the same dimension as their input.
++            if len(dims) == 1:
++                return expr.func(*factors), dims[0]
++
++            # For multi-argument functions with non-dimensionless args,
++            # fall back to using the dimensional expression resolver to
++            # produce a Dimension instance.
++            return expr.func(*factors), Dimension(self.get_dimensional_expr(expr))
+         elif isinstance(expr, Dimension):
+             return S.One, expr
+         else:

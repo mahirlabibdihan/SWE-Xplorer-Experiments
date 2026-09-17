@@ -1,0 +1,134 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 9735ce10c8..60a3e4c15c 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -550,6 +550,99 @@ class Query(BaseExpression):
+         Perform a COUNT() query using the current filter constraints.
+         """
+         obj = self.clone()
++
++        # Remove annotations that are not referenced by filters, ordering,
++        # grouping or distinct fields. Unused annotations add unnecessary
++        # SELECT items and JOINs to the COUNT() query. We keep only the
++        # annotations that are actually referenced.
++        referenced = set()
++
++        def _collect_from_expr(expr):
++            """Recursively collect annotation aliases referenced by an expression."""
++            from django.db.models.expressions import Ref
++
++            if isinstance(expr, Ref):
++                referenced.add(expr.refs)
++                return
++            if hasattr(expr, "get_source_expressions"):
++                for sub in expr.get_source_expressions() or ():
++                    _collect_from_expr(sub)
++            # Strings (e.g. in order_by) might directly reference annotation
++            if isinstance(expr, str) and expr in obj.annotations:
++                referenced.add(expr)
++
++        # Inspect WHERE clauses for lookups referencing annotations (e.g. "a__gt")
++        def _collect_from_where(node):
++            for child in getattr(node, "children", []):
++                # Q/WhereNode children can be nested nodes
++                if hasattr(child, "children"):
++                    _collect_from_where(child)
++                    continue
++                # Lookups are stored as (lookup, value) pairs
++                if isinstance(child, tuple) and child:
++                    lookup = child[0]
++                    # lookup may be like "annot__something__gt"; check prefixes
++                    if isinstance(lookup, str):
++                        parts = lookup.split(LOOKUP_SEP)
++                        for n in range(1, len(parts) + 1):
++                            prefix = LOOKUP_SEP.join(parts[:n])
++                            if prefix in obj.annotations:
++                                referenced.add(prefix)
++                                break
++                    # The RHS/value may itself be an expression referencing annotations
++                    if len(child) > 1:
++                        _collect_from_expr(child[1])
++                else:
++                    # Other possible expression children
++                    _collect_from_expr(child)
++
++        # FROM WHERE
++        _collect_from_where(obj.where)
++
++        # ORDER BY
++        for order in getattr(obj, "order_by", ()):
++            if not order:
++                continue
++            # strip direction prefix
++            if isinstance(order, str):
++                name = order.lstrip("+-")
++                if name in obj.annotations:
++                    referenced.add(name)
++            else:
++                _collect_from_expr(order)
++
++        # GROUP BY
++        for group in (obj.group_by or ()):  # group_by may be None/True/tuple
++            _collect_from_expr(group)
++
++        # DISTINCT fields may reference annotations
++        for name in getattr(obj, "distinct_fields", ()):
++            if name in obj.annotations:
++                referenced.add(name)
++
++        # Resolve transitive dependencies: annotations can reference other
++        # annotations via Ref(). Keep expanding until stable.
++        changed = True
++        while changed:
++            changed = False
++            for alias, annotation in list(obj.annotations.items()):
++                if alias in referenced:
++                    # Scan this annotation for Ref() to other annotations.
++                    before = len(referenced)
++                    _collect_from_expr(annotation)
++                    if len(referenced) != before:
++                        changed = True
++
++        # Prune unreferenced annotations. We don't remove annotations that are
++        # already requested to be selected via annotation_select_mask (if any),
++        # but by default remove any annotation not in referenced. The COUNT
++        # annotation will be added next.
++        if obj.annotations:
++            # Keep nothing except referenced (prune others)
++            obj.annotations = {k: v for k, v in obj.annotations.items() if k in referenced}
++            # Reset cached selection mapping
++            obj.set_annotation_mask(set(obj.annotations))
++
+         obj.add_annotation(Count("*"), alias="__count", is_summary=True)
+         return obj.get_aggregation(using, ["__count"])["__count"]
+ 
+diff --git a/tests/aggregation/tests.py b/tests/aggregation/tests.py
+index 39c8a45707..e88c9b4946 100644
+--- a/tests/aggregation/tests.py
++++ b/tests/aggregation/tests.py
+@@ -261,6 +261,25 @@ class AggregateTestCase(TestCase):
+         )
+         self.assertEqual(b.mean_age, 34.5)
+ 
++    def test_count_strips_unused_annotations(self):
++        """count() should ignore annotations that are not used by filters,
++        ordering or grouping so the generated SQL is the same as an unannotated
++        count()."""
++        from django.test.utils import CaptureQueriesContext
++        from django.db import connection
++
++        qs = Book.objects.annotate(num_authors=Count("authors"))
++        with CaptureQueriesContext(connection) as c1:
++            Book.objects.count()
++        with CaptureQueriesContext(connection) as c2:
++            qs.count()
++
++        # Ensure the SQL emitted for both counts is identical (no extra
++        # annotations or JOINs introduced by the annotation)
++        sql1 = c1.captured_queries[0]["sql"]
++        sql2 = c2.captured_queries[0]["sql"]
++        self.assertEqual(sql1, sql2)
++
+     def test_annotate_defer(self):
+         qs = (
+             Book.objects.annotate(page_sum=Sum("pages"))

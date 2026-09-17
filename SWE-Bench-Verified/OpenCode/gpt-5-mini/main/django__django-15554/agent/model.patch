@@ -1,0 +1,56 @@
+diff --git a/django/db/models/sql/datastructures.py b/django/db/models/sql/datastructures.py
+index 1edf040e82..14d643aaf4 100644
+--- a/django/db/models/sql/datastructures.py
++++ b/django/db/models/sql/datastructures.py
+@@ -162,8 +162,12 @@ class Join:
+         return hash(self.identity)
+ 
+     def equals(self, other):
+-        # Ignore filtered_relation in equality check.
+-        return self.identity[:-1] == other.identity[:-1]
++        # Consider filtered_relation in equality check so that joins which
++        # differ only by their filtered_relation are treated as distinct.
++        # Previously filtered_relation was ignored which caused multiple
++        # FilteredRelation annotations for the same relation to reuse the
++        # same SQL JOIN and thus drop one of the filters.
++        return self.identity == other.identity
+ 
+     def demote(self):
+         new = self.relabeled_clone({})
+diff --git a/tests/filtered_relation/tests.py b/tests/filtered_relation/tests.py
+index 790a90d9e2..578d6ce8cb 100644
+--- a/tests/filtered_relation/tests.py
++++ b/tests/filtered_relation/tests.py
+@@ -657,6 +657,32 @@ class FilteredRelationTests(TestCase):
+             FilteredRelation("book", condition=Q(book__title="b")), mock.ANY
+         )
+ 
++    def test_multiple_filteredrelation_same_relation_not_reused(self):
++        """Ensure multiple FilteredRelation annotations for the same relation
++        produce distinct JOINs (don't reuse a single JOIN)."""
++        qs = Author.objects.annotate(
++            relation_zone=FilteredRelation(
++                "book", condition=Q(book__title__icontains="poem")
++            ),
++            relation_all=FilteredRelation(
++                "book", condition=Q(book__title__iexact="Poem by Alice")
++            ),
++        ).filter(relation_zone__isnull=True)
++        sql = str(qs.query)
++        # Both filtered_relation table aliases should appear in the generated SQL
++        self.assertIn(
++            "INNER JOIN {} relation_zone ON".format(
++                connection.ops.quote_name("filtered_relation_book")
++            ),
++            sql,
++        )
++        self.assertIn(
++            "INNER JOIN {} relation_all ON".format(
++                connection.ops.quote_name("filtered_relation_book")
++            ),
++            sql,
++        )
++
+ 
+ class FilteredRelationAggregationTests(TestCase):
+     @classmethod

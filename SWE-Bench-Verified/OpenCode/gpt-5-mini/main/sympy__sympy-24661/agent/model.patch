@@ -1,0 +1,90 @@
+diff --git a/sympy/parsing/sympy_parser.py b/sympy/parsing/sympy_parser.py
+index 52711d1324..a1ba833a02 100644
+--- a/sympy/parsing/sympy_parser.py
++++ b/sympy/parsing/sympy_parser.py
+@@ -1118,6 +1118,14 @@ class EvaluateFalseTransformer(ast.NodeTransformer):
+         'cosh', 'coth', 'csch', 'sech', 'sinh', 'tanh',
+         'exp', 'ln', 'log', 'sqrt', 'cbrt',
+     )
++    comparisons = {
++        ast.Lt: 'Lt',
++        ast.Gt: 'Gt',
++        ast.LtE: 'Le',
++        ast.GtE: 'Ge',
++        ast.Eq: 'Eq',
++        ast.NotEq: 'Ne',
++    }
+ 
+     def flatten(self, args, func):
+         result = []
+@@ -1186,6 +1194,48 @@ def visit_BinOp(self, node):
+             return new_node
+         return node
+ 
++    def visit_Compare(self, node):
++        """Transform Python comparison(s) into SymPy relational calls with
++        evaluate=False. Chained comparisons are converted into an And(...) of
++        individual comparisons to preserve the original ordering and semantics.
++        """
++        # Visit children first
++        left = self.visit(node.left)
++        comparators = [self.visit(c) for c in node.comparators]
++
++        # Build comparison calls for each operator/comparator pair
++        comps = []
++        current_left = left
++        for op, comp in zip(node.ops, comparators):
++            op_type = op.__class__
++            if op_type in self.comparisons:
++                opname = self.comparisons[op_type]
++            else:
++                # Unknown comparison operator; leave as-is
++                return node
++
++            comp_call = ast.Call(
++                func=ast.Name(id=opname, ctx=ast.Load()),
++                args=[current_left, comp],
++                keywords=[ast.keyword(arg='evaluate', value=ast.NameConstant(value=False, ctx=ast.Load()))],
++                starargs=None,
++                kwargs=None
++            )
++            comps.append(comp_call)
++            current_left = comp
++
++        if len(comps) == 1:
++            return comps[0]
++        # For chained comparisons, combine with And(...)
++        new_node = ast.Call(
++            func=ast.Name(id='And', ctx=ast.Load()),
++            args=comps,
++            keywords=[ast.keyword(arg='evaluate', value=ast.NameConstant(value=False, ctx=ast.Load()))],
++            starargs=None,
++            kwargs=None
++        )
++        return new_node
++
+     def visit_Call(self, node):
+         new_node = self.generic_visit(node)
+         if isinstance(node.func, ast.Name) and node.func.id in self.functions:
+diff --git a/sympy/parsing/tests/test_sympy_parser.py b/sympy/parsing/tests/test_sympy_parser.py
+index 7c43e1fce3..eda444322e 100644
+--- a/sympy/parsing/tests/test_sympy_parser.py
++++ b/sympy/parsing/tests/test_sympy_parser.py
+@@ -209,6 +209,17 @@ def test_function_evaluate_false():
+     assert str(parse_expr('cbrt(0)', evaluate=False)) == '0**(1/3)'
+ 
+ 
++def test_evaluate_false_relationals():
++    # ensure relational operators are not evaluated when evaluate=False
++    assert parse_expr('1 < 2') is True
++    expr = parse_expr('1 < 2', evaluate=False)
++    assert str(expr) == '1 < 2'
++
++    # chained comparisons
++    expr2 = parse_expr('1 < x < 3', evaluate=False)
++    assert str(expr2) == '1 < x < 3'
++
++
+ def test_issue_10773():
+     inputs = {
+     '-10/5': '(-10)/5',

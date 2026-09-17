@@ -1,0 +1,54 @@
+diff --git a/sphinx/io.py b/sphinx/io.py
+index 4874fdf39..54af2f1cd 100644
+--- a/sphinx/io.py
++++ b/sphinx/io.py
+@@ -156,10 +156,49 @@ class SphinxFileInput(FileInput):
+         kwargs['error_handler'] = 'sphinx'
+         super().__init__(*args, **kwargs)
+ 
++    def read(self, *args: Any, **kwargs: Any) -> str:
++        """Read the file content and emit ``source-read`` event if available.
++
++        Docutils' include directive uses the publisher's ``source_class`` to
++        read included files.  To let Sphinx extensions intercept included
++        file contents via the ``source-read`` event (same as top-level
++        documents), emit the event here when an environment was attached
++        to the class in :func:`create_publisher`.
++        """
++        content = super().read(*args, **kwargs)
++
++        env = getattr(self.__class__, '_env', None)
++        if env is None:
++            return content
++
++        # try to determine a docname for this source file; fall back to the
++        # current env.docname when not found
++        filename = None
++        for attr in ('source_path', 'path', 'source', 'source_name'):
++            filename = getattr(self, attr, None)
++            if filename:
++                break
++
++        try:
++            docname = env.path2doc(filename) if filename else env.docname
++        except Exception:
++            docname = env.docname
++
++        arg = [content]
++        try:
++            env.events.emit('source-read', docname, arg)
++            return arg[0]
++        except Exception:
++            # never let event handlers break doc build here; return original
++            return content
++
+ 
+ def create_publisher(app: Sphinx, filetype: str) -> Publisher:
+     reader = SphinxStandaloneReader()
+     reader.setup(app)
++    # attach environment to SphinxFileInput class so its read() can emit
++    # "source-read" events for included files
++    SphinxFileInput._env = app.env
+ 
+     parser = app.registry.create_source_parser(app, filetype)
+     if parser.__class__.__name__ == 'CommonMarkParser' and parser.settings_spec == ():

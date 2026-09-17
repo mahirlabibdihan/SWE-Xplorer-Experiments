@@ -1,0 +1,73 @@
+diff --git a/django/db/migrations/executor.py b/django/db/migrations/executor.py
+index 57042a8690..a8a8882448 100644
+--- a/django/db/migrations/executor.py
++++ b/django/db/migrations/executor.py
+@@ -250,10 +250,26 @@ class MigrationExecutor:
+         if not fake:
+             with self.connection.schema_editor(atomic=migration.atomic) as schema_editor:
+                 state = migration.unapply(state, schema_editor)
+-        # For replacement migrations, record individual statuses
++        # For replacement migrations, record individual statuses. If the
++        # replaced migration files are still present on disk, unapplying the
++        # replacement should mark the replacement migration itself as
++        # unapplied as well (remove its applied record). This happens when a
++        # squashed migration was recorded as applied (via
++        # check_replacements) but the original migration files are still
++        # available.
+         if migration.replaces:
+             for app_label, name in migration.replaces:
+                 self.recorder.record_unapplied(app_label, name)
++            # If any of the replaced migration files still exist on disk,
++            # also remove the replacement migration record from the
++            # django_migrations table so the squashed migration is marked as
++            # unapplied.
++            try:
++                disk_migrations = self.loader.disk_migrations
++            except Exception:
++                disk_migrations = None
++            if disk_migrations is not None and any((app_label, name) in disk_migrations for app_label, name in migration.replaces):
++                self.recorder.record_unapplied(migration.app_label, migration.name)
+         else:
+             self.recorder.record_unapplied(migration.app_label, migration.name)
+         # Report progress
+diff --git a/tests/migrations/test_executor.py b/tests/migrations/test_executor.py
+index e61d8f1276..6f9d33605d 100644
+--- a/tests/migrations/test_executor.py
++++ b/tests/migrations/test_executor.py
+@@ -104,6 +104,36 @@ class ExecutorTests(MigrationTestBase):
+         self.assertTableNotExists("migrations_author")
+         self.assertTableNotExists("migrations_book")
+ 
++    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_squashed"})
++    def test_unapply_squashed_marks_all_unapplied_when_replaced_on_disk(self):
++        """
++        Unapplying a squashed migration should remove the squashed migration's
++        applied record if the replaced migration files still exist on disk.
++        """
++        executor = MigrationExecutor(connection)
++        recorder = MigrationRecorder(connection)
++
++        # Apply the squashed migration which replaces 0001 and 0002
++        executor.migrate([("migrations", "0001_squashed_0002")])
++        # Rebuild the graph to reflect the new DB state
++        executor.loader.build_graph()
++
++        # Sanity check: both replaced and the replacement should be recorded
++        applied = recorder.applied_migrations()
++        self.assertIn(("migrations", "0001_initial"), applied)
++        self.assertIn(("migrations", "0002_second"), applied)
++        self.assertIn(("migrations", "0001_squashed_0002"), applied)
++
++        # Now unapply the squashed migration
++        executor.migrate([("migrations", None)])
++
++        # After unapplying, none of the replaced migrations nor the squashed
++        # migration itself should be present in the applied set.
++        applied = recorder.applied_migrations()
++        self.assertNotIn(("migrations", "0001_initial"), applied)
++        self.assertNotIn(("migrations", "0002_second"), applied)
++        self.assertNotIn(("migrations", "0001_squashed_0002"), applied)
++
+     @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_non_atomic"})
+     def test_non_atomic_migration(self):
+         """

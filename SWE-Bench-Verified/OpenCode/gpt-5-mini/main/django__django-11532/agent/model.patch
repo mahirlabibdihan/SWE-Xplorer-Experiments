@@ -1,0 +1,48 @@
+diff --git a/django/core/mail/message.py b/django/core/mail/message.py
+index e393b4cf5c..3bd011c4db 100644
+--- a/django/core/mail/message.py
++++ b/django/core/mail/message.py
+@@ -257,7 +257,17 @@ class EmailMessage:
+             msg['Date'] = formatdate(localtime=settings.EMAIL_USE_LOCALTIME)
+         if 'message-id' not in header_names:
+             # Use cached DNS_NAME for performance
+-            msg['Message-ID'] = make_msgid(domain=DNS_NAME)
++            # Ensure the domain part is ASCII by converting internationalized
++            # domain names (IDN) to punycode (IDNA) before creating the
++            # Message-ID. This prevents header encoding errors when the
++            # message encoding is not UTF-8.
++            domain = str(DNS_NAME)
++            try:
++                domain.encode('ascii')
++            except UnicodeEncodeError:
++                # Convert to IDNA (punycode) representation.
++                domain = domain.encode('idna').decode('ascii')
++            msg['Message-ID'] = make_msgid(domain=domain)
+         for name, value in self.extra_headers.items():
+             if name.lower() != 'from':  # From is already handled
+                 msg[name] = value
+diff --git a/tests/mail/tests.py b/tests/mail/tests.py
+index 15593dc3f7..68f227aacb 100644
+--- a/tests/mail/tests.py
++++ b/tests/mail/tests.py
+@@ -334,6 +334,20 @@ class MailTests(HeadersCheckMixin, SimpleTestCase):
+         self.assertEqual(message['Sender'], '=?utf-8?q?Firstname_S=C3=BCrname?= <sender@example.com>')
+         self.assertEqual(message['Comments'], '=?utf-8?q?My_S=C3=BCrname_is_non-ASCII?=')
+ 
++    def test_unicode_dns(self):
++        """
++        Message-ID domain should be converted to punycode (IDNA) when the
++        system DNS_NAME contains non-ASCII characters and the message
++        encoding is non-unicode (e.g. iso-8859-1).
++        """
++        from unittest.mock import patch
++        with patch('django.core.mail.message.DNS_NAME', '漢字'):
++            email = EmailMessage('subject', '', 'from@example.com', ['to@example.com'])
++            email.encoding = 'iso-8859-1'
++            message = email.message()
++            # Punycode for '漢字' starts with 'xn--'
++            self.assertIn('xn--', message['Message-ID'])
++
+     def test_safe_mime_multipart(self):
+         """
+         Make sure headers can be set with a different encoding than utf-8 in

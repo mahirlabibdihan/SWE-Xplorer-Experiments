@@ -1,0 +1,52 @@
+diff --git a/django/contrib/sessions/backends/base.py b/django/contrib/sessions/backends/base.py
+index b5453160a5..14f09fc326 100644
+--- a/django/contrib/sessions/backends/base.py
++++ b/django/contrib/sessions/backends/base.py
+@@ -108,6 +108,19 @@ class SessionBase:
+ 
+     def encode(self, session_dict):
+         "Return the given session dictionary serialized and encoded as a string."
++        # During the transitional period around Django 3.1, older instances
++        # of a project may still expect the pre-3.1 session format which was
++        # a base64-encoded string of "<hexdigest>:<serialized>". If the
++        # runtime DEFAULT_HASHING_ALGORITHM is set to 'sha1', keep using the
++        # legacy encode format so different instances (old/new) can interop.
++        # RemovedInDjango40Warning: drop this branch when the transition ends.
++        if getattr(settings, 'DEFAULT_HASHING_ALGORITHM', None) == 'sha1':
++            # Legacy format: hash:serialized -> base64
++            serialized = self.serializer().dumps(session_dict)
++            hash_ = self._hash(serialized).encode('ascii')
++            encoded = base64.b64encode(hash_ + b':' + serialized).decode('ascii')
++            return encoded
++
+         return signing.dumps(
+             session_dict, salt=self.key_salt, serializer=self.serializer,
+             compress=True,
+diff --git a/tests/sessions_tests/tests.py b/tests/sessions_tests/tests.py
+index 248dae82aa..15be6c2306 100644
+--- a/tests/sessions_tests/tests.py
++++ b/tests/sessions_tests/tests.py
+@@ -311,6 +311,23 @@ class SessionTestsMixin:
+         encoded = self.session.encode(data)
+         self.assertEqual(self.session.decode(encoded), data)
+ 
++    def test_encode_default_hashing_algorithm_sha1(self):
++        # When DEFAULT_HASHING_ALGORITHM is 'sha1' we should use the legacy
++        # pre-3.1 encoding format so older/newer instances can interoperate.
++        with override_settings(DEFAULT_HASHING_ALGORITHM='sha1'):
++            # Recreate backend to pick up overridden settings
++            session = self.backend()
++            data = {'a test key': 'a test value'}
++            encoded = session.encode(data)
++            # Legacy format is base64 of "<hex digest>:<serialized>"
++            raw = base64.b64decode(encoded.encode('ascii'))
++            self.assertIn(b':', raw)
++            hash_part, serialized = raw.split(b':', 1)
++            # hash part should be ascii hex
++            self.assertRegex(hash_part.decode('ascii'), r'^[0-9a-f]+$')
++            # decode should return original data
++            self.assertEqual(session.decode(encoded), data)
++
+     @override_settings(SECRET_KEY='django_tests_secret_key')
+     def test_decode_legacy(self):
+         # RemovedInDjango40Warning: pre-Django 3.1 sessions will be invalid.

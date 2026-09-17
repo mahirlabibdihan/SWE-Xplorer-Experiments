@@ -1,0 +1,69 @@
+diff --git a/src/_pytest/unittest.py b/src/_pytest/unittest.py
+index 773f545af..e3ee370d6 100644
+--- a/src/_pytest/unittest.py
++++ b/src/_pytest/unittest.py
+@@ -90,7 +90,24 @@ def _make_xunit_fixture(obj, setup_name, teardown_name, scope, pass_self):
+     @pytest.fixture(scope=scope, autouse=True)
+     def fixture(self, request):
+         if getattr(self, "__unittest_skip__", None):
+-            reason = self.__unittest_skip_why__
++            reason = self.__unittest_skip_why_
++            # When running with --pdb we postpone running tearDown() (see
++            # TestCaseFunction.runtest). If the test is skipped in the
++            # fixture we must also prevent unittest from calling the real
++            # tearDown immediately (unittest always calls tearDown in a
++            # finally block). Store the original tearDown on the test item
++            # so that TestCaseFunction.teardown can call it later, and
++            # replace the instance tearDown with a noop.
++            try:
++                if request.config.getoption("usepdb"):
++                    node = getattr(request, "node", None)
++                    # Only touch TestCaseFunction instances (avoid importing)
++                    if node is not None and type(node).__name__ == "TestCaseFunction":
++                        node._explicit_tearDown = getattr(self, "tearDown", None)
++                        setattr(self, "tearDown", lambda *args, **kwargs: None)
++            except Exception:
++                # Be defensive: do not fail fixture setup due to pdb bookkeeping
++                pass
+             pytest.skip(reason)
+         if setup is not None:
+             if pass_self:
+diff --git a/testing/test_unittest.py b/testing/test_unittest.py
+index 83f1b6b2a..5f7562cc8 100644
+--- a/testing/test_unittest.py
++++ b/testing/test_unittest.py
+@@ -1193,6 +1193,34 @@ def test_pdb_teardown_called(testdir, monkeypatch):
+     ]
+ 
+ 
++def test_skip_with_pdb_does_not_run_teardown(testdir):
++    """A skipped unittest test should not have its tearDown executed immediately
++    when running with --pdb (regression test).
++    """
++    p = testdir.makepyfile(
++        """
++        import unittest
++
++        class MyTestCase(unittest.TestCase):
++            def setUp(self):
++                # would raise if executed
++                xxx
++
++            @unittest.skip("skip me")
++            def test_one(self):
++                pass
++
++            def tearDown(self):
++                # would raise if executed
++                xxx
++        """
++    )
++    result = testdir.runpytest_inprocess("--pdb", p)
++    # Expect no errors, only a skipped test
++    result.stdout.fnmatch_lines(["*1 skipped*", "*0 failed*", "*0 error*"],
++                                strict=False)
++
++
+ def test_async_support(testdir):
+     pytest.importorskip("unittest.async_case")
+ 

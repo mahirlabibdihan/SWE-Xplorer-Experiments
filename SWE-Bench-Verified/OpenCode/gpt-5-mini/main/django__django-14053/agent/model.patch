@@ -1,0 +1,105 @@
+diff --git a/django/contrib/staticfiles/storage.py b/django/contrib/staticfiles/storage.py
+index 494890cc23..16b872635b 100644
+--- a/django/contrib/staticfiles/storage.py
++++ b/django/contrib/staticfiles/storage.py
+@@ -226,19 +226,50 @@ class HashedFilesMixin:
+             path for path in paths
+             if matches_patterns(path, self._patterns)
+         ]
+-        # Do a single pass first. Post-process all files once, then repeat for
+-        # adjustable files.
++        # Accumulate results from each pass and yield each original filename
++        # exactly once with the final hashed name and aggregated processed
++        # flag. Exceptions and special control items (like 'All') are
++        # handled immediately.
++        results = {}
++        order = []
++
++        # First pass: process all files
+         for name, hashed_name, processed, _ in self._post_process(paths, adjustable_paths, hashed_files):
+-            yield name, hashed_name, processed
++            if name == 'All':
++                yield name, hashed_name, processed
++                continue
++            if isinstance(processed, Exception):
++                # Surface post-processing errors immediately, like before.
++                yield name, None, processed
++                return
++            if name not in results:
++                order.append(name)
++                results[name] = {'hashed_name': hashed_name, 'processed': bool(processed)}
++            else:
++                results[name]['processed'] = results[name]['processed'] or bool(processed)
++                results[name]['hashed_name'] = hashed_name
+ 
+         paths = {path: paths[path] for path in adjustable_paths}
+ 
++        substitutions = False
+         for i in range(self.max_post_process_passes):
+-            substitutions = False
++            any_subst = False
+             for name, hashed_name, processed, subst in self._post_process(paths, adjustable_paths, hashed_files):
+-                yield name, hashed_name, processed
+-                substitutions = substitutions or subst
++                if name == 'All':
++                    yield name, hashed_name, processed
++                    continue
++                if isinstance(processed, Exception):
++                    yield name, None, processed
++                    return
++                if name not in results:
++                    order.append(name)
++                    results[name] = {'hashed_name': hashed_name, 'processed': bool(processed)}
++                else:
++                    results[name]['processed'] = results[name]['processed'] or bool(processed)
++                    results[name]['hashed_name'] = hashed_name
++                any_subst = any_subst or subst
+ 
++            substitutions = any_subst
+             if not substitutions:
+                 break
+ 
+@@ -248,6 +279,11 @@ class HashedFilesMixin:
+         # Store the processed paths
+         self.hashed_files.update(hashed_files)
+ 
++        # Yield each original filename once, in the order first encountered.
++        for name in order:
++            info = results[name]
++            yield name, info['hashed_name'], info['processed']
++
+     def _post_process(self, paths, adjustable_paths, hashed_files):
+         # Sort the files by directory level
+         def path_level(name):
+diff --git a/tests/staticfiles_tests/test_storage.py b/tests/staticfiles_tests/test_storage.py
+index dc45a0b839..9ae450aa2d 100644
+--- a/tests/staticfiles_tests/test_storage.py
++++ b/tests/staticfiles_tests/test_storage.py
+@@ -205,6 +205,27 @@ class TestHashedFiles:
+         self.assertIn(os.path.join('test', 'nonascii.css'), stats['post_processed'])
+         self.assertPostCondition()
+ 
++    def test_no_duplicate_post_processed_entries(self):
++        """
++        Ensure post-processed file list contains no duplicate original paths.
++        """
++        collectstatic_args = {
++            'interactive': False,
++            'verbosity': 0,
++            'link': False,
++            'clear': False,
++            'dry_run': False,
++            'post_process': True,
++            'use_default_ignore_patterns': True,
++            'ignore_patterns': ['*.ignoreme'],
++        }
++
++        collectstatic_cmd = CollectstaticCommand()
++        collectstatic_cmd.set_options(**collectstatic_args)
++        stats = collectstatic_cmd.collect()
++        post_processed = stats['post_processed']
++        self.assertEqual(len(post_processed), len(set(post_processed)))
++
+     def test_css_import_case_insensitive(self):
+         relpath = self.hashed_file_path("cached/styles_insensitive.css")
+         self.assertEqual(relpath, "cached/styles_insensitive.3fa427592a53.css")

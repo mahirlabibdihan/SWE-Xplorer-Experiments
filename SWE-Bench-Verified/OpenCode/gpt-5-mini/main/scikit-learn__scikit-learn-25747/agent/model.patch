@@ -1,0 +1,78 @@
+diff --git a/sklearn/utils/_set_output.py b/sklearn/utils/_set_output.py
+index 335773c6a..693d65de7 100644
+--- a/sklearn/utils/_set_output.py
++++ b/sklearn/utils/_set_output.py
+@@ -55,11 +55,36 @@ def _wrap_in_pandas_container(
+     if isinstance(data_to_wrap, pd.DataFrame):
+         if columns is not None:
+             data_to_wrap.columns = columns
++        # Only set the index if it matches the length of the output. If the
++        # transformer reduced/expanded the number of rows (e.g. aggregation),
++        # preserve the estimator's output index instead of forcing the
++        # original input index which would raise a length mismatch error.
+         if index is not None:
+-            data_to_wrap.index = index
++            try:
++                if len(index) == len(data_to_wrap):
++                    data_to_wrap.index = index
++            except Exception:
++                # If we cannot determine lengths, be conservative and do not
++                # override the output index.
++                pass
+         return data_to_wrap
+ 
+-    return pd.DataFrame(data_to_wrap, index=index, columns=columns)
++    # For non-DataFrame inputs (e.g. ndarray or Series), only use the
++    # provided `index` if its length matches the number of rows of
++    # `data_to_wrap`. This avoids ValueErrors when transformers change the
++    # number of rows (aggregation, filtering, etc.).
++    index_to_use = index
++    try:
++        # determine number of rows in data_to_wrap
++        n_rows = data_to_wrap.shape[0]
++        if index is not None and len(index) != n_rows:
++            index_to_use = None
++    except Exception:
++        # If we cannot determine shape/length, fall back to not forcing the
++        # index to avoid unexpected errors.
++        index_to_use = None
++
++    return pd.DataFrame(data_to_wrap, index=index_to_use, columns=columns)
+ 
+ 
+ def _get_output_config(method, estimator=None):
+diff --git a/sklearn/utils/tests/test_set_output.py b/sklearn/utils/tests/test_set_output.py
+index ac73ca094..e28708b9e 100644
+--- a/sklearn/utils/tests/test_set_output.py
++++ b/sklearn/utils/tests/test_set_output.py
+@@ -260,3 +260,30 @@ def test_set_output_mro():
+         pass
+ 
+     assert C().transform(None) == "B"
++
++
++def test__wrap_in_pandas_container_preserve_output_index_on_length_mismatch():
++    """If the output has a different number of rows than the original input
++    index, the output's own index should be preserved and the original input
++    index should not be forced onto the output.
++    """
++    pd = pytest.importorskip("pandas")
++
++    # original input with 6 rows
++    original_index = pd.date_range("2020-01-01", periods=6, freq="H")
++
++    # aggregated output with 2 rows
++    out_index = pd.to_datetime(["2020-01-01", "2020-01-02"]).date
++    # create a Series-like output (length mismatch)
++    series_out = pd.Series([1, 2], index=[pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02")])
++
++    wrapped = _wrap_in_pandas_container(series_out, columns=None, index=original_index)
++    # The output index should be the series' own index, not the original_index
++    assert isinstance(wrapped, pd.DataFrame)
++    assert_array_equal(wrapped.index, series_out.index)
++
++    # Same for DataFrame outputs
++    df_out = pd.DataFrame({"a": [1, 2]}, index=[pd.Timestamp("2020-01-01"), pd.Timestamp("2020-01-02")])
++    wrapped_df = _wrap_in_pandas_container(df_out, columns=None, index=original_index)
++    assert isinstance(wrapped_df, pd.DataFrame)
++    assert_array_equal(wrapped_df.index, df_out.index)

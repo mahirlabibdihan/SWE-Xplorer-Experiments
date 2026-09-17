@@ -1,0 +1,56 @@
+diff --git a/xarray/core/nanops.py b/xarray/core/nanops.py
+index 41c8d258..024b9914 100644
+--- a/xarray/core/nanops.py
++++ b/xarray/core/nanops.py
+@@ -26,14 +26,20 @@ def _maybe_null_out(result, axis, mask, min_count=1):
+     """
+     xarray version of pandas.core.nanops._maybe_null_out
+     """
+-    if hasattr(axis, "__len__"):  # if tuple or list
+-        raise ValueError(
+-            "min_count is not available for reduction with more than one dimensions."
+-        )
+-
++    # axis may be an int, a sequence of ints, or None. We need to compute the
++    # number of valid (non-null) elements that contributed to each reduced
++    # position and compare that against min_count. For a single axis the
++    # original logic used mask.shape[axis]; for multiple axes we compute the
++    # product of the reduced dimensions' lengths.
+     if axis is not None and getattr(result, "ndim", False):
+-        null_mask = (mask.shape[axis] - mask.sum(axis) - min_count) < 0
+-        if null_mask.any():
++        # total elements reduced for each output position
++        if hasattr(axis, "__len__"):
++            total = np.take(mask.shape, axis).prod()
++        else:
++            total = mask.shape[axis]
++
++        null_mask = (total - mask.sum(axis=axis) - min_count) < 0
++        if np.any(null_mask):
+             dtype, fill_value = dtypes.maybe_promote(result.dtype)
+             result = result.astype(dtype)
+             result[null_mask] = fill_value
+diff --git a/xarray/tests/test_duck_array_ops.py b/xarray/tests/test_duck_array_ops.py
+index b542dad9..9156f622 100644
+--- a/xarray/tests/test_duck_array_ops.py
++++ b/xarray/tests/test_duck_array_ops.py
+@@ -595,6 +595,19 @@ def test_min_count(dim_num, dtype, dask, func, aggdim):
+     assert_dask_array(actual, dask)
+ 
+ 
++def test_min_count_multiple_dims():
++    data = np.array([[1.0, np.nan, 3.0], [np.nan, np.nan, 6.0]])
++    da = DataArray(data, dims=("x", "y"))
++
++    # valid values: [1,3,6] -> 3 values, sum = 10
++    res = da.sum(("x", "y"), min_count=3)
++    assert res.values == 10.0
++
++    # require 4 valid values -> should return NA
++    res2 = da.sum(("x", "y"), min_count=4)
++    assert np.isnan(res2.values)
++
++
+ @pytest.mark.parametrize("func", ["sum", "prod"])
+ def test_min_count_dataset(func):
+     da = construct_dataarray(2, dtype=float, contains_nan=True, dask=False)

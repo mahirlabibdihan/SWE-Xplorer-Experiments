@@ -1,0 +1,71 @@
+diff --git a/sympy/matrices/expressions/blockmatrix.py b/sympy/matrices/expressions/blockmatrix.py
+index 95302a05ca..7dbd05ad34 100644
+--- a/sympy/matrices/expressions/blockmatrix.py
++++ b/sympy/matrices/expressions/blockmatrix.py
+@@ -162,9 +162,35 @@ def structurally_equal(self, other):
+             and self.colblocksizes == other.colblocksizes)
+ 
+     def _blockmul(self, other):
++        # Perform blockwise multiplication while preserving MatrixExpr
++        # types (especially ZeroMatrix) instead of delegating to the
++        # DenseMatrix multiplication which can collapse zero blocks to a
++        # scalar Zero. This keeps block structure intact for further
++        # block operations.
+         if (isinstance(other, BlockMatrix) and
+                 self.colblocksizes == other.rowblocksizes):
+-            return BlockMatrix(self.blocks*other.blocks)
++            from functools import reduce
++            rows = self.blockshape[0]
++            cols = other.blockshape[1]
++            inner = self.blockshape[1]
++            new = []
++            for i in range(rows):
++                new_row = []
++                for j in range(cols):
++                    terms = [self.blocks[i, k] * other.blocks[k, j]
++                             for k in range(inner)]
++                    # Reduce without a scalar zero initializer to avoid
++                    # mixing scalar Zero with MatrixExprs
++                    if not terms:
++                        # Should not happen for well-formed blocks, but
++                        # be defensive and return a ZeroMatrix of the
++                        # appropriate size if it does.
++                        entry = ZeroMatrix(self.rowblocksizes[i], other.colblocksizes[j])
++                    else:
++                        entry = reduce(lambda a, b: a + b, terms)
++                    new_row.append(entry)
++                new.append(new_row)
++            return BlockMatrix(new)
+ 
+         return self * other
+ 
+diff --git a/sympy/matrices/expressions/tests/test_blockmatrix.py b/sympy/matrices/expressions/tests/test_blockmatrix.py
+index 1e1033affc..5852e4f14e 100644
+--- a/sympy/matrices/expressions/tests/test_blockmatrix.py
++++ b/sympy/matrices/expressions/tests/test_blockmatrix.py
+@@ -212,6 +212,25 @@ def test_deblock():
+ 
+     assert deblock(reblock_2x2(B)) == B
+ 
++
++def test_block_matrix_zero_blocks_preserved():
++    # Regression test for bug where ZeroMatrix blocks became scalar Zero
++    from sympy import MatrixSymbol, ZeroMatrix, BlockMatrix, block_collapse
++    a = MatrixSymbol('a', 2, 2)
++    z = ZeroMatrix(2, 2)
++    b = BlockMatrix([[a, z], [z, z]])
++
++    # Single block multiplication should produce ZeroMatrix blocks
++    r = b._blockmul(b)
++    assert getattr(r.blocks[0, 1], 'is_ZeroMatrix', False) is True
++    assert getattr(r.blocks[1, 0], 'is_ZeroMatrix', False) is True
++
++    # Multiplying further should not raise and should keep zeros as matrices
++    r2 = block_collapse(b * b * b)
++    # check that off-diagonal blocks are zero-matrices
++    assert getattr(r2.blocks[0, 1], 'is_ZeroMatrix', False) is True
++    assert getattr(r2.blocks[1, 0], 'is_ZeroMatrix', False) is True
++
+ def test_block_collapse_type():
+     bm1 = BlockDiagMatrix(ImmutableMatrix([1]), ImmutableMatrix([2]))
+     bm2 = BlockDiagMatrix(ImmutableMatrix([3]), ImmutableMatrix([4]))

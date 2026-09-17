@@ -1,0 +1,66 @@
+diff --git a/src/_pytest/mark/expression.py b/src/_pytest/mark/expression.py
+index 04c73411a..a62757f3b 100644
+--- a/src/_pytest/mark/expression.py
++++ b/src/_pytest/mark/expression.py
+@@ -128,8 +128,15 @@ class Scanner:
+ 
+ 
+ def expression(s: Scanner) -> ast.Expression:
++    # Use ast.Constant where available (py3.8+); fall back to ast.NameConstant
++    # for older Python versions. This avoids producing ast.Name nodes with ids
++    # of "True", "False" or "None" which make the compiler abort in debug
++    # builds (see bpo-40870).
+     if s.accept(TokenType.EOF):
+-        ret = ast.NameConstant(False)  # type: ast.expr
++        if hasattr(ast, "Constant"):
++            ret = ast.Constant(False)  # type: ast.expr
++        else:
++            ret = ast.NameConstant(False)  # type: ast.expr
+     else:
+         ret = expr(s)
+         s.accept(TokenType.EOF, reject=True)
+@@ -161,7 +168,23 @@ def not_expr(s: Scanner) -> ast.expr:
+         return ret
+     ident = s.accept(TokenType.IDENT)
+     if ident:
+-        return ast.Name(ident.value, ast.Load())
++        # Treat literal names specially: True/False/None should be constants
++        # rather than names. On Python 3.8+ the AST uses ast.Constant;
++        # older versions use ast.NameConstant.
++        val = ident.value
++        if val == "True":
++            if hasattr(ast, "Constant"):
++                return ast.Constant(True)
++            return ast.NameConstant(True)
++        if val == "False":
++            if hasattr(ast, "Constant"):
++                return ast.Constant(False)
++            return ast.NameConstant(False)
++        if val == "None":
++            if hasattr(ast, "Constant"):
++                return ast.Constant(None)
++            return ast.NameConstant(None)
++        return ast.Name(val, ast.Load())
+     s.reject((TokenType.NOT, TokenType.LPAREN, TokenType.IDENT))
+ 
+ 
+diff --git a/testing/test_mark_expression.py b/testing/test_mark_expression.py
+index 335888618..584526eb3 100644
+--- a/testing/test_mark_expression.py
++++ b/testing/test_mark_expression.py
+@@ -139,6 +139,15 @@ def test_valid_idents(ident: str) -> None:
+     assert evaluate(ident, {ident: True}.__getitem__)
+ 
+ 
++def test_compile_boolean_constants() -> None:
++    # Ensure boolean/None literals compile to constants and do not crash
++    # (fix for crash on debug builds when using ast.Name for these idents).
++    assert not evaluate("False", lambda ident: True)
++    assert evaluate("True", lambda ident: False)
++    # None literal should evaluate to False in boolean context
++    assert not evaluate("None", lambda ident: True)
++
++
+ @pytest.mark.parametrize(
+     "ident",
+     (

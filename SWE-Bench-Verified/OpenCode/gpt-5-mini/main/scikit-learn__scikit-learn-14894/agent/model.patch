@@ -1,0 +1,69 @@
+diff --git a/sklearn/svm/base.py b/sklearn/svm/base.py
+index 64cebe837..724034798 100644
+--- a/sklearn/svm/base.py
++++ b/sklearn/svm/base.py
+@@ -286,12 +286,19 @@ class BaseLibSVM(BaseEstimator, metaclass=ABCMeta):
+             n_class = 1
+         n_SV = self.support_vectors_.shape[0]
+ 
+-        dual_coef_indices = np.tile(np.arange(n_SV), n_class)
+-        dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
+-                                     dual_coef_indices.size / n_class)
+-        self.dual_coef_ = sp.csr_matrix(
+-            (dual_coef_data, dual_coef_indices, dual_coef_indptr),
+-            (n_class, n_SV))
++        # Handle the corner case where there are no support vectors. In that
++        # situation dual_coef_ should be an empty (n_class x 0) CSR matrix.
++        # Avoid constructing arrays with a zero step in np.arange which would
++        # raise a ZeroDivisionError.
++        if n_SV == 0:
++            self.dual_coef_ = sp.csr_matrix((n_class, 0), dtype=np.float64)
++        else:
++            dual_coef_indices = np.tile(np.arange(n_SV), n_class)
++            dual_coef_indptr = np.arange(0, dual_coef_indices.size + 1,
++                                         dual_coef_indices.size / n_class)
++            self.dual_coef_ = sp.csr_matrix(
++                (dual_coef_data, dual_coef_indices, dual_coef_indptr),
++                (n_class, n_SV))
+ 
+     def predict(self, X):
+         """Perform regression on samples in X.
+diff --git a/sklearn/svm/tests/test_svm.py b/sklearn/svm/tests/test_svm.py
+index 6ba141811..8ebb4c4ab 100644
+--- a/sklearn/svm/tests/test_svm.py
++++ b/sklearn/svm/tests/test_svm.py
+@@ -236,6 +236,34 @@ def test_svr_errors():
+         clf.predict(X)
+ 
+ 
++def test_svr_sparse_empty_support_vectors():
++    # Regression test for case when sparse input leads to no support vectors
++    # and _sparse_fit previously raised ZeroDivisionError when building
++    # dual_coef_. See issue: ZeroDivisionError in _sparse_fit for SVM with
++    # empty support_vectors_.
++    x_train = np.array([[0, 1, 0, 0],
++                        [0, 0, 0, 1],
++                        [0, 0, 1, 0],
++                        [0, 0, 0, 1]])
++    y_train = np.array([0.04, 0.04, 0.10, 0.16])
++    model = svm.SVR(kernel='linear', C=316.227766017, gamma=1.0,
++                    epsilon=0.1, max_iter=15000)
++
++    # dense fit should work
++    model.fit(x_train, y_train)
++
++    # sparse input previously raised ZeroDivisionError; ensure no error and
++    # that dual_coef_ is an empty (1 x 0) sparse matrix for this regression
++    # dataset.
++    xtrain = sparse.csr_matrix(x_train)
++    model.fit(xtrain, y_train)
++    assert hasattr(model, 'dual_coef_')
++    assert sparse.isspmatrix_csr(model.dual_coef_)
++    assert model.dual_coef_.shape[0] == 1
++    # in this case we expect zero support vectors
++    assert model.dual_coef_.shape[1] == 0
++
++
+ def test_oneclass():
+     # Test OneClassSVM
+     clf = svm.OneClassSVM()

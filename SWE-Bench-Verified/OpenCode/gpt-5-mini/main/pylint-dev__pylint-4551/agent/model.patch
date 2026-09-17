@@ -1,0 +1,124 @@
+diff --git a/pylint/pyreverse/inspector.py b/pylint/pyreverse/inspector.py
+index 8fa12202..4abfb031 100644
+--- a/pylint/pyreverse/inspector.py
++++ b/pylint/pyreverse/inspector.py
+@@ -231,6 +231,71 @@ class Linker(IdGeneratorMixIn, utils.LocalsVisitor):
+         """
+         try:
+             values = set(node.infer())
++        except astroid.InferenceError:
++            values = set()
++
++        # If inference didn't yield useful information, try to fallback to
++        # a type annotation on the right-hand side name. This handles cases
++        # like ``def __init__(self, a: str = None): self.a = a`` where the
++        # parameter carries the type via PEP 484 annotations but the default
++        # value (None) would make inference of the value yield Uninferable.
++        try:
++            # parent is usually the class node; the assign statement node is
++            # node.parent. The RHS expression of the assignment is stored on
++            # node.parent.value for Assign nodes.
++            rhs = getattr(node.parent, "value", None)
++            if (
++                (not values or any(v is astroid.Uninferable for v in values))
++                and isinstance(rhs, astroid.Name)
++            ):
++                arg_name = rhs.name
++                try:
++                    frame = node.parent.frame()
++                except Exception:
++                    frame = None
++                # If the assignment is inside a function/method, inspect the
++                # function arguments for an annotation for this name.
++                if isinstance(frame, astroid.FunctionDef):
++                    arguments = frame.args
++                    # build a list of argument nodes in the order they appear
++                    arg_nodes = []
++                    if getattr(arguments, "posonlyargs", None):
++                        arg_nodes.extend(arguments.posonlyargs)
++                    if getattr(arguments, "args", None):
++                        arg_nodes.extend(arguments.args)
++                    if getattr(arguments, "kwonlyargs", None):
++                        arg_nodes.extend(arguments.kwonlyargs)
++
++                    # build the corresponding annotation nodes list
++                    annotations = []
++                    if getattr(arguments, "posonlyargs_annotations", None):
++                        annotations.extend(arguments.posonlyargs_annotations or [])
++                    annotations.extend(arguments.annotations or [])
++                    annotations.extend(arguments.kwonlyargs_annotations or [])
++
++                    # zip and find matching arg
++                    for a_node, ann in zip(arg_nodes, annotations):
++                        # a_node can be AssignName-like node with a .name
++                        a_name = getattr(a_node, "name", None)
++                        if a_name == arg_name and ann is not None:
++                            # ann is an astroid node representing the
++                            # annotation expression (eg. Name('str')). Try to
++                            # infer it to get the actual type node(s).
++                            try:
++                                for inferred_ann in ann.infer():
++                                    if inferred_ann is not astroid.Uninferable:
++                                        values.add(inferred_ann)
++                            except astroid.InferenceError:
++                                # ignore failures to infer the annotation
++                                pass
++                            break
++
++        except astroid.InferenceError:
++            # ignore any inference issues while trying to resolve
++            # annotation-based types
++            pass
++
++        try:
+             current = set(parent.instance_attrs_type[node.attrname])
+             parent.instance_attrs_type[node.attrname] = list(current | values)
+         except astroid.InferenceError:
+diff --git a/tests/unittest_pyreverse_inspector.py b/tests/unittest_pyreverse_inspector.py
+index e1ff6378..b95e86e3 100644
+--- a/tests/unittest_pyreverse_inspector.py
++++ b/tests/unittest_pyreverse_inspector.py
+@@ -128,3 +128,43 @@ def test_from_directory(project):
+ def test_project_node(project):
+     expected = ["data", "data.clientmodule_test", "data.suppliermodule_test"]
+     assert sorted(project.keys()) == expected
++
++
++def test_instance_attr_from_annotated_param():
++    """Ensure that an instance attribute assigned from an annotated
++    parameter picks up the type from the annotation.
++
++    This covers cases like::
++
++        class C:
++            def __init__(self, a: str = None):
++                self.a = a
++
++    where inference from the default ``None`` would be Uninferable but the
++    annotation should provide the type information.
++    """
++    module = astroid.parse(
++        """
++class C(object):
++    def __init__(self, a: str = None):
++        self.a = a
++"""
++    )
++    # Build a small project containing only our module
++    project = inspector.Project(module.name)
++    project.add_module(module)
++    linker = inspector.Linker(project)
++    linker.visit(project)
++    klass = project.get_module(project.name)["C"]
++    assert hasattr(klass, "instance_attrs_type")
++    type_dict = klass.instance_attrs_type
++    assert "a" in type_dict
++    # Expect that the type is not Uninferable and that it refers to 'str'.
++    inferred = type_dict["a"][0]
++    assert inferred is not astroid.Uninferable
++    as_str = getattr(inferred, "as_string", None)
++    if as_str:
++        assert "str" in inferred.as_string()
++    else:
++        # fallback: name attribute
++        assert getattr(inferred, "name", "").lower() == "str"

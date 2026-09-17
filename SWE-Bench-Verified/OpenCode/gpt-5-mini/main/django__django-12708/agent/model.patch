@@ -1,0 +1,83 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index 61f88401ab..d7387e9420 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -407,6 +407,34 @@ class BaseDatabaseSchemaEditor:
+             model, columns, exclude=meta_constraint_names | meta_index_names,
+             **constraint_kwargs
+         )
++        # If we found multiple matching constraints, try to disambiguate.
++        # For index deletions prefer index-only constraints (not unique),
++        # and for unique deletions prefer unique-only constraints (not index).
++        if len(constraint_names) != 1:
++            if constraint_kwargs.get('index'):
++                # Prefer an index that's not a unique constraint.
++                index_only = self._constraint_names(
++                    model, columns, index=True, unique=False,
++                    exclude=meta_constraint_names | meta_index_names,
++                )
++                if len(index_only) == 1:
++                    constraint_names = index_only
++                else:
++                    # Fall back to matching a specific index type (Index suffix) if available.
++                    index_type = self._constraint_names(
++                        model, columns, index=True, type_=Index.suffix,
++                        exclude=meta_constraint_names | meta_index_names,
++                    )
++                    if len(index_type) == 1:
++                        constraint_names = index_type
++            elif constraint_kwargs.get('unique'):
++                # Prefer a unique that's not also marked as a non-unique index.
++                unique_only = self._constraint_names(
++                    model, columns, unique=True, index=False,
++                    exclude=meta_constraint_names | meta_index_names,
++                )
++                if len(unique_only) == 1:
++                    constraint_names = unique_only
+         if len(constraint_names) != 1:
+             raise ValueError("Found wrong number (%s) of constraints for %s(%s)" % (
+                 len(constraint_names),
+diff --git a/tests/schema/tests.py b/tests/schema/tests.py
+index 9aa1e239ac..41b183815e 100644
+--- a/tests/schema/tests.py
++++ b/tests/schema/tests.py
+@@ -2184,6 +2184,39 @@ class SchemaTests(TransactionTestCase):
+         with connection.schema_editor() as editor:
+             editor.alter_index_together(Book, [['author', 'title']], [])
+ 
++    @isolate_apps('schema')
++    def test_remove_index_together_when_unique_together_exists(self):
++        """
++        Removing index_together when a unique_together exists on the same
++        fields should remove only the index and preserve the unique
++        constraint (regression test for composed index deletion).
++        """
++        class M(Model):
++            name = CharField(max_length=255)
++            birthday = DateField()
++
++            class Meta:
++                app_label = 'schema'
++                unique_together = (("name", "birthday"),)
++                index_together = (("name", "birthday"),)
++
++        # Create the table with both constraints
++        with connection.schema_editor() as editor:
++            editor.create_model(M)
++
++        # Ensure there's an index on the name/birthday columns
++        constraints = self.get_constraints(M._meta.db_table)
++        self.assertTrue(any(c['columns'] == ['name', 'birthday'] and c['index'] for c in constraints.values()))
++
++        # Remove index_together only
++        with connection.schema_editor() as editor:
++            editor.alter_index_together(M, [("name", "birthday")], [])
++
++        # Ensure the index is gone but the unique constraint still exists
++        constraints = self.get_constraints(M._meta.db_table)
++        self.assertFalse(any(c['columns'] == ['name', 'birthday'] and c['index'] for c in constraints.values()))
++        self.assertTrue(any(c['columns'] == ['name', 'birthday'] and c.get('unique') for c in constraints.values()))
++
+     def test_create_index_together(self):
+         """
+         Tests creating models with index_together already defined

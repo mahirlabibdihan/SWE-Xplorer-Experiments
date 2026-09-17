@@ -1,0 +1,83 @@
+diff --git a/django/db/backends/base/schema.py b/django/db/backends/base/schema.py
+index f2ca8c8df9..c58ce298e0 100644
+--- a/django/db/backends/base/schema.py
++++ b/django/db/backends/base/schema.py
+@@ -568,6 +568,24 @@ class BaseDatabaseSchemaEditor:
+             exclude=meta_constraint_names | meta_index_names,
+             **constraint_kwargs,
+         )
++
++        # When looking for a unique constraint on columns that include the
++        # primary key, some backends (PostgreSQL) expose both the primary key
++        # constraint and an explicit unique constraint on the same column. The
++        # autodetector expects to find the single non-primary unique constraint
++        # to drop. Try to prefer non-primary-key constraints if multiple
++        # matches are found.
++        if len(constraint_names) != 1:
++            if constraint_kwargs.get("unique"):
++                non_pk_constraint_names = self._constraint_names(
++                    model,
++                    columns,
++                    primary_key=False,
++                    exclude=meta_constraint_names | meta_index_names,
++                    **constraint_kwargs,
++                )
++                if len(non_pk_constraint_names) == 1:
++                    constraint_names = non_pk_constraint_names
+         if len(constraint_names) != 1:
+             raise ValueError(
+                 "Found wrong number (%s) of constraints for %s(%s)"
+diff --git a/tests/backends/base/test_schema.py b/tests/backends/base/test_schema.py
+index 5409789b13..809ad53529 100644
+--- a/tests/backends/base/test_schema.py
++++ b/tests/backends/base/test_schema.py
+@@ -17,3 +17,49 @@ class SchemaEditorTests(SimpleTestCase):
+ 
+         field = MyCharField(max_length=1, default=MyStr)
+         self.assertEqual(BaseDatabaseSchemaEditor._effective_default(field), MyStr)
++
++    def test_delete_composed_index_prefers_non_pk_unique(self):
++        """When multiple constraints exist on the same columns (PK + UNIQUE),
++        deleting a composed unique should prefer the non-primary unique one.
++        """
++        from types import SimpleNamespace
++
++        # Build a dummy model with a single field 'id' whose column is 'id'.
++        class Meta:
++            db_table = 'test_table'
++
++            def get_field(self, name):
++                return SimpleNamespace(column=name)
++
++        model = SimpleNamespace(_meta=Meta())
++
++        # Dummy connection with minimal features used by BaseDatabaseSchemaEditor
++        dummy_conn = SimpleNamespace(features=SimpleNamespace(can_rollback_ddl=False))
++
++        executed = []
++
++        class DummyEditor(BaseDatabaseSchemaEditor):
++            def __init__(self):
++                super().__init__(dummy_conn, collect_sql=False, atomic=False)
++
++            def _constraint_names(self, model_arg, column_names=None, **kwargs):
++                # First call (no primary_key filter) returns both pkey and uniq.
++                # When asked with primary_key=False, only return the non-PK one.
++                if 'primary_key' in kwargs and kwargs['primary_key'] is False:
++                    return ['test_table_id_uniq']
++                return ['test_table_pkey', 'test_table_id_uniq']
++
++            def _delete_constraint_sql(self, template, model_arg, name):
++                return f"DROP {name}"
++
++            def execute(self, sql, params=()):
++                executed.append(str(sql))
++
++        editor = DummyEditor()
++
++        # Call the method under test. The sql argument is unused by our
++        # DummyEditor._delete_constraint_sql, so pass a dummy template.
++        editor._delete_composed_index(model, ['id'], {'unique': True}, 'SQL')
++
++        # Ensure we deleted the non-PK unique constraint.
++        self.assertEqual(executed, ['DROP test_table_id_uniq'])

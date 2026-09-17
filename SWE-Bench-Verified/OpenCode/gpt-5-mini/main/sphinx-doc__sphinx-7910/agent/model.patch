@@ -1,0 +1,73 @@
+diff --git a/sphinx/ext/napoleon/__init__.py b/sphinx/ext/napoleon/__init__.py
+index 10b1ff3a3..943c494ec 100644
+--- a/sphinx/ext/napoleon/__init__.py
++++ b/sphinx/ext/napoleon/__init__.py
+@@ -438,7 +438,35 @@ def _skip_member(app: Sphinx, what: str, name: str, obj: Any,
+                         mod_path = cls_path.split('.')
+                         cls = functools.reduce(getattr, mod_path, mod)
+                     else:
+-                        cls = obj.__globals__[cls_path]
++                        # obj may be a decorated function (for example,
++                        # decorated with functools.wraps). In that case
++                        # obj.__globals__ may not contain the class name.
++                        # Walk the __wrapped__ chain to try to find the
++                        # original function whose globals contain the
++                        # class. This mirrors how functools.update_wrapper
++                        # preserves __wrapped__.
++                        cur = obj
++                        cls = None
++                        tried = set()
++                        while cur is not None:
++                            g = getattr(cur, '__globals__', None)
++                            try:
++                                if g is not None and cls_path in g:
++                                    cls = g[cls_path]
++                                    break
++                            except Exception:
++                                # ignore and try next
++                                pass
++                            # avoid infinite loops
++                            cur_id = id(cur)
++                            if cur_id in tried:
++                                break
++                            tried.add(cur_id)
++                            cur = getattr(cur, '__wrapped__', None)
++                        if cls is None:
++                            # fallback to import-based resolution used
++                            # previously for dotted class paths
++                            raise KeyError(cls_path)
+                 except Exception:
+                     cls_is_owner = False
+                 else:
+diff --git a/tests/test_ext_napoleon.py b/tests/test_ext_napoleon.py
+index 7c3379757..cad7b1ee4 100644
+--- a/tests/test_ext_napoleon.py
++++ b/tests/test_ext_napoleon.py
+@@ -205,3 +205,27 @@ class SkipMemberTest(TestCase):
+     def test_module_special_undoc(self):
+         self.assertSkip('module', '__special_undoc__', __special_undoc__, True,
+                         'napoleon_include_special_with_doc')
++
++    def test_decorated_init_doc(self):
++        """Decorated __init__ with functools.wraps should be included when
++        napoleon_include_init_with_doc is True. This verifies that napoleon
++        correctly resolves the class for decorated methods.
++        """
++        import functools
++
++        def deco(f):
++            @functools.wraps(f)
++            def wrapper(*args, **kwargs):
++                return f(*args, **kwargs)
++            return wrapper
++
++        class DecoratedInit:
++            @deco
++            def __init__(self):
++                """DecoratedInit.__init__.DOCSTRING"""
++                pass
++
++        # When napoleon_include_init_with_doc is True, __init__ with a
++        # docstring should be included (i.e. _skip_member should return False)
++        self.assertSkip('class', '__init__', DecoratedInit.__init__, False,
++                        'napoleon_include_init_with_doc')

@@ -1,0 +1,55 @@
+diff --git a/src/_pytest/pathlib.py b/src/_pytest/pathlib.py
+index f0bdb1481..764e9752a 100644
+--- a/src/_pytest/pathlib.py
++++ b/src/_pytest/pathlib.py
+@@ -558,7 +558,9 @@ def visit(
+     entries = sorted(os.scandir(path), key=lambda entry: entry.name)
+     yield from entries
+     for entry in entries:
+-        if entry.is_dir(follow_symlinks=False) and recurse(entry):
++        # Follow symlinks to directories to preserve historical behaviour
++        # (regressed when follow_symlinks=False was added).
++        if entry.is_dir() and recurse(entry):
+             yield from visit(entry.path, recurse)
+ 
+ 
+diff --git a/testing/test_pathlib_visit.py b/testing/test_pathlib_visit.py
+new file mode 100644
+index 000000000..7db0dbc82
+--- /dev/null
++++ b/testing/test_pathlib_visit.py
+@@ -0,0 +1,34 @@
++import os
++
++import pytest
++
++from _pytest.pathlib import visit
++
++
++def symlink_or_skip(src, dst, **kwargs):
++    try:
++        os.symlink(str(src), str(dst), **kwargs)
++    except OSError as e:
++        pytest.skip(f"symlinks not supported: {e}")
++
++
++def test_visit_follows_symlinked_directory(tmp_path):
++    """visit() should follow symlinked directories and yield their contents.
++
++    Regression: passing follow_symlinks=False to DirEntry.is_dir() caused
++    symlinked directories to be skipped.
++    """
++    real = tmp_path / "real"
++    real.mkdir()
++    (real / "test_file.py").write_text("def test(): pass\n")
++
++    link = tmp_path / "link"
++    # Create a symlink to the real directory; skip the test if symlinks are not supported.
++    symlink_or_skip(real, link, target_is_directory=True)
++
++    # Collect all paths reported by visit, relative to tmp_path
++    entries = list(visit(str(tmp_path), lambda entry: True))
++    rel_paths = {os.path.relpath(e.path, str(tmp_path)) for e in entries}
++
++    # Expect to see the file inside the symlinked directory
++    assert os.path.join("link", "test_file.py") in rel_paths

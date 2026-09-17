@@ -1,0 +1,72 @@
+diff --git a/astropy/io/ascii/rst.py b/astropy/io/ascii/rst.py
+index abdeba8ef..89370eace 100644
+--- a/astropy/io/ascii/rst.py
++++ b/astropy/io/ascii/rst.py
+@@ -57,10 +57,33 @@ class RST(FixedWidth):
+     data_class = SimpleRSTData
+     header_class = SimpleRSTHeader
+ 
+-    def __init__(self):
+-        super().__init__(delimiter_pad=None, bookend=False)
++    def __init__(self, header_rows=None):
++        # Allow passing header_rows through to FixedWidth so that multiple
++        # header rows (e.g. name and unit) are supported when writing.
++        super().__init__(delimiter_pad=None, bookend=False, header_rows=header_rows)
+ 
+     def write(self, lines):
++        # Leverage FixedWidth.write to build the header and data lines.
++        # FixedWidth.write returns header rows (len = len(header_rows)),
++        # optionally a position_line, then the data lines. For the RST
++        # simple table format we want a top border (the position line),
++        # then the header rows, then another position line, then the data
++        # and a final position line. Compute the index of the position
++        # line from the header_rows length and reassemble accordingly.
+         lines = super().write(lines)
+-        lines = [lines[1]] + lines + [lines[1]]
+-        return lines
++
++        # Determine where the position line is in the returned lines.
++        if self.header.position_line is not None:
++            pos_idx = len(self.header.header_rows)
++            # Safety: ensure pos_idx is within bounds
++            if pos_idx < 0 or pos_idx >= len(lines):
++                return lines
++            pos_line = lines[pos_idx]
++            header_lines = lines[:pos_idx]
++            data_lines = lines[pos_idx + 1 :]
++            return [pos_line] + header_lines + [pos_line] + data_lines + [pos_line]
++        else:
++            # Fallback to previous behaviour for the single-header case.
++            if len(lines) > 1:
++                return [lines[1]] + lines + [lines[1]]
++            return lines
+diff --git a/astropy/io/ascii/tests/test_rst.py b/astropy/io/ascii/tests/test_rst.py
+index 84d6fed40..dc5ea933b 100644
+--- a/astropy/io/ascii/tests/test_rst.py
++++ b/astropy/io/ascii/tests/test_rst.py
+@@ -185,3 +185,25 @@ Col1      Col2 Col3 Col4
+ ==== ========= ==== ====
+ """,
+     )
++
++
++def test_write_with_header_rows():
++    """Write an RST table including an additional unit header row"""
++    from astropy.table import QTable
++    import astropy.units as u
++
++    out = StringIO()
++    tbl = QTable({"wave": [350, 950] * u.nm, "response": [0.7, 1.2] * u.count})
++    ascii.write(tbl, out, Writer=ascii.RST, header_rows=["name", "unit"])
++    assert_equal_splitlines(
++        out.getvalue(),
++        """\
++===== ========
++ wave response
++   nm      ct
++===== ========
++350.0      0.7
++950.0      1.2
++===== ========
++""",
++    )

@@ -1,0 +1,69 @@
+diff --git a/lib/matplotlib/tests/test_widgets.py b/lib/matplotlib/tests/test_widgets.py
+index 71ebd176f..3f60eb80a 100644
+--- a/lib/matplotlib/tests/test_widgets.py
++++ b/lib/matplotlib/tests/test_widgets.py
+@@ -280,6 +280,22 @@ def test_span_selector_direction():
+         tool.direction = 'invalid_string'
+ 
+ 
++def test_span_selector_init_does_not_change_xlim():
++    """Creating an interactive SpanSelector must not change the axes limits.
++
++    Regression test for a bug where creating interactive handles expanded the
++    axes limits to include 0 (e.g. changing xlim from (10, 20) to (0, 20)).
++    """
++    fig, ax = plt.subplots()
++    ax.plot([10, 20], [10, 20])
++    before_xlim = ax.get_xlim()
++    # create interactive span selector which historically mutated xlim
++    tool = widgets.SpanSelector(ax, lambda vmin, vmax: None, 'horizontal',
++                                interactive=True)
++    after_xlim = ax.get_xlim()
++    assert after_xlim == before_xlim
++
++
+ def test_tool_line_handle():
+     ax = get_ax()
+ 
+diff --git a/lib/matplotlib/widgets.py b/lib/matplotlib/widgets.py
+index a199e45d4..bcf800786 100644
+--- a/lib/matplotlib/widgets.py
++++ b/lib/matplotlib/widgets.py
+@@ -2366,10 +2366,34 @@ class ToolLineHandles:
+             line_props = {}
+         line_props.update({'visible': False, 'animated': useblit})
+ 
+-        line_fun = ax.axvline if self.direction == 'horizontal' else ax.axhline
++        # Create line artists for handles without affecting the axes data
++        # limits. Using ax.axvline/ax.axhline would trigger autoscaling and
++        # expand the view limits to include the handle positions (e.g. x=0),
++        # which is undesirable. Instead, create Line2D objects and set their
++        # transform to the corresponding axis-transform so they are drawn in
++        # data x (or y) coordinates but with the orthogonal coordinate in
++        # axes coordinates. Artists with a non-data transform are ignored by
++        # autoscaling and therefore won't change the axes limits.
+         self._line_props = line_props
+-
+-        self.artists = [line_fun(p, **line_props) for p in positions]
++        self.artists = []
++        if self.direction == 'horizontal':
++            # vertical lines at given x positions: x in data coords, y in axes
++            # coords [0, 1]
++            trans = ax.get_xaxis_transform()
++            for p in positions:
++                line = Line2D([p, p], [0, 1], **line_props)
++                line.set_transform(trans)
++                ax.add_line(line)
++                self.artists.append(line)
++        else:
++            # horizontal lines at given y positions: x in axes coords [0,1],
++            # y in data coords
++            trans = ax.get_yaxis_transform()
++            for p in positions:
++                line = Line2D([0, 1], [p, p], **line_props)
++                line.set_transform(trans)
++                ax.add_line(line)
++                self.artists.append(line)
+ 
+     @property
+     def positions(self):

@@ -1,0 +1,75 @@
+diff --git a/django/views/generic/base.py b/django/views/generic/base.py
+index db1842e3e5..d4df3efb7f 100644
+--- a/django/views/generic/base.py
++++ b/django/views/generic/base.py
+@@ -92,16 +92,49 @@ class View:
+                     "attributes of the class." % (cls.__name__, key)
+                 )
+ 
+-        def view(request, *args, **kwargs):
+-            self = cls(**initkwargs)
+-            self.setup(request, *args, **kwargs)
+-            if not hasattr(self, "request"):
+-                raise AttributeError(
+-                    "%s instance has no 'request' attribute. Did you override "
+-                    "setup() and forget to call super()?" % cls.__name__
+-                )
+-            return self.dispatch(request, *args, **kwargs)
+-
++        if cls.view_is_async:
++            # Create an async view wrapper. We implement the dispatch-by-method
++            # logic here so we can await the handler only if it's a coroutine
++            # function. This avoids awaiting non-awaitable responses such as
++            # HttpResponseNotAllowed when the handler is a sync function.
++            async def view(request, *args, **kwargs):
++                self = cls(**initkwargs)
++                # setup() is a synchronous method; call it directly. If
++                # callers override setup with a long-running sync operation
++                # they should rework it for async views.
++                self.setup(request, *args, **kwargs)
++                if not hasattr(self, "request"):
++                    raise AttributeError(
++                        "%s instance has no 'request' attribute. Did you override "
++                        "setup() and forget to call super()?" % cls.__name__
++                    )
++                # Determine handler for the request method.
++                if request.method.lower() in self.http_method_names:
++                    handler = getattr(
++                        self, request.method.lower(), self.http_method_not_allowed
++                    )
++                else:
++                    handler = self.http_method_not_allowed
++
++                # If handler is a coroutine function, await it; otherwise call
++                # it directly and return its result.
++                if asyncio.iscoroutinefunction(handler):
++                    return await handler(request, *args, **kwargs)
++                result = handler(request, *args, **kwargs)
++                # Handler may return a coroutine (see options()), await it.
++                if asyncio.iscoroutine(result):
++                    return await result
++                return result
++        else:
++            def view(request, *args, **kwargs):
++                self = cls(**initkwargs)
++                self.setup(request, *args, **kwargs)
++                if not hasattr(self, "request"):
++                    raise AttributeError(
++                        "%s instance has no 'request' attribute. Did you override "
++                        "setup() and forget to call super()?" % cls.__name__
++                    )
++                return self.dispatch(request, *args, **kwargs)
+         view.view_class = cls
+         view.view_initkwargs = initkwargs
+ 
+@@ -115,10 +148,6 @@ class View:
+         # the dispatch method.
+         view.__dict__.update(cls.dispatch.__dict__)
+ 
+-        # Mark the callback if the view class is async.
+-        if cls.view_is_async:
+-            view._is_coroutine = asyncio.coroutines._is_coroutine
+-
+         return view
+ 
+     def setup(self, request, *args, **kwargs):

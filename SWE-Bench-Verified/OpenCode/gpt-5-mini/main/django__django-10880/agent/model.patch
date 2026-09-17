@@ -1,0 +1,40 @@
+diff --git a/django/db/models/aggregates.py b/django/db/models/aggregates.py
+index ac0b62d0bf..d5b56bd89c 100644
+--- a/django/db/models/aggregates.py
++++ b/django/db/models/aggregates.py
+@@ -68,7 +68,12 @@ class Aggregate(Func):
+         return []
+ 
+     def as_sql(self, compiler, connection, **extra_context):
+-        extra_context['distinct'] = 'DISTINCT' if self.distinct else ''
++        # When using DISTINCT with expressions that may start immediately
++        # with an identifier (for example a CASE expression), ensure there
++        # is a separating space so SQL like "COUNT(DISTINCT CASE ...)"
++        # is produced instead of "COUNT(DISTINCTCASE ...)", which is
++        # invalid SQL and was causing a syntax error (see #29801).
++        extra_context['distinct'] = 'DISTINCT ' if self.distinct else ''
+         if self.filter:
+             if connection.features.supports_aggregate_filter_clause:
+                 filter_sql, filter_params = self.filter.as_sql(compiler, connection)
+diff --git a/tests/aggregation/test_filter_argument.py b/tests/aggregation/test_filter_argument.py
+index 63dee59464..e0fe85f341 100644
+--- a/tests/aggregation/test_filter_argument.py
++++ b/tests/aggregation/test_filter_argument.py
+@@ -75,6 +75,17 @@ class FilteredAggregateTests(TestCase):
+         )
+         self.assertEqual(Author.objects.aggregate(age=agg)['age'], 80)
+ 
++    def test_count_case_distinct(self):
++        # Combination of Count, Case expression and distinct=True should
++        # produce valid SQL (a space must exist between DISTINCT and CASE)
++        # and return the correct distinct count of friend ids with age >= 60.
++        agg = Count(
++            Case(When(friends__age__gte=60, then=F('friends__id'))),
++            distinct=True,
++        )
++        # friends with age >= 60 are a2 (60) and a3 (100) -> distinct count == 2
++        self.assertEqual(Author.objects.aggregate(n=agg)['n'], 2)
++
+     def test_sum_star_exception(self):
+         msg = 'Star cannot be used with filter. Please specify a field.'
+         with self.assertRaisesMessage(ValueError, msg):

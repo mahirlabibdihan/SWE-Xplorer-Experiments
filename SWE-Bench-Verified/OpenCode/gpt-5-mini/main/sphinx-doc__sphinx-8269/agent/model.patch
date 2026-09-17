@@ -1,0 +1,58 @@
+diff --git a/sphinx/builders/linkcheck.py b/sphinx/builders/linkcheck.py
+index 9b54afc7c..8a40e78ad 100644
+--- a/sphinx/builders/linkcheck.py
++++ b/sphinx/builders/linkcheck.py
+@@ -166,6 +166,11 @@ class CheckExternalLinksBuilder(Builder):
+                     # Read the whole document and see if #anchor exists
+                     response = requests.get(req_url, stream=True, config=self.app.config,
+                                             auth=auth_info, **kwargs)
++                    # First, ensure the response was successful. If the
++                    # server returned an HTTP error (e.g. 404), report that
++                    # error instead of claiming the anchor wasn't found.
++                    response.raise_for_status()
++
+                     found = check_anchor(response, unquote(anchor))
+ 
+                     if not found:
+diff --git a/tests/test_build_linkcheck.py b/tests/test_build_linkcheck.py
+index 7d85f10c5..abb2e5578 100644
+--- a/tests/test_build_linkcheck.py
++++ b/tests/test_build_linkcheck.py
+@@ -12,6 +12,7 @@ import json
+ import re
+ from unittest import mock
+ import pytest
++from requests.exceptions import HTTPError
+ 
+ 
+ @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+@@ -148,7 +149,7 @@ def test_linkcheck_request_headers(app, status, warning):
+ 
+     with mock.patch.multiple('requests', get=mock_req, head=mock_req):
+         app.builder.build_all()
+-        for args, kwargs in mock_req.call_args_list:
++    for args, kwargs in mock_req.call_args_list:
+             url = args[0]
+             headers = kwargs.get('headers', {})
+             if "https://localhost:7777" in url:
+@@ -160,3 +161,20 @@ def test_linkcheck_request_headers(app, status, warning):
+                 assert headers["X-Secret"] == "open sesami"
+             else:
+                 assert headers["Accept"] == "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
++
++
++@pytest.mark.sphinx('linkcheck', testroot='test-linkcheck-anchor-http', freshenv=True)
++def test_anchor_http_error(app, status, warning):
++    # Simulate that the server returns a 404 for the URL that includes an
++    # anchor. When linkcheck_anchors=True, we should report the HTTP error
++    # (404) instead of "Anchor '...' not found".
++    mock_resp = mock.MagicMock()
++    err = HTTPError('404 Client Error: Not Found for url: https://example.com/missing')
++    # raise_for_status should raise the HTTPError
++    mock_resp.raise_for_status.side_effect = err
++
++    with mock.patch('sphinx.util.requests.get', return_value=mock_resp):
++        app.builder.build_all()
++
++    content = (app.outdir / 'output.txt').read_text()
++    assert '404 Client Error: Not Found for url: https://example.com/missing' in content

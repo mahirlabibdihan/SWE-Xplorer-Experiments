@@ -1,0 +1,80 @@
+diff --git a/sklearn/model_selection/_validation.py b/sklearn/model_selection/_validation.py
+index 95669a212..2be6a844b 100644
+--- a/sklearn/model_selection/_validation.py
++++ b/sklearn/model_selection/_validation.py
+@@ -855,10 +855,35 @@ def _fit_and_predict(estimator, X, y, train, test, verbose, fit_params,
+     predictions = func(X_test)
+     if method in ['decision_function', 'predict_proba', 'predict_log_proba']:
+         if isinstance(predictions, list):
+-            predictions = [_enforce_prediction_order(
+-                estimator.classes_[i_label], predictions[i_label],
+-                n_classes=len(set(y[:, i_label])), method=method)
+-                for i_label in range(len(predictions))]
++            # Handle multioutput estimators (e.g. MultiOutputClassifier)
++            # which store fitted estimators in ``estimators_`` and may not
++            # have a ``classes_`` attribute. Prefer ``estimator.classes_``
++            # when present (e.g. ClassifierChain), otherwise try to get the
++            # classes_ from each underlying estimator.
++            n_labels = len(predictions)
++            if hasattr(estimator, 'classes_'):
++                classes_list = estimator.classes_
++            elif hasattr(estimator, 'estimators_'):
++                classes_list = [getattr(e, 'classes_', None)
++                                for e in estimator.estimators_]
++            else:
++                classes_list = [None] * n_labels
++
++            new_preds = []
++            for i_label in range(n_labels):
++                classes_i = classes_list[i_label] if (
++                        isinstance(classes_list, (list, tuple)) or
++                        (hasattr(classes_list, '__len__') and
++                         not isinstance(classes_list, (str, bytes)))) else None
++                # If we don't have class labels information for this
++                # estimator, skip reordering for this label.
++                if classes_i is None:
++                    new_preds.append(predictions[i_label])
++                else:
++                    new_preds.append(_enforce_prediction_order(
++                        classes_i, predictions[i_label],
++                        n_classes=len(set(y[:, i_label])), method=method))
++            predictions = new_preds
+         else:
+             # A 2D y array should be a binary label indicator matrix
+             n_classes = len(set(y)) if y.ndim == 1 else y.shape[1]
+diff --git a/sklearn/model_selection/tests/test_validation.py b/sklearn/model_selection/tests/test_validation.py
+index 6fa2e4fee..65d15662e 100644
+--- a/sklearn/model_selection/tests/test_validation.py
++++ b/sklearn/model_selection/tests/test_validation.py
+@@ -73,6 +73,8 @@ from sklearn.multiclass import OneVsRestClassifier
+ from sklearn.utils import shuffle
+ from sklearn.datasets import make_classification
+ from sklearn.datasets import make_multilabel_classification
++from sklearn.multioutput import MultiOutputClassifier
++from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+ 
+ from sklearn.model_selection.tests.common import OneTimeSplitter
+ from sklearn.model_selection import GridSearchCV
+@@ -1557,6 +1559,22 @@ def test_cross_val_predict_class_subset():
+         # Test with n_splits=4
+         predictions = cross_val_predict(est, X, y, method=method,
+                                         cv=kfold4)
++
++
++def test_cross_val_predict_predict_proba_with_multioutputclassifier():
++    # Regression test for multioutput classifiers with predict_proba
++    X, y = make_multilabel_classification(n_samples=50, n_features=10,
++                                          n_classes=4, n_labels=2,
++                                          random_state=0)
++    mo_lda = MultiOutputClassifier(LinearDiscriminantAnalysis())
++    # sanity check: regular predict works
++    pred = cross_val_predict(mo_lda, X, y, cv=5)
++    # ensure predict_proba does not raise and returns list of arrays
++    pred_proba = cross_val_predict(mo_lda, X, y, cv=5, method='predict_proba')
++    assert isinstance(pred_proba, list)
++    assert len(pred_proba) == y.shape[1]
++    for p in pred_proba:
++        assert p.shape[0] == X.shape[0]
+         expected_predictions = get_expected_predictions(X, y, kfold4, classes,
+                                                         est, method)
+         assert_array_almost_equal(expected_predictions, predictions)

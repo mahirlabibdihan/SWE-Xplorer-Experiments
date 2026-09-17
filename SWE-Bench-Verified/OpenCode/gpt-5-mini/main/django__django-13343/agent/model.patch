@@ -1,0 +1,130 @@
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index e10a5bb6d9..ea5c11ba77 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -17,7 +17,10 @@ class FieldFile(File):
+         super().__init__(None, name)
+         self.instance = instance
+         self.field = field
+-        self.storage = field.storage
++        # Don't cache storage on the FieldFile instance; access the field's
++        # storage property so that callable storages are resolved at runtime.
++        # This avoids evaluated storage objects being inlined during
++        # deconstruction.
+         self._committed = True
+ 
+     def __eq__(self, other):
+@@ -138,7 +141,22 @@ class FieldFile(File):
+ 
+     def __setstate__(self, state):
+         self.__dict__.update(state)
+-        self.storage = self.field.storage
++        # Ensure storage resolution is delegated to the field rather than
++        # storing a possibly-evaluated storage instance on the FieldFile.
++        # FieldFile.storage is implemented as a property that reads the
++        # current field.storage.
++        # No assignment here to avoid masking the storage property.
++        pass
++
++    @property
++    def storage(self):
++        """Return the storage instance for this field/file.
++
++        If the field.storage is a callable, delegate to the field so the
++        callable is evaluated at runtime rather than being inlined during
++        deconstruction.
++        """
++        return self.field.storage
+ 
+ 
+ class FileDescriptor(DeferredAttribute):
+@@ -227,10 +245,24 @@ class FileField(Field):
+     def __init__(self, verbose_name=None, name=None, upload_to='', storage=None, **kwargs):
+         self._primary_key_set_explicitly = 'primary_key' in kwargs
+ 
+-        self.storage = storage or default_storage
+-        if callable(self.storage):
+-            self.storage = self.storage()
+-            if not isinstance(self.storage, Storage):
++        # Preserve the original storage argument for deconstruction so that
++        # callable storages are not evaluated and inlined into migration
++        # files. Store it on _storage and provide a storage property that
++        # evaluates the callable at runtime when needed.
++        self._storage = storage or default_storage
++        # Validate the provided storage: if it's callable, ensure calling it
++        # returns a Storage instance; if it's not callable, ensure it's a
++        # Storage instance. Do not replace _storage with the evaluated
++        # instance to preserve the original callable for deconstruction.
++        if callable(self._storage):
++            storage_instance = self._storage()
++            if not isinstance(storage_instance, Storage):
++                raise TypeError(
++                    "%s.storage must be a subclass/instance of %s.%s"
++                    % (self.__class__.__qualname__, Storage.__module__, Storage.__qualname__)
++                )
++        else:
++            if not isinstance(self._storage, Storage):
+                 raise TypeError(
+                     "%s.storage must be a subclass/instance of %s.%s"
+                     % (self.__class__.__qualname__, Storage.__module__, Storage.__qualname__)
+@@ -278,10 +310,32 @@ class FileField(Field):
+         if kwargs.get("max_length") == 100:
+             del kwargs["max_length"]
+         kwargs['upload_to'] = self.upload_to
+-        if self.storage is not default_storage:
+-            kwargs['storage'] = self.storage
++        # Use the original _storage value for deconstruction so that
++        # callable storages are preserved as references rather than being
++        # evaluated and inlined into migration files.
++        if getattr(self, '_storage', default_storage) is not default_storage:
++            kwargs['storage'] = self._storage
+         return name, path, args, kwargs
+ 
++    @property
++    def storage(self):
++        """Return the resolved storage instance for runtime use.
++
++        If the original storage passed was a callable, call it to obtain the
++        current storage instance. This is evaluated at runtime so the storage
++        can vary per environment.
++        """
++        storage = self._storage
++        if callable(storage):
++            storage = storage()
++        return storage
++
++    @storage.setter
++    def storage(self, value):
++        # Allow setting storage after construction if necessary; keep the
++        # original semantics by storing the raw value on _storage.
++        self._storage = value
++
+     def get_internal_type(self):
+         return "FileField"
+ 
+diff --git a/tests/field_deconstruction/tests.py b/tests/field_deconstruction/tests.py
+index bf00aa44e2..e740cb97d3 100644
+--- a/tests/field_deconstruction/tests.py
++++ b/tests/field_deconstruction/tests.py
+@@ -174,6 +174,21 @@ class FieldDeconstructionTests(SimpleTestCase):
+         self.assertEqual(args, [])
+         self.assertEqual(kwargs, {"upload_to": "foo/bar", "max_length": 200})
+ 
++    def test_file_field_callable_storage_deconstruct(self):
++        """A callable passed as the storage argument must be preserved by
++        deconstruct() (it should not be evaluated/inlined).
++        """
++        def get_storage():
++            # Dummy callable storage used only to test deconstruction.
++            return None
++
++        field = models.FileField(upload_to="foo/bar", storage=get_storage)
++        name, path, args, kwargs = field.deconstruct()
++        self.assertIn('storage', kwargs)
++        # The deconstructed storage should be the original callable, not the
++        # result of calling it.
++        self.assertIs(kwargs['storage'], get_storage)
++
+     def test_file_path_field(self):
+         field = models.FilePathField(match=r".*\.txt$")
+         name, path, args, kwargs = field.deconstruct()

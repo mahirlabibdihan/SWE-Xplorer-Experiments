@@ -1,0 +1,51 @@
+diff --git a/src/_pytest/skipping.py b/src/_pytest/skipping.py
+index 335e10996..2c3853269 100644
+--- a/src/_pytest/skipping.py
++++ b/src/_pytest/skipping.py
+@@ -261,7 +261,15 @@ def pytest_runtest_call(item: Item) -> Generator[None, None, None]:
+ def pytest_runtest_makereport(item: Item, call: CallInfo[None]):
+     outcome = yield
+     rep = outcome.get_result()
++    # xfailed_key may be None if it hasn't been evaluated yet (or was
++    # intentionally left to be evaluated during the call). Re-evaluate here
++    # so that markers dynamically added during the test execution (e.g.
++    # request.node.add_marker(pytest.mark.xfail(...)) inside the test body)
++    # are honored when constructing the report.
+     xfailed = item._store.get(xfailed_key, None)
++    if xfailed is None:
++        xfailed = evaluate_xfail_marks(item)
++        item._store[xfailed_key] = xfailed
+     # unittest special case, see setting of unexpectedsuccess_key
+     if unexpectedsuccess_key in item._store and rep.when == "call":
+         reason = item._store[unexpectedsuccess_key]
+diff --git a/testing/test_skipping.py b/testing/test_skipping.py
+index 8fceb37aa..cc60b9d85 100644
+--- a/testing/test_skipping.py
++++ b/testing/test_skipping.py
+@@ -1188,6 +1188,26 @@ def test_mark_xfail_item(testdir):
+     assert xfailed
+ 
+ 
++def test_dynamic_xfail_added_in_test_body(testdir):
++    """A test that adds an xfail marker during its execution should be
++    treated as xfailed (not as a failure).
++    """
++    testdir.makepyfile(
++        """
++        import pytest
++
++
++        def test_xfail_in_body(request):
++            # dynamically add an xfail marker during the test
++            request.node.add_marker(pytest.mark.xfail(reason="xfail"))
++            assert 0
++        """
++    )
++    result = testdir.runpytest("-rsx")
++    # The test should be reported as xfailed, not failed.
++    result.stdout.fnmatch_lines(["*XFAIL*test_xfail_in_body*"])
++
++
+ def test_summary_list_after_errors(testdir):
+     """Ensure the list of errors/fails/xfails/skips appears after tracebacks in terminal reporting."""
+     testdir.makepyfile(

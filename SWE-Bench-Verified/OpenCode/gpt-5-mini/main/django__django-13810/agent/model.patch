@@ -1,0 +1,80 @@
+diff --git a/django/core/handlers/base.py b/django/core/handlers/base.py
+index 8e8c3da06a..7856c68c58 100644
+--- a/django/core/handlers/base.py
++++ b/django/core/handlers/base.py
+@@ -49,6 +49,13 @@ class BaseHandler:
+                 middleware_is_async = False
+             else:
+                 middleware_is_async = middleware_can_async
++            # Keep previous handler state so that if the middleware factory
++            # raises MiddlewareNotUsed we don't keep the adapted handler and
++            # accidentally "poison" the handler chain for subsequent
++            # middleware. See ticket where a skipped middleware altered the
++            # async/sync mode for the remaining chain.
++            prev_handler = handler
++            prev_handler_is_async = handler_is_async
+             try:
+                 # Adapt handler, if needed.
+                 handler = self.adapt_method_mode(
+@@ -57,6 +64,11 @@ class BaseHandler:
+                 )
+                 mw_instance = middleware(handler)
+             except MiddlewareNotUsed as exc:
++                # Restore previous handler state to avoid leaving the chain in
++                # an adapted mode from the middleware that was not actually
++                # used.
++                handler = prev_handler
++                handler_is_async = prev_handler_is_async
+                 if settings.DEBUG:
+                     if str(exc):
+                         logger.debug('MiddlewareNotUsed(%r): %s', middleware_path, exc)
+diff --git a/tests/middleware_exceptions/tests.py b/tests/middleware_exceptions/tests.py
+index 8b019ba524..36b4e9a2e6 100644
+--- a/tests/middleware_exceptions/tests.py
++++ b/tests/middleware_exceptions/tests.py
+@@ -339,3 +339,45 @@ class AsyncMiddlewareTests(SimpleTestCase):
+     async def test_process_view_return_response(self):
+         response = await self.async_client.get('/middleware_exceptions/view/')
+         self.assertEqual(response.content, b'Processed view normal_view')
++
++
++class MiddlewareNotUsedChainBehaviorTests(SimpleTestCase):
++    """Ensure that MiddlewareNotUsed doesn't leave side-effects on the
++    handler chain (regression test for handler adaptation being left in
++    place after a skipped middleware).
++    """
++
++    def test_notused_does_not_poison_handler(self):
++        from django.core.handlers.base import BaseHandler
++        from django.core.exceptions import MiddlewareNotUsed
++        import asyncio
++
++        # Define skipping middleware and an inspector middleware in this
++        # module so they can be referenced by import string.
++        class SkipMiddleware:
++            def __init__(self, get_response):
++                raise MiddlewareNotUsed
++
++        class InspectMiddleware:
++            received_is_coroutine = None
++
++            def __init__(self, get_response):
++                # Record whether the handler passed in is an async callable.
++                InspectMiddleware.received_is_coroutine = asyncio.iscoroutinefunction(get_response)
++                self.get_response = get_response
++
++            def __call__(self, request):
++                return self.get_response(request)
++
++        from django.test import override_settings
++
++        with override_settings(MIDDLEWARE=[
++            'middleware_exceptions.tests.SkipMiddleware',
++            'middleware_exceptions.tests.InspectMiddleware',
++        ]):
++            handler = BaseHandler()
++            # Load middleware in async mode to exercise adapt logic.
++            handler.load_middleware(is_async=True)
++            # The inspector should have observed an async handler being passed
++            # to it (the final handler is async for ASGI mode).
++            self.assertTrue(InspectMiddleware.received_is_coroutine)

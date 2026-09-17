@@ -1,0 +1,110 @@
+diff --git a/seaborn/_core/scales.py b/seaborn/_core/scales.py
+index 55874bf2..0b0a3b26 100644
+--- a/seaborn/_core/scales.py
++++ b/seaborn/_core/scales.py
+@@ -378,7 +378,31 @@ class ContinuousBase(Scale):
+             axis.set_view_interval(vmin, vmax)
+             locs = axis.major.locator()
+             locs = locs[(vmin <= locs) & (locs <= vmax)]
+-            labels = axis.major.formatter.format_ticks(locs)
++            formatter = axis.major.formatter
++            labels = formatter.format_ticks(locs)
++
++            # If the formatter has an offset (e.g. ScalarFormatter for large
++            # numbers) include that offset in the legend labels so the
++            # multiplicative factor isn't lost when the axis offset would
++            # otherwise be displayed separately on an Axis.
++            offset = None
++            get_offset = getattr(formatter, "get_offset", None)
++            if callable(get_offset):
++                try:
++                    offset = get_offset()
++                except Exception:
++                    offset = None
++            else:
++                off_text = getattr(formatter, "offset_text", None)
++                if off_text is not None:
++                    try:
++                        offset = off_text.get_text()
++                    except Exception:
++                        offset = None
++
++            if offset:
++                labels = [f"{lab} {offset}" for lab in labels]
++
+             new._legend = list(locs), list(labels)
+ 
+         return new
+diff --git a/seaborn/utils.py b/seaborn/utils.py
+index 2407853c..56d20ef7 100644
+--- a/seaborn/utils.py
++++ b/seaborn/utils.py
+@@ -707,6 +707,28 @@ def locator_to_legend_entries(locator, limits, dtype):
+     formatter.set_locs(raw_levels)
+     formatted_levels = [formatter(x) for x in raw_levels]
+ 
++    # If the formatter computed an offset (e.g. ScalarFormatter for large
++    # numbers) include that offset in the returned formatted levels so the
++    # multiplicative factor isn't lost when the axis would otherwise show it
++    # separately.
++    offset = None
++    get_offset = getattr(formatter, "get_offset", None)
++    if callable(get_offset):
++        try:
++            offset = get_offset()
++        except Exception:
++            offset = None
++    else:
++        off_text = getattr(formatter, "offset_text", None)
++        if off_text is not None:
++            try:
++                offset = off_text.get_text()
++            except Exception:
++                offset = None
++
++    if offset:
++        formatted_levels = [f"{lab} {offset}" for lab in formatted_levels]
++
+     return raw_levels, formatted_levels
+ 
+ 
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+index 02839a02..54717349 100644
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -335,6 +335,35 @@ def test_locator_to_legend_entries():
+         assert re.match(f"1e.0{exp}", str_levels[i])
+ 
+ 
++def test_locator_to_legend_entries_with_formatter_offset(monkeypatch):
++    """Ensure that an offset reported by a formatter is appended to legend
++    formatted levels. We monkeypatch ScalarFormatter to a dummy formatter
++    that reports an offset to make this deterministic across matplotlib
++    versions.
++    """
++
++    class DummyFormatter:
++        def __init__(self):
++            self.axis = None
++
++        def set_locs(self, locs):
++            self._locs = locs
++
++        def __call__(self, x):
++            return f"{float(x):.2f}"
++
++        def get_offset(self):
++            return "x10^6"
++
++    monkeypatch.setattr(mpl.ticker, "ScalarFormatter", DummyFormatter)
++
++    locator = mpl.ticker.MaxNLocator(nbins=3)
++    limits = (1e6 + 10, 1e6 + 90)
++    levels, str_levels = utils.locator_to_legend_entries(locator, limits, float)
++    # All formatted strings should contain the reported offset suffix
++    assert all(s.endswith(" x10^6") for s in str_levels)
++
++
+ def test_move_legend_matplotlib_objects():
+ 
+     fig, ax = plt.subplots()

@@ -1,0 +1,62 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 982816be3a..b089e00854 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -320,6 +320,18 @@ class RenameModel(ModelOperation):
+         new_model = to_state.apps.get_model(app_label, self.new_name)
+         if self.allow_migrate_model(schema_editor.connection.alias, new_model):
+             old_model = from_state.apps.get_model(app_label, self.old_name)
++            # If the model explicitly defines a db_table in its migration
++            # state, a RenameModel must be a no-op for the database. The
++            # presence of an explicit db_table means the database table name
++            # is decoupled from the model's class name, so renaming the
++            # Python-level model should not attempt to alter tables or
++            # constraints.
++            try:
++                old_state = from_state.models[app_label, self.old_name_lower]
++            except KeyError:
++                old_state = None
++            if old_state is not None and 'db_table' in old_state.options:
++                return
+             # Move the main table
+             schema_editor.alter_db_table(
+                 new_model,
+diff --git a/tests/migrations/test_operations.py b/tests/migrations/test_operations.py
+index 11961a1f40..2a91dfa5c2 100644
+--- a/tests/migrations/test_operations.py
++++ b/tests/migrations/test_operations.py
+@@ -651,6 +651,34 @@ class OperationTests(OperationTestBase):
+         self.assertEqual(definition[1], [])
+         self.assertEqual(definition[2], {'old_name': "Pony", 'new_name': "Horse"})
+ 
++    def test_rename_model_with_db_table_noop(self):
++        """
++        A RenameModel operation for a model that already has an explicit
++        db_table defined should not touch the database (be a noop).
++        """
++        app_label = "test_rnmodbtable"
++        db_table = 'pony_fixed'
++        project_state = self.set_up_test_model(app_label, related_model=True, db_table=db_table)
++        operation = migrations.RenameModel("Pony", "Horse")
++        new_state = project_state.clone()
++        operation.state_forwards(app_label, new_state)
++        # Applying the database operation should be a no-op when db_table is set
++        with connection.schema_editor() as editor:
++            with self.assertNumQueries(0):
++                operation.database_forwards(app_label, editor, project_state, new_state)
++        # Table name should be unchanged
++        self.assertTableExists(db_table)
++        self.assertTableNotExists(f"{app_label}_horse")
++        # Ensure state updated the relation target (Python-level change)
++        self.assertEqual(
++            new_state.models[app_label, 'rider'].fields['pony'].remote_field.model,
++            f'{app_label}.Horse',
++        )
++        # And database backwards should also be a no-op
++        with connection.schema_editor() as editor:
++            with self.assertNumQueries(0):
++                operation.database_backwards(app_label, editor, project_state, new_state)
++
+     def test_rename_model_state_forwards(self):
+         """
+         RenameModel operations shouldn't trigger the caching of rendered apps

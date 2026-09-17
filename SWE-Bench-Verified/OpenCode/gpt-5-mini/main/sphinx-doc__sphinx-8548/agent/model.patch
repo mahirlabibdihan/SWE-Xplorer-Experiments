@@ -1,0 +1,85 @@
+diff --git a/sphinx/ext/autodoc/__init__.py b/sphinx/ext/autodoc/__init__.py
+index ddfd2b365..736551a47 100644
+--- a/sphinx/ext/autodoc/__init__.py
++++ b/sphinx/ext/autodoc/__init__.py
+@@ -756,6 +756,38 @@ class Documenter:
+                     # keep documented attributes
+                     keep = True
+                 isattr = True
++            else:
++                # try to find attribute docs in base classes' source
++                # (this supports inherited attributes whose doc comments
++                # are stored under the base class' namespace)
++                try:
++                    # only makes sense for classes
++                    if inspect.isclass(self.object):
++                        for cls in inspect.getmro(self.object):
++                            try:
++                                module = safe_getattr(cls, '__module__')
++                                qualname = safe_getattr(cls, '__qualname__')
++                                if not module or not qualname:
++                                    continue
++                                # get analyzer for the module where the base
++                                # class is defined, and look for attribute docs
++                                try:
++                                    base_analyzer = ModuleAnalyzer.for_module(module)
++                                    base_analyzer.analyze()
++                                except PycodeError:
++                                    continue
++                                key2 = (qualname, membername)
++                                if key2 in base_analyzer.attr_docs:
++                                    # found documentation for this attribute
++                                    isattr = True
++                                    keep = True
++                                    break
++                            except Exception:
++                                # ignore any problems while probing base class
++                                continue
++                except Exception:
++                    # be safe and ignore analyzer problems
++                    pass
+             elif want_all and isprivate:
+                 if has_doc or self.options.undoc_members:
+                     if self.options.private_members is None:
+diff --git a/tests/roots/test-ext-autodoc/target/__init__.py b/tests/roots/test-ext-autodoc/target/__init__.py
+index e49f9a141..a5a62ff5f 100644
+--- a/tests/roots/test-ext-autodoc/target/__init__.py
++++ b/tests/roots/test-ext-autodoc/target/__init__.py
+@@ -188,3 +188,15 @@ class CustomIter(object):
+     def snafucate(self):
+         """Makes this snafucated."""
+         print("snafucated")
++
++
++class BaseWithAttr(object):
++    """Base class with a documented class attribute."""
++
++    #: Documentation for the inherited attribute
++    inherited_attr = 42
++
++
++class DerivedWithAttr(BaseWithAttr):
++    """Derived class that doesn't redeclare the attribute."""
++    pass
+diff --git a/tests/test_ext_autodoc.py b/tests/test_ext_autodoc.py
+index 392ad1a68..42860b8f0 100644
+--- a/tests/test_ext_autodoc.py
++++ b/tests/test_ext_autodoc.py
+@@ -625,6 +625,17 @@ def test_autodoc_inherited_members(app):
+     ]
+ 
+ 
++@pytest.mark.sphinx('html', testroot='ext-autodoc')
++def test_autodoc_inherited_attribute(app):
++    options = {"members": None,
++               "inherited-members": None}
++    actual = do_autodoc(app, 'class', 'target.DerivedWithAttr', options)
++    # attribute directive should be present for inherited attribute
++    assert any('.. py:attribute:: DerivedWithAttr.inherited_attr' in l for l in actual)
++    # doc comment from base class should be included
++    assert any('Documentation for the inherited attribute' in l for l in actual)
++
++
+ @pytest.mark.sphinx('html', testroot='ext-autodoc')
+ def test_autodoc_inherited_members_Base(app):
+     options = {"members": None,

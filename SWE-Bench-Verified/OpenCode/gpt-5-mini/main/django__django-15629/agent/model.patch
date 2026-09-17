@@ -1,0 +1,98 @@
+diff --git a/django/db/backends/mysql/schema.py b/django/db/backends/mysql/schema.py
+index 562b209eef..b4ad322809 100644
+--- a/django/db/backends/mysql/schema.py
++++ b/django/db/backends/mysql/schema.py
+@@ -166,7 +166,28 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+         return new_type
+ 
+     def _alter_column_type_sql(self, model, old_field, new_field, new_type):
++        """
++        MySQL/MariaDB needs to include a COLLATE clause when altering the
++        column type if the field defines a collation. Ensure the collation
++        is propagated for foreign key columns that reference a PK whose
++        collation changed.
++        """
+         new_type = self._set_field_new_type_null_status(old_field, new_type)
++        # If the new field has an explicit collation, use the collate-aware
++        # MODIFY template so the FK column will match the PK's collation.
++        new_db_params = new_field.db_parameters(connection=self.connection)
++        new_collation = new_db_params.get("collation")
++        if new_collation:
++            collation_sql = " " + self._collate_sql(new_collation)
++            return (
++                self.sql_alter_column_collate
++                % {
++                    "column": self.quote_name(new_field.column),
++                    "type": new_type,
++                    "collation": collation_sql,
++                },
++                [],
++            )
+         return super()._alter_column_type_sql(model, old_field, new_field, new_type)
+ 
+     def _rename_field_sql(self, table, old_field, new_field, new_type):
+diff --git a/tests/schema/tests.py b/tests/schema/tests.py
+index 2d12796cbd..20806c6fcf 100644
+--- a/tests/schema/tests.py
++++ b/tests/schema/tests.py
+@@ -4633,6 +4633,60 @@ class SchemaTests(TransactionTestCase):
+         self.assertEqual(self.get_primary_key(Thing._meta.db_table), "when")
+         self.assertIsNone(self.get_column_collation(Thing._meta.db_table, "when"))
+ 
++    @isolate_apps("schema")
++    @skipUnlessDBFeature("supports_collation_on_charfield")
++    def test_alter_primary_key_propagates_db_collation_to_fks(self):
++        """
++        When a primary key's collation is altered, the referencing foreign key
++        columns must be altered to include the same COLLATE clause so that the
++        FK constraint can be recreated on backends (e.g. MySQL) that require
++        matching collations.
++        """
++        collation = connection.features.test_collations.get("non_default")
++        if not collation:
++            self.skipTest("Language collations are not supported.")
++
++        class Account(Model):
++            id = CharField(max_length=22, primary_key=True)
++
++            class Meta:
++                app_label = "schema"
++
++        class Address(Model):
++            id = AutoField(primary_key=True)
++            account = OneToOneField(Account, CASCADE)
++
++            class Meta:
++                app_label = "schema"
++
++        class Profile(Model):
++            id = AutoField(primary_key=True)
++            account = ForeignKey(Account, CASCADE, null=True, blank=True)
++
++            class Meta:
++                app_label = "schema"
++
++        self.isolated_local_models = [Account, Address, Profile]
++        # Create the tables first.
++        with connection.schema_editor() as editor:
++            editor.create_model(Account)
++            editor.create_model(Address)
++            editor.create_model(Profile)
++
++        # Alter the PK to set a collation and collect the SQL that would be run.
++        old_field = Account._meta.get_field("id")
++        new_field = CharField(max_length=22, primary_key=True, db_collation=collation)
++        new_field.set_attributes_from_name("id")
++        new_field.model = Account
++        with connection.schema_editor(collect_sql=True) as editor:
++            editor.alter_field(Account, old_field, new_field, strict=True)
++            collected = "\n".join(editor.collected_sql)
++
++        # Expect the collected SQL to include the collation on the referencing
++        # columns so that foreign keys can be recreated without error.
++        quoted_collation = connection.ops.quote_name(collation)
++        self.assertIn(quoted_collation, collected)
++
+     @skipUnlessDBFeature(
+         "supports_collation_on_charfield", "supports_collation_on_textfield"
+     )

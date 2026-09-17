@@ -1,0 +1,101 @@
+diff --git a/django/db/models/fields/__init__.py b/django/db/models/fields/__init__.py
+index 28374272f4..e6ecfc4194 100644
+--- a/django/db/models/fields/__init__.py
++++ b/django/db/models/fields/__init__.py
+@@ -516,17 +516,51 @@ class Field(RegisterLookupMixin):
+     def __eq__(self, other):
+         # Needed for @total_ordering
+         if isinstance(other, Field):
+-            return self.creation_counter == other.creation_counter
++            # Two fields should only be equal if they have the same
++            # creation_counter and belong to the same model (or both are
++            # unattached). This avoids fields from different models — for
++            # example, concrete subclasses of an abstract model — being
++            # considered equal just because they were created at the same
++            # time.
++            self_model = getattr(self, 'model', None)
++            other_model = getattr(other, 'model', None)
++            return (
++                self.creation_counter == other.creation_counter
++                and self_model == other_model
++            )
+         return NotImplemented
+ 
+     def __lt__(self, other):
+         # This is needed because bisect does not take a comparison function.
+         if isinstance(other, Field):
+-            return self.creation_counter < other.creation_counter
++            # Keep the primary ordering by creation_counter so existing
++            # behaviour that depends on insertion order is preserved. Use
++            # model and name as tie-breakers when creation_counter is equal
++            # (which can happen for fields created from the same abstract
++            # definition).
++            if self.creation_counter != other.creation_counter:
++                return self.creation_counter < other.creation_counter
++            # Tie-break using model (None sorts before real models), then
++            # app_label/model_name, then field name.
++            self_model = getattr(self, 'model', None)
++            other_model = getattr(other, 'model', None)
++            if self_model is other_model:
++                return (self.name or '') < (other.name or '')
++            if self_model is None:
++                return True
++            if other_model is None:
++                return False
++            self_label = (self_model._meta.app_label, self_model._meta.model_name)
++            other_label = (other_model._meta.app_label, other_model._meta.model_name)
++            if self_label != other_label:
++                return self_label < other_label
++            return (self.name or '') < (other.name or '')
+         return NotImplemented
+ 
+     def __hash__(self):
+-        return hash(self.creation_counter)
++        # Include the model in the hash so fields attached to different
++        # models don't collide when placed in sets or used as dict keys.
++        return hash((self.creation_counter, getattr(self, 'model', None)))
+ 
+     def __deepcopy__(self, memodict):
+         # We don't have to deepcopy very much here, since most things are not
+diff --git a/tests/model_fields/tests.py b/tests/model_fields/tests.py
+index b97c99d42d..7cffc96b63 100644
+--- a/tests/model_fields/tests.py
++++ b/tests/model_fields/tests.py
+@@ -4,6 +4,7 @@ from django import forms
+ from django.core.exceptions import ValidationError
+ from django.db import models
+ from django.test import SimpleTestCase, TestCase
++from django.test.utils import isolate_apps
+ from django.utils.functional import lazy
+ 
+ from .models import (
+@@ -97,6 +98,29 @@ class BasicFieldTests(SimpleTestCase):
+         field._get_default
+         pickle.dumps(field)
+ 
++
++@isolate_apps('model_fields')
++class FieldEqualityTests(SimpleTestCase):
++    def test_abstract_model_field_instances_are_distinct_across_models(self):
++        class A(models.Model):
++            myfield = models.IntegerField()
++
++            class Meta:
++                abstract = True
++
++        class B(A):
++            pass
++
++        class C(A):
++            pass
++
++        f_b = B._meta.get_field('myfield')
++        f_c = C._meta.get_field('myfield')
++        # Fields coming from different concrete models should not compare equal
++        # even if they originated from the same abstract definition.
++        self.assertNotEqual(f_b, f_c)
++        self.assertEqual(len({f_b, f_c}), 2)
++
+     def test_deconstruct_nested_field(self):
+         """deconstruct() uses __qualname__ for nested class support."""
+         name, path, args, kwargs = Nested.Field().deconstruct()

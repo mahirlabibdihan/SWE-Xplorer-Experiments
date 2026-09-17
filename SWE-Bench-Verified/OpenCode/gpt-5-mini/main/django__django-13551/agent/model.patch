@@ -1,0 +1,38 @@
+diff --git a/django/contrib/auth/tokens.py b/django/contrib/auth/tokens.py
+index 93e2d71af2..ea41e62bdb 100644
+--- a/django/contrib/auth/tokens.py
++++ b/django/contrib/auth/tokens.py
+@@ -94,7 +94,11 @@ class PasswordResetTokenGenerator:
+         # Truncate microseconds so that tokens are consistent even if the
+         # database doesn't support microseconds.
+         login_timestamp = '' if user.last_login is None else user.last_login.replace(microsecond=0, tzinfo=None)
+-        return str(user.pk) + user.password + str(login_timestamp) + str(timestamp)
++        # Include the user's email address in the hash so that changing the
++        # email invalidates existing password reset tokens. Use getattr to
++        # support custom user models that may not have an email field.
++        email = getattr(user, 'email', '') or ''
++        return str(user.pk) + user.password + str(login_timestamp) + email + str(timestamp)
+ 
+     def _num_seconds(self, dt):
+         return int((dt - datetime(2001, 1, 1)).total_seconds())
+diff --git a/tests/auth_tests/test_tokens.py b/tests/auth_tests/test_tokens.py
+index bba435be84..9fd71ce4a4 100644
+--- a/tests/auth_tests/test_tokens.py
++++ b/tests/auth_tests/test_tokens.py
+@@ -110,3 +110,16 @@ class TokenGeneratorTest(TestCase):
+         legacy_token = p_old_generator.make_token(user)
+         self.assertIs(p_old_generator.check_token(user, legacy_token), True)
+         self.assertIs(p_new_generator.check_token(user, legacy_token), True)
++
++    def test_token_invalidated_on_email_change(self):
++        """Changing a user's email should invalidate existing reset tokens."""
++        user = User.objects.create_user('tokentestuser', 'email_before@example.com', 'testpw')
++        p0 = PasswordResetTokenGenerator()
++        token = p0.make_token(user)
++        # Token is valid initially
++        self.assertIs(p0.check_token(user, token), True)
++        # Change the email and save
++        user.email = 'email_after@example.com'
++        user.save()
++        # Token should now be invalid
++        self.assertIs(p0.check_token(user, token), False)

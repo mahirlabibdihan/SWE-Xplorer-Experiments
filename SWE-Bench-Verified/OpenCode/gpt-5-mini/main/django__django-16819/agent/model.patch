@@ -1,0 +1,97 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index 967a91fdc8..d150db9826 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -861,6 +861,33 @@ class AddIndex(IndexOperation):
+     def migration_name_fragment(self):
+         return "%s_%s" % (self.model_name_lower, self.index.name.lower())
+ 
++    def reduce(self, operation, app_label):
++        # AddIndex followed by RemoveIndex for the same index can cancel out.
++        if (
++            isinstance(operation, RemoveIndex)
++            and self.model_name_lower == operation.model_name.lower()
++            and self.index.name == operation.name
++        ):
++            return []
++
++        # AddIndex followed by RenameIndex of the same index name should
++        # result in an AddIndex with the new name.
++        if (
++            isinstance(operation, RenameIndex)
++            and self.model_name_lower == operation.model_name_lower
++            and operation.old_name
++            and self.index.name == operation.old_name
++        ):
++            # Create a new Index instance with the new name. Preserve fields
++            # and expressions if present.
++            if getattr(self.index, "expressions", None):
++                new_index = models.Index(expressions=self.index.expressions, name=operation.new_name)
++            else:
++                new_index = models.Index(fields=self.index.fields, name=operation.new_name)
++            return [AddIndex(self.model_name, new_index)]
++
++        return super().reduce(operation, app_label)
++
+ 
+ class RemoveIndex(IndexOperation):
+     """Remove an index from a model."""
+@@ -904,6 +931,21 @@ class RemoveIndex(IndexOperation):
+     def migration_name_fragment(self):
+         return "remove_%s_%s" % (self.model_name_lower, self.name.lower())
+ 
++    def reduce(self, operation, app_label):
++        # If a RemoveIndex is followed by an AddIndex of the same name on the
++        # same model, the Remove can be replaced by the Add (we want the
++        # resulting index definition).
++        if (
++            isinstance(operation, AddIndex)
++            and self.model_name_lower == operation.model_name_lower
++            and operation.index.name == self.name
++        ):
++            return [operation]
++
++        # If a RemoveIndex is followed by a RenameIndex for the same index,
++        # treat the RenameIndex normally (no special-case here).
++        return super().reduce(operation, app_label)
++
+ 
+ class RenameIndex(IndexOperation):
+     """Rename an index."""
+diff --git a/tests/migrations/test_optimizer.py b/tests/migrations/test_optimizer.py
+index 8cd4c67fbd..02235a923c 100644
+--- a/tests/migrations/test_optimizer.py
++++ b/tests/migrations/test_optimizer.py
+@@ -1158,3 +1158,32 @@ class OptimizerTests(SimpleTestCase):
+                 ),
+             ]
+         )
++
++    def test_add_remove_index(self):
++        """
++        AddIndex followed by RemoveIndex should cancel out.
++        """
++        index = models.Index(fields=["pink"], name="idx_pink")
++        self.assertOptimizesTo(
++            [
++                migrations.AddIndex("Pony", index),
++                migrations.RemoveIndex("Pony", "idx_pink"),
++            ],
++            [],
++        )
++
++    def test_remove_add_index(self):
++        """
++        RemoveIndex followed by AddIndex of the same name should simplify
++        to a single AddIndex with the provided definition.
++        """
++        index = models.Index(fields=["pink"], name="idx_pink")
++        self.assertOptimizesTo(
++            [
++                migrations.RemoveIndex("Pony", "idx_pink"),
++                migrations.AddIndex("Pony", index),
++            ],
++            [
++                migrations.AddIndex("Pony", index),
++            ],
++        )

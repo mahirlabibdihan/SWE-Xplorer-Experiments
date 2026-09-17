@@ -1,0 +1,66 @@
+diff --git a/pylint/lint/expand_modules.py b/pylint/lint/expand_modules.py
+index b20cd873..7f877b90 100644
+--- a/pylint/lint/expand_modules.py
++++ b/pylint/lint/expand_modules.py
+@@ -61,11 +61,20 @@ def expand_modules(
+ 
+     for something in files_or_modules:
+         basename = os.path.basename(something)
+-        if (
+-            basename in ignore_list
+-            or _is_in_ignore_list_re(os.path.basename(something), ignore_list_re)
+-            or _is_in_ignore_list_re(something, ignore_list_paths_re)
+-        ):
++        # If any path component (directory or file) matches the ignore
++        # lists/patterns, skip this entry. This is important when running in
++        # recursive mode: discovered files may be inside directories that
++        # should be ignored (for example hidden directories starting with
++        # a dot). Previously we only checked the basename of the full
++        # path which missed such directories.
++        normpath = os.path.normpath(something)
++        parts = normpath.split(os.sep)
++        ignored = False
++        for part in parts:
++            if part in ignore_list or _is_in_ignore_list_re(part, ignore_list_re):
++                ignored = True
++                break
++        if ignored or _is_in_ignore_list_re(something, ignore_list_paths_re):
+             continue
+         module_path = get_python_path(something)
+         additional_search_path = [".", module_path] + path
+diff --git a/tests/lint/unittest_expand_modules.py b/tests/lint/unittest_expand_modules.py
+index 15f72d0c..0299b1be 100644
+--- a/tests/lint/unittest_expand_modules.py
++++ b/tests/lint/unittest_expand_modules.py
+@@ -155,3 +155,31 @@ class TestExpandModules(CheckerTestCase):
+         modules.sort(key=lambda d: d["name"])
+         assert modules == expected
+         assert not errors
++
++    def test_expand_modules_recursive_ignores_directory(self, tmp_path):
++        """Files discovered under an ignored directory should be skipped.
++
++        This reproduces the case where recursive discovery yields file paths
++        like '/.../.hidden/foo.py' and the ignore-patterns/config is meant to
++        ignore the directory '.hidden'.
++        """
++        # create temp tree: tmp/.a/foo.py and tmp/bar.py
++        hidden_dir = tmp_path / ".a"
++        hidden_dir.mkdir()
++        foo = hidden_dir / "foo.py"
++        foo.write_text("# sample")
++        bar = tmp_path / "bar.py"
++        bar.write_text("# sample")
++
++        files = [str(foo), str(bar)]
++        # ignore-list empty, but ignore-patterns should match directories
++        ignore_list: list[str] = []
++        ignore_list_re = [re.compile(r"^\.")]
++        ignore_paths_re: list[re.Pattern[str]] = []
++
++        modules, errors = expand_modules(files, ignore_list, ignore_list_re, ignore_paths_re)
++        # only bar.py should remain
++        paths = {m["path"] for m in modules}
++        assert str(bar) in paths
++        assert str(foo) not in paths
++        assert not errors

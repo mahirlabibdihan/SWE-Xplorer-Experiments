@@ -1,0 +1,74 @@
+diff --git a/xarray/core/variable.py b/xarray/core/variable.py
+index 379be8f5..c1c6a3ca 100644
+--- a/xarray/core/variable.py
++++ b/xarray/core/variable.py
+@@ -1944,10 +1944,26 @@ class IndexVariable(Variable):
+         if data is None:
+             if deep:
+                 # self._data should be a `PandasIndexAdapter` instance at this
+-                # point, which doesn't have a copy method, so make a deep copy
+-                # of the underlying `pandas.MultiIndex` and create a new
+-                # `PandasIndexAdapter` instance with it.
+-                data = PandasIndexAdapter(self._data.array.copy(deep=True))
++                # point. Historically we used `self._data.array.copy(deep=True)`
++                # to duplicate the underlying pandas.Index. However, in some
++                # pandas versions copying an Index can coerce numpy unicode
++                # dtypes (e.g. "<U3") to object dtype. To avoid that
++                # regression we copy the underlying numpy values for plain
++                # Index objects with a numpy unicode dtype. For more complex
++                # index types (MultiIndex, PeriodIndex, CategoricalIndex)
++                # keep using pandas' own copy to preserve type information.
++                idx = self._data.array
++                try:
++                    kind = getattr(idx, 'dtype', None)
++                    kind = kind.kind if kind is not None else None
++                except Exception:
++                    kind = None
++
++                if kind == 'U' and not isinstance(idx, (pd.MultiIndex, pd.PeriodIndex)):
++                    # copy underlying numpy unicode array to preserve '<U*' dtype
++                    data = PandasIndexAdapter(np.asarray(idx.values).copy())
++                else:
++                    data = PandasIndexAdapter(idx.copy(deep=True))
+             else:
+                 data = self._data
+         else:
+diff --git a/xarray/tests/test_variable.py b/xarray/tests/test_variable.py
+index 73d2a40b..8bf4d2bb 100644
+--- a/xarray/tests/test_variable.py
++++ b/xarray/tests/test_variable.py
+@@ -166,6 +166,34 @@ class VariableSubclassobjects:
+         x = self.cls(['x'], [value])
+         self._assertIndexedLikeNDArray(x, value, dtype)
+ 
++
++def test_indexvariable_copy_preserves_numpy_unicode_dtype():
++    """Regression test: copying IndexVariable with numpy unicode dtype
++    should not coerce dtype to object.
++    """
++    import xarray as xr
++
++    ds = xr.Dataset(
++        coords={"x": ["foo"], "y": ("x", ["bar"])},
++        data_vars={"z": ("x", ["baz"])},
++    )
++
++    # baseline dtypes
++    x_dtype_before = ds["x"].variable.dtype
++    assert getattr(x_dtype_before, "kind", None) == "U"
++
++    # shallow and deep copies should preserve dtype
++    ds_shallow = ds.copy(deep=False)
++    ds_deep = ds.copy(deep=True)
++
++    assert getattr(ds_shallow["x"].variable.dtype, "kind", None) == "U"
++    assert getattr(ds_deep["x"].variable.dtype, "kind", None) == "U"
++
++    # also check DataArray copy
++    da = ds["z"]
++    da_deep = da.copy(deep=True)
++    assert getattr(da_deep.coords["x"].variable.dtype, "kind", None) == "U"
++
+     def test_index_0d_datetime(self):
+         d = datetime(2000, 1, 1)
+         x = self.cls(['x'], [d])

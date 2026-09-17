@@ -1,0 +1,61 @@
+diff --git a/sympy/polys/polytools.py b/sympy/polys/polytools.py
+index 68b69d1a24..aca1e9b3e3 100644
+--- a/sympy/polys/polytools.py
++++ b/sympy/polys/polytools.py
+@@ -5925,6 +5925,40 @@ def _symbolic_factor_list(expr, opt, method):
+             func = getattr(poly, method + '_list')
+ 
+             _coeff, _factors = func()
++
++            # Some factorization routines over algebraic domains may return
++            # an incomplete list of factors for the polynomial representation
++            # (e.g. return (x - 1) but miss (y - 1) when factoring (x - 1)*(y - 1)
++            # with a composite algebraic domain). As a conservative recovery
++            # attempt, check whether the product of the returned factors
++            # (together with the coefficient) equals the original polynomial.
++            # If not, try to append the remaining factor (the quotient) so the
++            # symbolic factoring above will see it too. This is a small and
++            # local fix to cover cases where the backend missed a factor.
++            try:
++                from sympy import simplify
++                # product of reported factors as a SymPy expression
++                prod_expr = _factors_product(_factors)
++                # make sure _coeff is a SymPy object for multiplication
++                coeff_expr = _coeff if isinstance(_coeff, Basic) else _coeff
++                remaining = simplify(poly.as_expr() / (coeff_expr * prod_expr))
++                if remaining is not None and remaining != 1:
++                    # If the remaining factor is a polynomial in the same
++                    # generators we can convert it to a Poly and append it.
++                    if remaining.is_Atom:
++                        append_poly = None
++                    else:
++                        try:
++                            append_poly = Poly(remaining, *poly.gens, domain=poly.domain)
++                        except Exception:
++                            append_poly = None
++
++                    if append_poly is not None and append_poly != poly and append_poly.as_expr() != 1:
++                        _factors.append((append_poly, S.One))
++            except Exception:
++                # If anything goes wrong, silently continue with the
++                # originally returned factors -- this keeps the change safe.
++                pass
+             if _coeff is not S.One:
+                 if exp.is_Integer:
+                     coeff *= _coeff**exp
+diff --git a/sympy/polys/tests/test_polytools.py b/sympy/polys/tests/test_polytools.py
+index b0b4cd6132..81bbff3184 100644
+--- a/sympy/polys/tests/test_polytools.py
++++ b/sympy/polys/tests/test_polytools.py
+@@ -2415,6 +2415,11 @@ def test_factor():
+     assert factor(
+         f, extension=sqrt(2)) == (x**2 + sqrt(2)*x + 1)*(x**2 - sqrt(2)*x + 1)
+ 
++    # regression: factoring multivariate polynomial with explicit algebraic
++    # extension should not drop factors (see issue #18895)
++    z = expand((x - 1)*(y - 1))
++    assert factor(z, extension=[I]) == (x - 1)*(y - 1)
++
+     f = x**2 + 2*sqrt(2)*x + 2
+ 
+     assert factor(f, extension=sqrt(2)) == (x + sqrt(2))**2

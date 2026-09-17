@@ -1,0 +1,65 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index 794e0faae7..d777697801 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1209,7 +1209,11 @@ class QuerySet:
+         if ignore_conflicts and not connections[self.db].features.supports_ignore_conflicts:
+             raise NotSupportedError('This database backend does not support ignoring conflicts.')
+         ops = connections[self.db].ops
+-        batch_size = (batch_size or max(ops.bulk_batch_size(fields, objs), 1))
++        # Determine backend's maximum allowed batch size and pick the
++        # minimum between the provided batch_size and the backend limit.
++        # If batch_size is falsy (None/0), use the backend limit.
++        max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
++        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+         inserted_rows = []
+         bulk_return = connections[self.db].features.can_return_rows_from_bulk_insert
+         for item in [objs[i:i + batch_size] for i in range(0, len(objs), batch_size)]:
+diff --git a/tests/bulk_create/tests.py b/tests/bulk_create/tests.py
+index 47aa7afcdc..f593f4e041 100644
+--- a/tests/bulk_create/tests.py
++++ b/tests/bulk_create/tests.py
+@@ -201,6 +201,43 @@ class BulkCreateTests(TestCase):
+         TwoFields.objects.bulk_create(objs, batch_size=num_objs)
+         self.assertEqual(TwoFields.objects.count(), num_objs)
+ 
++    def test_batch_size_limited_by_backend(self):
++        """
++        If the caller provides a batch_size larger than the backend's
++        bulk_batch_size, bulk_create() should use the backend's limit.
++        We patch QuerySet._insert to observe the actual per-insert batch
++        sizes used.
++        """
++        from django.db.models.query import QuerySet
++        from django.db import connection
++
++        objs = [TwoFields(f1=i, f2=i) for i in range(0, 10)]
++        # Determine backend's maximum batch size for these fields/objects
++        fields = [f for f in TwoFields._meta.concrete_fields if f.name != 'id']
++        max_batch = connection.ops.bulk_batch_size(fields, objs)
++
++        # Request a batch size larger than backend limit
++        requested = max_batch + 5
++
++        calls = []
++        orig_insert = QuerySet._insert
++
++        def fake_insert(self, items, fields=None, returning_fields=None, raw=False, using=None, ignore_conflicts=False):
++            # record how many items were passed to each _insert call
++            calls.append(len(items))
++            return []
++
++        QuerySet._insert = fake_insert
++        try:
++            TwoFields.objects.bulk_create(objs, batch_size=requested)
++        finally:
++            QuerySet._insert = orig_insert
++
++        # Ensure that all insert calls used at most the backend's max batch
++        # size and that the total number of inserted items equals len(objs).
++        self.assertTrue(all(c <= max_batch for c in calls))
++        self.assertEqual(sum(calls), len(objs))
++
+     def test_empty_model(self):
+         NoFields.objects.bulk_create([NoFields() for i in range(2)])
+         self.assertEqual(NoFields.objects.count(), 2)

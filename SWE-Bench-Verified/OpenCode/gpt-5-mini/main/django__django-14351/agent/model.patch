@@ -1,0 +1,72 @@
+diff --git a/django/db/models/fields/related_lookups.py b/django/db/models/fields/related_lookups.py
+index d745ecd5f9..497aad7c23 100644
+--- a/django/db/models/fields/related_lookups.py
++++ b/django/db/models/fields/related_lookups.py
+@@ -86,7 +86,11 @@ class RelatedIn(In):
+                     AND)
+             return root_constraint.as_sql(compiler, connection)
+         else:
+-            if (not getattr(self.rhs, 'has_select_fields', True) and
++            # Treat queries that would use default columns as having no
++            # explicit select fields so that the RHS of the IN lookup is
++            # reduced to the target field (usually the PK) for comparison.
++            if ((getattr(self.rhs, 'default_cols', False) or
++                    not getattr(self.rhs, 'has_select_fields', True)) and
+                     not getattr(self.lhs.field.target_field, 'primary_key', False)):
+                 self.rhs.clear_select_clause()
+                 if (getattr(self.lhs.output_field, 'primary_key', False) and
+diff --git a/django/db/models/lookups.py b/django/db/models/lookups.py
+index 5089737034..89c1f2d96e 100644
+--- a/django/db/models/lookups.py
++++ b/django/db/models/lookups.py
+@@ -401,7 +401,17 @@ class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
+             placeholder = '(' + ', '.join(sqls) + ')'
+             return (placeholder, sqls_params)
+         else:
+-            if not getattr(self.rhs, 'has_select_fields', True):
++            # If the RHS is a Query, ensure it only selects a single
++            # column for use in an IN() lookup. Historically, a Query
++            # that would use the default columns (default_cols=True)
++            # should behave as if it has no explicit select fields when
++            # used as the RHS of an IN lookup, and thus be reduced to
++            # selecting only the primary key. Relying solely on
++            # has_select_fields() is insufficient because some queries
++            # may present default columns via the compiler; check
++            # default_cols to detect that case as well.
++            if (getattr(self.rhs, 'default_cols', False) or
++                    not getattr(self.rhs, 'has_select_fields', True)):
+                 self.rhs.clear_select_clause()
+                 self.rhs.add_fields(['pk'])
+             return super().process_rhs(compiler, connection)
+diff --git a/tests/lookup/tests.py b/tests/lookup/tests.py
+index e38eae087c..fbb3d6cb3c 100644
+--- a/tests/lookup/tests.py
++++ b/tests/lookup/tests.py
+@@ -194,10 +194,25 @@ class LookupTests(TestCase):
+             Season.objects.in_bulk(
+                 [season_2011.year, season_2012.year],
+                 field_name='year',
+-            ),
+-            {season_2011.year: season_2011, season_2012.year: season_2012},
++        ),
++        {season_2011.year: season_2011, season_2012.year: season_2012},
+         )
+ 
++    def test_filter_with_queryset_in_lookup_combined_with_q(self):
++        """
++        Ensure using a QuerySet as the RHS of an IN lookup combined with an OR
++        Q() object doesn't cause a subquery to select multiple columns and
++        raise a database error. See regression test for selecting default
++        columns in subqueries used in IN lookups.
++        """
++        authors_qs = Author.objects.filter(name__startswith='Author')
++        # This should not raise and should return the correct set of articles
++        qs = Article.objects.filter(
++            Q(author__in=authors_qs) | Q(author__isnull=True)
++        ).distinct()
++        # Evaluate the queryset to force SQL compilation/execution
++        list(qs)
++
+     def test_in_bulk_non_unique_field(self):
+         msg = "in_bulk()'s field_name must be a unique field but 'author' isn't."
+         with self.assertRaisesMessage(ValueError, msg):

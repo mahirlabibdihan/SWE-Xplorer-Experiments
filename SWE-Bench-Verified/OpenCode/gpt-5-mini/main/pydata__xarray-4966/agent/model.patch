@@ -1,0 +1,82 @@
+diff --git a/xarray/coding/variables.py b/xarray/coding/variables.py
+index b035ff82..62493961 100644
+--- a/xarray/coding/variables.py
++++ b/xarray/coding/variables.py
+@@ -308,14 +308,34 @@ class UnsignedIntegerCoder(VariableCoder):
+         if "_Unsigned" in attrs:
+             unsigned = pop_to(attrs, encoding, "_Unsigned")
+ 
++            # normalize textual boolean values
++            def _is_true(val):
++                return val is True or (isinstance(val, str) and val.lower() == "true")
++
++            def _is_false(val):
++                return val is False or (isinstance(val, str) and val.lower() == "false")
++
+             if data.dtype.kind == "i":
+-                if unsigned == "true":
++                # e.g. netCDF3 files with attribute _Unsigned="true" indicate
++                # that signed integers should be interpreted as unsigned.
++                if _is_true(unsigned):
+                     unsigned_dtype = np.dtype("u%s" % data.dtype.itemsize)
+                     transform = partial(np.asarray, dtype=unsigned_dtype)
+                     data = lazy_elemwise_func(data, transform, unsigned_dtype)
+                     if "_FillValue" in attrs:
+                         new_fill = unsigned_dtype.type(attrs["_FillValue"])
+                         attrs["_FillValue"] = new_fill
++            elif data.dtype.kind == "u":
++                # OPeNDAP only knows unsigned bytes; some servers (and the
++                # netCDF-C library) use the hack of setting _Unsigned="false"
++                # to signal that the data should be interpreted as signed.
++                if _is_false(unsigned):
++                    signed_dtype = np.dtype("i%s" % data.dtype.itemsize)
++                    transform = partial(np.asarray, dtype=signed_dtype)
++                    data = lazy_elemwise_func(data, transform, signed_dtype)
++                    if "_FillValue" in attrs:
++                        new_fill = signed_dtype.type(attrs["_FillValue"])
++                        attrs["_FillValue"] = new_fill
+             else:
+                 warnings.warn(
+                     "variable %r has _Unsigned attribute but is not "
+diff --git a/xarray/tests/test_coding.py b/xarray/tests/test_coding.py
+index e0df7782..d09cfbf5 100644
+--- a/xarray/tests/test_coding.py
++++ b/xarray/tests/test_coding.py
+@@ -8,7 +8,13 @@ import xarray as xr
+ from xarray.coding import variables
+ from xarray.conventions import decode_cf_variable, encode_cf_variable
+ 
+-from . import assert_allclose, assert_equal, assert_identical, requires_dask
++from . import (
++    assert_allclose,
++    assert_equal,
++    assert_identical,
++    assert_array_equal,
++    requires_dask,
++)
+ 
+ with suppress(ImportError):
+     import dask.array as da
+@@ -117,3 +123,22 @@ def test_scaling_offset_as_list(scale_factor, add_offset):
+     encoded = coder.encode(original)
+     roundtripped = coder.decode(encoded)
+     assert_allclose(original, roundtripped)
++
++
++def test_unsigned_opendap_false_handling():
++    """OPeNDAP may return unsigned dtype with _Unsigned="false" to indicate
++    the data should be interpreted as signed. Ensure we convert u1 -> i1.
++    """
++    import xarray as xr
++
++    # unsigned byte values that correspond to signed negative values
++    uvals = np.array([128, 255, 0, 1, 2, 127], dtype="u1")
++    var = xr.Variable(("x",), uvals, attrs={"_Unsigned": "false"})
++
++    coder = variables.UnsignedIntegerCoder()
++    decoded = coder.decode(var)
++
++    assert decoded.dtype.kind == "i"
++    # casting u1 -> i1: 128 -> -128, 255 -> -1, others unchanged
++    expected = np.array([-128, -1, 0, 1, 2, 127], dtype="i1")
++    assert_array_equal(np.asarray(decoded.data), expected)

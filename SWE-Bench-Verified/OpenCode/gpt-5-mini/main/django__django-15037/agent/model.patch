@@ -1,0 +1,62 @@
+diff --git a/django/core/management/commands/inspectdb.py b/django/core/management/commands/inspectdb.py
+index f9b4bfb477..e1fb8668a5 100644
+--- a/django/core/management/commands/inspectdb.py
++++ b/django/core/management/commands/inspectdb.py
+@@ -124,6 +124,21 @@ class Command(BaseCommand):
+                             "self" if relations[column_name][1] == table_name
+                             else table2model(relations[column_name][1])
+                         )
++                        # If the FK references a non-primary-key column on the
++                        # related table, include the `to_field` parameter so the
++                        # generated model references the correct column.
++                        try:
++                            ref_column = relations[column_name][0]
++                            ref_table = relations[column_name][1]
++                            ref_pk = connection.introspection.get_primary_key_column(cursor, ref_table)
++                        except Exception:
++                            ref_column = None
++                            ref_pk = None
++                        if ref_column and ref_column != ref_pk:
++                            # Use the column name as the `to_field` value. The
++                            # normalization of field names for the referenced
++                            # model is handled when that model is generated.
++                            extra_params['to_field'] = ref_column
+                         if rel_to in known_models:
+                             field_type = '%s(%s' % (rel_type, rel_to)
+                         else:
+diff --git a/tests/postgres_tests/test_introspection.py b/tests/postgres_tests/test_introspection.py
+index 50cb9b2828..ea51dc8847 100644
+--- a/tests/postgres_tests/test_introspection.py
++++ b/tests/postgres_tests/test_introspection.py
+@@ -30,3 +30,31 @@ class InspectDBTests(PostgreSQLTestCase):
+                 'dates = django.contrib.postgres.fields.DateRangeField(blank=True, null=True)',
+             ],
+         )
++
++    def test_foreign_key_to_non_pk(self):
++        """A FK that references a non-primary key column should include to_field."""
++        from django.db import connection
++        with connection.cursor() as cursor:
++            # Create tables with a FK that references a non-PK column.
++            cursor.execute(
++                """
++                CREATE TABLE IF NOT EXISTS inspectdb_foo (
++                    id serial primary key,
++                    other_id int UNIQUE
++                );
++                """
++            )
++            cursor.execute(
++                """
++                CREATE TABLE IF NOT EXISTS inspectdb_bar (
++                    id serial primary key,
++                    other_id int,
++                    constraint myconst FOREIGN KEY(other_id) references inspectdb_foo(other_id)
++                );
++                """
++            )
++        # Inspect only the bar table and check for to_field in output.
++        self.assertFieldsInModel(
++            'inspectdb_bar',
++            ["other = models.ForeignKey('InspectdbFoo', models.DO_NOTHING, to_field='other_id')"],
++        )

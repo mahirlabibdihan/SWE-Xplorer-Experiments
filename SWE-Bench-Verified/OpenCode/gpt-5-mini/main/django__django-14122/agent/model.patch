@@ -1,0 +1,85 @@
+diff --git a/django/db/models/sql/compiler.py b/django/db/models/sql/compiler.py
+index 850734709d..9fdf9e4392 100644
+--- a/django/db/models/sql/compiler.py
++++ b/django/db/models/sql/compiler.py
+@@ -128,7 +128,14 @@ class SQLCompiler:
+         for expr, (sql, params, is_ref) in order_by:
+             # Skip References to the select clause, as all expressions in the
+             # select clause are already part of the group by.
++            # Also skip ordering expressions that come from Meta.ordering;
++            # Meta.ordering should not affect GROUP BY. get_order_by() will
++            # populate _meta_ordering_expressions with the resolved ordering
++            # expressions when Meta.ordering was used as the source.
+             if not is_ref:
++                meta_ordering_exprs = getattr(self, '_meta_ordering_expressions', ())
++                if expr in meta_ordering_exprs:
++                    continue
+                 expressions.extend(expr.get_group_by_cols())
+         having_group_by = self.having.get_group_by_cols() if self.having else ()
+         for expr in having_group_by:
+@@ -277,6 +284,7 @@ class SQLCompiler:
+         can add aliases to clauses that do not yet have one, or it can
+         add totally new select clauses).
+         """
++        using_meta = False
+         if self.query.extra_order_by:
+             ordering = self.query.extra_order_by
+         elif not self.query.default_ordering:
+@@ -285,7 +293,11 @@ class SQLCompiler:
+             ordering = self.query.order_by
+         elif self.query.get_meta().ordering:
+             ordering = self.query.get_meta().ordering
++            # Remember that ordering originates from Meta.ordering so that
++            # get_group_by() can ignore these ordering expressions when
++            # building the GROUP BY clause.
+             self._meta_ordering = ordering
++            using_meta = True
+         else:
+             ordering = []
+         if self.query.standard_ordering:
+@@ -362,8 +374,22 @@ class SQLCompiler:
+         result = []
+         seen = set()
+ 
++        # If ordering came from Meta.ordering, collect the resolved
++        # expressions so get_group_by() can avoid adding them to GROUP BY.
++        # Ensure attribute exists to avoid carrying over state between
++        # subsequent calls to get_order_by(). If ordering didn't originate
++        # from Meta.ordering, keep the list empty.
++        if using_meta:
++            self._meta_ordering_expressions = []
++        else:
++            self._meta_ordering_expressions = []
++
+         for expr, is_ref in order_by:
+             resolved = expr.resolve_expression(self.query, allow_joins=True, reuse=None)
++            if using_meta:
++                # Track resolved expression objects (OrderBy instances)
++                # originating from Meta.ordering.
++                self._meta_ordering_expressions.append(resolved)
+             if self.query.combinator and self.select:
+                 src = resolved.get_source_expressions()[0]
+                 expr_src = expr.get_source_expressions()[0]
+diff --git a/tests/aggregation_regress/tests.py b/tests/aggregation_regress/tests.py
+index 877e7b49a7..658885500e 100644
+--- a/tests/aggregation_regress/tests.py
++++ b/tests/aggregation_regress/tests.py
+@@ -1213,6 +1213,18 @@ class AggregationTests(TestCase):
+         self.assertEqual(len(qs.exclude(publisher=-1)), 6)
+ 
+     @skipUnlessAnyDBFeature('allows_group_by_pk', 'allows_group_by_selected_pks')
++    def test_meta_ordering_not_in_group_by(self):
++        """
++        Regression test: Meta.ordering should not cause fields to be added to
++        the GROUP BY clause.
++        """
++        qs = Book.objects.values('publisher').annotate(num_books=Count('pk'))
++        _, _, group_by = qs.query.get_compiler(using='default').pre_sql_setup()
++        # The GROUP BY should include publisher only, and should not include
++        # the model's Meta.ordering field ('name').
++        group_sql = ' '.join(item[0] for item in group_by)
++        self.assertNotIn('name', group_sql)
++    @skipUnlessAnyDBFeature('allows_group_by_pk', 'allows_group_by_selected_pks')
+     def test_aggregate_duplicate_columns(self):
+         # Regression test for #17144
+ 

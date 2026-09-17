@@ -1,0 +1,58 @@
+diff --git a/django/core/management/base.py b/django/core/management/base.py
+index abc6f79a15..e3e8653979 100644
+--- a/django/core/management/base.py
++++ b/django/core/management/base.py
+@@ -71,6 +71,34 @@ class CommandParser(ArgumentParser):
+         else:
+             raise CommandError("Error: %s" % message)
+ 
++    def add_subparsers(self, **kwargs):
++        """
++        Override add_subparsers so that subparsers created via the returned
++        action will construct CommandParser instances and inherit the
++        CommandParser-specific keyword arguments (missing_args_message and
++        called_from_command_line). This ensures error() behavior is
++        preserved for sub-commands.
++        """
++        action = super().add_subparsers(**kwargs)
++
++        # Wrap the action.add_parser so that created subparsers are
++        # instances of CommandParser and receive the same custom kwargs.
++        original_add_parser = action.add_parser
++
++        def add_parser(*p_args, **p_kwargs):
++            # Ensure subparsers use CommandParser so they share error()
++            p_kwargs.setdefault("parser_class", CommandParser)
++            # Propagate Django-specific kwargs so subparsers get the
++            # improved error handling and missing-args message.
++            p_kwargs.setdefault("missing_args_message", self.missing_args_message)
++            p_kwargs.setdefault(
++                "called_from_command_line", self.called_from_command_line
++            )
++            return original_add_parser(*p_args, **p_kwargs)
++
++        action.add_parser = add_parser
++        return action
++
+ 
+ def handle_default_options(options):
+     """
+diff --git a/tests/user_commands/tests.py b/tests/user_commands/tests.py
+index e40632385c..bfb3e6589b 100644
+--- a/tests/user_commands/tests.py
++++ b/tests/user_commands/tests.py
+@@ -406,6 +406,14 @@ class CommandTests(SimpleTestCase):
+         with self.assertRaisesMessage(CommandError, msg):
+             management.call_command("subparser_dest", subcommand="foo", bar=12)
+ 
++    def test_subparser_missing_argument_raises_command_error(self):
++        """Missing required positional argument for a subparser should raise
++        CommandError with a usage-like message instead of a traceback.
++        """
++        msg = "Error: the following arguments are required: bar"
++        with self.assertRaisesMessage(CommandError, msg):
++            management.call_command("subparser", "foo")
++
+     def test_create_parser_kwargs(self):
+         """BaseCommand.create_parser() passes kwargs to CommandParser."""
+         epilog = "some epilog text"

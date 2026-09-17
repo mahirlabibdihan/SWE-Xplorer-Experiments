@@ -1,0 +1,58 @@
+diff --git a/django/db/migrations/operations/models.py b/django/db/migrations/operations/models.py
+index dddf7c679c..5e41bfb53d 100644
+--- a/django/db/migrations/operations/models.py
++++ b/django/db/migrations/operations/models.py
+@@ -137,11 +137,21 @@ class CreateModel(ModelOperation):
+                 ),
+             ]
+         elif isinstance(operation, AlterModelOptions) and self.name_lower == operation.name_lower:
++            # When squashing an AlterModelOptions into a CreateModel, we need
++            # to emulate AlterModelOptions.state_forwards() behaviour: keys in
++            # ALTER_OPTION_KEYS that are not present in operation.options
++            # should be removed from the resulting options dict. Otherwise,
++            # an AlterModelOptions that clears options (e.g. options={}) would
++            # not unset previously set model options on the created model.
++            options = {**self.options, **operation.options}
++            for key in AlterModelOptions.ALTER_OPTION_KEYS:
++                if key not in operation.options:
++                    options.pop(key, None)
+             return [
+                 CreateModel(
+                     self.name,
+                     fields=self.fields,
+-                    options={**self.options, **operation.options},
++                    options=options,
+                     bases=self.bases,
+                     managers=self.managers,
+                 ),
+diff --git a/tests/migrations/test_optimizer.py b/tests/migrations/test_optimizer.py
+index 2950635514..a682cb60b4 100644
+--- a/tests/migrations/test_optimizer.py
++++ b/tests/migrations/test_optimizer.py
+@@ -119,6 +119,26 @@ class OptimizerTests(SimpleTestCase):
+             ]
+         )
+ 
++    def test_create_alter_model_options_clears_keys(self):
++        """
++        When an AlterModelOptions with an empty options dict is squashed into
++        a CreateModel, keys listed in ALTER_OPTION_KEYS should be removed
++        from the CreateModel.options. Non-ALTER_OPTION_KEYS should be
++        preserved.
++        """
++        # Start with a CreateModel that has an option that should be removed
++        # by AlterModelOptions (verbose_name) and one custom option that
++        # should remain.
++        self.assertOptimizesTo(
++            [
++                migrations.CreateModel('Foo', fields=[], options={'verbose_name': 'Foo', 'custom_opt': 1}),
++                migrations.AlterModelOptions(name='Foo', options={}),
++            ],
++            [
++                migrations.CreateModel('Foo', fields=[], options={'custom_opt': 1}),
++            ]
++        )
++
+     def _test_create_alter_foo_delete_model(self, alter_foo):
+         """
+         CreateModel, AlterModelTable, AlterUniqueTogether/AlterIndexTogether/

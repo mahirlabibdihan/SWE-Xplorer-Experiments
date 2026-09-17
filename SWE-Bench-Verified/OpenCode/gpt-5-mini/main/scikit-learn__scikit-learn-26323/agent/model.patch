@@ -1,0 +1,62 @@
+diff --git a/sklearn/compose/_column_transformer.py b/sklearn/compose/_column_transformer.py
+index 4eddd12b1..f2e8484e1 100644
+--- a/sklearn/compose/_column_transformer.py
++++ b/sklearn/compose/_column_transformer.py
+@@ -303,6 +303,17 @@ class ColumnTransformer(TransformerMixin, _BaseComposition):
+         for trans in transformers:
+             _safe_set_output(trans, transform=transform)
+ 
++        # Also configure the user-provided `remainder` estimator if it is an
++        # estimator (and not the special strings 'passthrough'/'drop'). This is
++        # necessary when `set_output` is called before fitting: the remainder
++        # transformer is stored in `self.remainder` (not in `self.transformers`)
++        # and therefore would be skipped by the iteration above.
++        if getattr(self, "remainder", None) not in {None, "passthrough", "drop"}:
++            # `_safe_set_output` will raise if the estimator does not expose
++            # `set_output`, which is the expected behaviour for estimators
++            # that cannot be configured.
++            _safe_set_output(self.remainder, transform=transform)
++
+         return self
+ 
+     def get_params(self, deep=True):
+diff --git a/sklearn/compose/tests/test_column_transformer.py b/sklearn/compose/tests/test_column_transformer.py
+index b9c8f5831..b26b95385 100644
+--- a/sklearn/compose/tests/test_column_transformer.py
++++ b/sklearn/compose/tests/test_column_transformer.py
+@@ -1965,6 +1965,35 @@ def test_column_transformer_set_output(verbose_feature_names_out, remainder):
+     assert_array_equal(X_trans.index, df_test.index)
+ 
+ 
++def test_set_output_applies_to_remainder_estimator():
++    """Regression test for configuring the remainder estimator via set_output
++
++    Non-regression test for the issue where calling `set_output` on a
++    ColumnTransformer that has an estimator for `remainder` would not
++    configure that estimator when `set_output` is called before fitting.
++    """
++    pd = pytest.importorskip("pandas")
++    from sklearn.feature_selection import VarianceThreshold
++    from sklearn.compose import make_column_selector, make_column_transformer
++
++    df = pd.DataFrame({"a": [True, False, True], "b": [1, 2, 3]})
++
++    ct = make_column_transformer(
++        (VarianceThreshold(), make_column_selector(dtype_include=bool)),
++        remainder=VarianceThreshold(),
++        verbose_feature_names_out=False,
++    ).set_output(transform="pandas")
++
++    out = ct.fit_transform(df)
++    # Expect pandas output with original dtypes preserved for passed-through
++    # columns: boolean for 'a' and integer for 'b'
++    assert isinstance(out, pd.DataFrame)
++    assert out.shape == df.shape
++    assert out["a"].dtype == df["a"].dtype
++    assert out["b"].dtype == df["b"].dtype
++    assert_array_equal(out.values, df.values)
++
++
+ @pytest.mark.parametrize("remainder", ["drop", "passthrough"])
+ @pytest.mark.parametrize("fit_transform", [True, False])
+ def test_column_transform_set_output_mixed(remainder, fit_transform):

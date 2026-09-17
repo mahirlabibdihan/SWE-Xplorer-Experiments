@@ -1,0 +1,80 @@
+diff --git a/django/db/migrations/writer.py b/django/db/migrations/writer.py
+index a59f0c8dcb..922a9ba104 100644
+--- a/django/db/migrations/writer.py
++++ b/django/db/migrations/writer.py
+@@ -173,10 +173,10 @@ class MigrationWriter:
+         else:
+             imports.add("from django.db import migrations")
+ 
+-        # Sort imports by the package / module to be imported (the part after
++        # Sort imports by import style (module imports before "from ... import ...")
++        # and then by the package / module to be imported (the part after
+         # "from" in "from ... import ..." or after "import" in "import ...").
+-        sorted_imports = sorted(imports, key=lambda i: i.split()[1])
+-        items["imports"] = "\n".join(sorted_imports) + "\n" if imports else ""
++        items["imports"] = self.format_imports(imports)
+         if migration_imports:
+             items["imports"] += (
+                 "\n\n# Functions from the following migrations need manual "
+@@ -281,6 +281,35 @@ class MigrationWriter:
+     def serialize(cls, value):
+         return serializer_factory(value).serialize()
+ 
++    @staticmethod
++    def format_imports(imports):
++        """Return a formatted imports string with module imports grouped before
++        "from" imports and sorted within each group.
++
++        The returned string includes a trailing newline when imports is not
++        empty, mimicking the previous behavior.
++        """
++        if not imports:
++            return ""
++
++        def import_key(i):
++            # Determine if this is an "import" (module import) or "from" import.
++            parts = i.split()
++            if parts[0] == "import":
++                kind = 0
++                module = parts[1]
++            elif parts[0] == "from":
++                kind = 1
++                module = parts[1]
++            else:
++                # Fallback - place unknown lines after the usual imports.
++                kind = 2
++                module = parts[1] if len(parts) > 1 else i
++            return (kind, module)
++
++        sorted_imports = sorted(imports, key=import_key)
++        return "\n".join(sorted_imports) + "\n"
++
+     @classmethod
+     def register_serializer(cls, type_, serializer):
+         Serializer.register(type_, serializer)
+diff --git a/tests/migrations/test_writer.py b/tests/migrations/test_writer.py
+index 1c11c68e97..543054ef1d 100644
+--- a/tests/migrations/test_writer.py
++++ b/tests/migrations/test_writer.py
+@@ -922,6 +922,21 @@ class WriterTests(SimpleTestCase):
+             output,
+         )
+ 
++    def test_imports_grouping(self):
++        """
++        New test for import ordering: module imports should be grouped before
++        "from ... import ..." imports.
++        """
++        imports = {
++            "import datetime",
++            "from django.db import migrations, models",
++            "import time",
++        }
++        result = MigrationWriter.format_imports(imports)
++        # module imports (import datetime, import time) must come before the
++        # from import, and each group should be sorted alphabetically by module.
++        self.assertEqual(result, "import datetime\nimport time\nfrom django.db import migrations, models\n")
++
+     def test_migration_file_header_comments(self):
+         """
+         Test comments at top of file.

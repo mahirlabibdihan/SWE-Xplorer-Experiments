@@ -1,0 +1,45 @@
+diff --git a/django/db/models/enums.py b/django/db/models/enums.py
+index f48143ddaf..e5b6919b6e 100644
+--- a/django/db/models/enums.py
++++ b/django/db/models/enums.py
+@@ -27,6 +27,12 @@ class ChoicesMeta(enum.EnumMeta):
+             dict.__setitem__(classdict, key, value)
+         cls = super().__new__(metacls, classname, bases, classdict)
+         cls._value2label_map_ = dict(zip(cls._value2member_map_, labels))
++        # Prevent the template system from trying to call the Choices class
++        # (the Template engine will call callables with no args unless they
++        # set ``do_not_call_in_templates``). Choices classes are types and
++        # therefore callable, so mark them to avoid accidental invocation in
++        # templates (see #29697).
++        setattr(cls, 'do_not_call_in_templates', True)
+         # Add a label property to instances of enum which uses the enum member
+         # that is passed in as "self" as the value to use when looking up the
+         # label in the choices.
+diff --git a/tests/template_tests/test_callables.py b/tests/template_tests/test_callables.py
+index b72b122deb..740a4e047a 100644
+--- a/tests/template_tests/test_callables.py
++++ b/tests/template_tests/test_callables.py
+@@ -123,3 +123,23 @@ class CallableVariablesTests(TestCase):
+         # Double-check that the object was really never called during the
+         # template rendering.
+         self.assertEqual(my_doodad.num_calls, 0)
++
++    def test_choices_not_called_in_templates(self):
++        """Choices subclasses should not be called by the template engine.
++
++        Previously, enum classes (Choices) were callable and the template
++        engine attempted to call them with no arguments during variable
++        resolution, causing a TypeError. Ensure that Choices classes set
++        do_not_call_in_templates so attribute comparisons like
++        ``student.year_in_school == YearInSchool.FRESHMAN`` work in templates.
++        """
++        from types import SimpleNamespace
++        from django.db import models
++
++        class YearInSchool(models.TextChoices):
++            FRESHMAN = 'FR', 'Freshman'
++
++        student = SimpleNamespace(year_in_school=YearInSchool.FRESHMAN)
++        c = Context({'student': student, 'YearInSchool': YearInSchool})
++        t = self.engine.from_string('{% if student.year_in_school == YearInSchool.FRESHMAN %}yes{% endif %}')
++        self.assertEqual(t.render(c), 'yes')

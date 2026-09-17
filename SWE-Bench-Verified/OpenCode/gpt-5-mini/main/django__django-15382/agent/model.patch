@@ -1,0 +1,62 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 81f8f79c71..a00ff738ab 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1210,14 +1210,30 @@ class Exists(Subquery):
+         return clone
+ 
+     def as_sql(self, compiler, connection, template=None, **extra_context):
+-        query = self.query.exists(using=connection.alias)
+-        sql, params = super().as_sql(
+-            compiler,
+-            connection,
+-            template=template,
+-            query=query,
+-            **extra_context,
+-        )
++        # Build an "exists" subquery. If the inner query is known to be
++        # empty, Query.as_sql() will raise EmptyResultSet. In that case,
++        # EXISTS(empty) is always False while NOT EXISTS(empty) is always
++        # True. To surface the correct semantics to the surrounding
++        # WhereNode/SQLCompiler machinery, return an empty SQL string to
++        # indicate a predicate that matches everything for the negated
++        # case, and re-raise EmptyResultSet for the non-negated case so the
++        # caller can treat it as a predicate that matches nothing.
++        try:
++            query = self.query.exists(using=connection.alias)
++            sql, params = super().as_sql(
++                compiler,
++                connection,
++                template=template,
++                query=query,
++                **extra_context,
++            )
++        except EmptyResultSet:
++            if self.negated:
++                # Signal "matches everything" to the surrounding WHERE
++                # handling by returning an empty SQL fragment.
++                return '', []
++            # Non-negated EXISTS(empty) matches nothing.
++            raise
+         if self.negated:
+             sql = 'NOT {}'.format(sql)
+         return sql, params
+diff --git a/tests/queries/tests.py b/tests/queries/tests.py
+index f146bc89fd..322294f125 100644
+--- a/tests/queries/tests.py
++++ b/tests/queries/tests.py
+@@ -1944,6 +1944,14 @@ class ExistsSql(TestCase):
+         self.assertNotIn(id, qstr)
+         self.assertNotIn(name, qstr)
+ 
++    def test_negated_exists_with_empty_subquery(self):
++        # A negated EXISTS() against an empty queryset should match all
++        # rows (i.e. be a no-op). This used to remove the WHERE block and
++        # produce an EmptyResultSet.
++        t = Tag.objects.create(name='t1')
++        qs = Tag.objects.filter(~Exists(Tag.objects.none()), name='t1')
++        self.assertSequenceEqual(list(qs), [t])
++
+     def test_ticket_18414(self):
+         Article.objects.create(name='one', created=datetime.datetime.now())
+         Article.objects.create(name='one', created=datetime.datetime.now())

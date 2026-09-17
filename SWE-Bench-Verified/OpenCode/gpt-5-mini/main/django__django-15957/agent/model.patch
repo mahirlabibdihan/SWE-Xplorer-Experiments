@@ -1,0 +1,54 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index be0deb90b0..7cb90af2f0 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -1438,7 +1438,15 @@ class QuerySet:
+         return self._filter_or_exclude(True, args, kwargs)
+ 
+     def _filter_or_exclude(self, negate, args, kwargs):
+-        if (args or kwargs) and self.query.is_sliced:
++        # Allow deferring a filter even when the queryset is sliced. Some
++        # internal consumers (e.g. RelatedManager._apply_rel_filters) set
++        # ``_defer_next_filter`` to True to indicate that the next filter
++        # should be stored and applied later (see the ``query`` property
++        # which applies any deferred filter). The previous check raised
++        # unconditionally for sliced querysets which prevented that
++        # mechanism from working (and broke using Prefetch with a sliced
++        # queryset). Only raise when we're not deferring the filter.
++        if (args or kwargs) and self.query.is_sliced and not self._defer_next_filter:
+             raise TypeError("Cannot filter a query once a slice has been taken.")
+         clone = self._chain()
+         if self._defer_next_filter:
+diff --git a/tests/prefetch_related/tests.py b/tests/prefetch_related/tests.py
+index 1ac17fde73..14117f3200 100644
+--- a/tests/prefetch_related/tests.py
++++ b/tests/prefetch_related/tests.py
+@@ -1215,6 +1215,28 @@ class GenericRelationTests(TestCase):
+         # instance returned by the manager.
+         self.assertEqual(list(bookmark.tags.all()), list(bookmark.tags.all().all()))
+ 
++    def test_prefetch_with_sliced_queryset(self):
++        """Prefetch should accept a sliced queryset without raising.
++
++        This exercises the case where a Prefetch is given a sliced
++        QuerySet (e.g. ``.all()[:1]``). Previously, attempting to apply
++        relation filters to a sliced queryset raised a TypeError. Ensure
++        that the sliced queryset is acceptable and prefetching works.
++        """
++        # Use existing Person/House test data from setUpTestData
++        with self.assertNumQueries(2):
++            persons = list(
++                Person.objects.prefetch_related(
++                    Prefetch("houses", queryset=House.objects.all()[:1], to_attr="houses_limited")
++                )
++            )
++
++        # Ensure the prefetched attribute exists and respects the slice limit
++        for p in persons:
++            self.assertTrue(hasattr(p, "houses_limited"))
++            self.assertIsInstance(p.houses_limited, list)
++            self.assertLessEqual(len(p.houses_limited), 1)
++
+     def test_deleted_GFK(self):
+         TaggedItem.objects.create(tag="awesome", content_object=self.book1)
+         TaggedItem.objects.create(tag="awesome", content_object=self.book2)

@@ -1,0 +1,61 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 192d9fad94..aff9dbc2ac 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -635,8 +635,13 @@ def modelform_factory(
+     # Give this new form class a reasonable name.
+     class_name = model.__name__ + "Form"
+ 
+-    # Class attributes for the new form class.
+-    form_class_attrs = {"Meta": Meta, "formfield_callback": formfield_callback}
++    # Class attributes for the new form class. Only set the
++    # `formfield_callback` attribute if a callback was explicitly provided.
++    # If not provided, we want the new form class to inherit any
++    # `Meta.formfield_callback` from the parent form.
++    form_class_attrs = {"Meta": Meta}
++    if formfield_callback is not None:
++        form_class_attrs["formfield_callback"] = formfield_callback
+ 
+     if getattr(Meta, "fields", None) is None and getattr(Meta, "exclude", None) is None:
+         raise ImproperlyConfigured(
+diff --git a/tests/model_forms/tests.py b/tests/model_forms/tests.py
+index d2ce3348c5..ebd40372fb 100644
+--- a/tests/model_forms/tests.py
++++ b/tests/model_forms/tests.py
+@@ -3496,6 +3496,36 @@ class FormFieldCallbackTests(SimpleTestCase):
+                 type(NewForm.base_fields[name].widget),
+             )
+ 
++    def test_factory_inherits_meta_formfield_callback(self):
++        """If the provided base form's Meta defines formfield_callback, the
++        modelform_factory should inherit and use that callback when no
++        callback is passed to modelform_factory.
++        """
++        callback_args = []
++
++        def all_required(field, **kwargs):
++            callback_args.append((field, kwargs))
++            formfield = field.formfield(**kwargs)
++            if formfield is not None:
++                formfield.required = True
++            return formfield
++
++        class MyForm(forms.ModelForm):
++            class Meta:
++                model = Person
++                formfield_callback = staticmethod(all_required)
++                fields = ["name"]
++
++        FactoryForm = modelform_factory(Person, form=MyForm)
++
++        # Ensure our callback was used to construct the fields
++        id_field, name_field = Person._meta.fields
++        # Expect at least the name field to have been processed with our widget
++        # Note: fields_for_model calls the callback for each editable field.
++        self.assertIn((name_field, {}), callback_args)
++        # And the resulting form field should be required because the callback set it
++        self.assertTrue(FactoryForm.base_fields["name"].required)
++
+ 
+ class LocalizedModelFormTest(TestCase):
+     def test_model_form_applies_localize_to_some_fields(self):

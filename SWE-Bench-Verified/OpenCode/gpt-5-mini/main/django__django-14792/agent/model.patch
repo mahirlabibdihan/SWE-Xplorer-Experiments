@@ -1,0 +1,55 @@
+diff --git a/django/db/models/functions/datetime.py b/django/db/models/functions/datetime.py
+index 20161bef38..bff68d7f28 100644
+--- a/django/db/models/functions/datetime.py
++++ b/django/db/models/functions/datetime.py
+@@ -25,6 +25,19 @@ class TimezoneMixin:
+                 tzname = timezone.get_current_timezone_name()
+             else:
+                 tzname = timezone._get_timezone_name(self.tzinfo)
++                # Some tzinfo implementations (zoneinfo/pytz) may return
++                # names like 'Etc/GMT-10'. Historically Django used a
++                # numeric offset like '+10' for these zones which, after
++                # being processed by backend _prepare_tzname_delta(),
++                # produced the correct SQL (e.g. AT TIME ZONE '-10').
++                # Keep that behaviour by converting 'Etc/GMT±N' to the
++                # numeric form with inverted sign ("Etc/GMT-10" -> "+10").
++                if isinstance(tzname, str) and tzname.startswith('Etc/GMT'):
++                    offset = tzname[len('Etc/GMT'):]
++                    if offset.startswith('+'):
++                        tzname = '-' + offset[1:]
++                    elif offset.startswith('-'):
++                        tzname = '+' + offset[1:]
+         return tzname
+ 
+ 
+diff --git a/tests/db_functions/datetime/test_extract_trunc.py b/tests/db_functions/datetime/test_extract_trunc.py
+index ced9da0c78..0dea68fd16 100644
+--- a/tests/db_functions/datetime/test_extract_trunc.py
++++ b/tests/db_functions/datetime/test_extract_trunc.py
+@@ -1141,6 +1141,26 @@ class DateFunctionWithTimeZoneTests(DateFunctionTests):
+         for constructor in ZONE_CONSTRUCTORS:
+             yield constructor(key)
+ 
++    def test_etc_gmt_timezone_name_preparation(self):
++        """Ensure 'Etc/GMT-10' becomes the expected numeric timezone used in SQL.
++
++        The TimezoneMixin should convert 'Etc/GMT-10' to a numeric form so that
++        DatabaseOperations._prepare_tzname_delta produces the correct value
++        used in "AT TIME ZONE ..." SQL fragments (e.g. '-10').
++        """
++        from django.db import connection
++        from django.db.models.functions.datetime import TimezoneMixin
++
++        for constructor in ZONE_CONSTRUCTORS:
++            tz = constructor('Etc/GMT-10')
++            mixin = TimezoneMixin()
++            mixin.tzinfo = tz
++            # get_tzname should return a numeric-like name that, when
++            # prepared by the backend, results in the expected SQL tz name.
++            tzname = mixin.get_tzname()
++            prepared = connection.ops._prepare_tzname_delta(tzname)
++            self.assertEqual(prepared, '-10')
++
+     def test_extract_func_with_timezone(self):
+         start_datetime = datetime(2015, 6, 15, 23, 30, 1, 321)
+         end_datetime = datetime(2015, 6, 16, 13, 11, 27, 123)

@@ -1,0 +1,104 @@
+diff --git a/sphinx/domains/cpp.py b/sphinx/domains/cpp.py
+index fe52d881d..9c7956667 100644
+--- a/sphinx/domains/cpp.py
++++ b/sphinx/domains/cpp.py
+@@ -866,14 +866,23 @@ class ASTCharLiteral(ASTLiteral):
+             self.value = ord(decoded)
+         else:
+             raise UnsupportedMultiCharacterCharLiteral(decoded)
++        # Optional user-defined-literal suffix (e.g., 'k', '_km').
++        # Will be filled by the parser if present.
++        self.suffix = None
+ 
+     def _stringify(self, transform: StringifyTransform) -> str:
+         if self.prefix is None:
+-            return "'" + self.data + "'"
++            base = "'" + self.data + "'"
+         else:
+-            return self.prefix + "'" + self.data + "'"
++            base = self.prefix + "'" + self.data + "'"
++        if self.suffix:
++            return base + self.suffix
++        return base
+ 
+     def get_id(self, version: int) -> str:
++        # include suffix in id if present to avoid collisions
++        if self.suffix:
++            return self.type + str(self.value) + '_' + self.suffix
+         return self.type + str(self.value)
+ 
+     def describe_signature(self, signode: TextElement, mode: str,
+@@ -4662,12 +4671,27 @@ class DefinitionParser(BaseParser):
+                       integer_literal_re, octal_literal_re]:
+             pos = self.pos
+             if self.match(regex):
++                # consume builtin literal suffix characters first
+                 while self.current_char in 'uUlLfF':
+                     self.pos += 1
++                # then accept a user-defined literal identifier suffix
++                # (e.g., 1_qm, 6.6e-34q_J)
++                if self.match(identifier_re):
++                    # append the identifier suffix to the literal
++                    # the match advanced self.pos already
++                    return ASTNumberLiteral(self.definition[pos:self.pos])
+                 return ASTNumberLiteral(self.definition[pos:self.pos])
+ 
+         string = self._parse_string()
+         if string is not None:
++            # accept optional user-defined literal suffix after a string
++            # e.g., "m"_km
++            pos = self.pos
++            if self.match(identifier_re):
++                # attach suffix to the string literal
++                return ASTStringLiteral(string + self.matched_text)
++            else:
++                self.pos = pos
+             return ASTStringLiteral(string)
+ 
+         # character-literal
+@@ -4675,12 +4699,20 @@ class DefinitionParser(BaseParser):
+             prefix = self.last_match.group(1)  # may be None when no prefix
+             data = self.last_match.group(2)
+             try:
+-                return ASTCharLiteral(prefix, data)
++                lit = ASTCharLiteral(prefix, data)
+             except UnicodeDecodeError as e:
+                 self.fail("Can not handle character literal. Internal error was: %s" % e)
+             except UnsupportedMultiCharacterCharLiteral:
+                 self.fail("Can not handle character literal"
+                           " resulting in multiple decoded characters.")
++            # if there is a user-defined literal suffix, consume and attach it
++            pos = self.pos
++            if self.match(identifier_re):
++                lit.suffix = self.matched_text
++                return lit
++            else:
++                self.pos = pos
++                return lit
+ 
+         # TODO: user-defined lit
+         return None
+diff --git a/tests/test_domain_cpp.py b/tests/test_domain_cpp.py
+index 9db741ae5..661d72a1e 100644
+--- a/tests/test_domain_cpp.py
++++ b/tests/test_domain_cpp.py
+@@ -290,6 +290,19 @@ def test_expressions():
+     check('function', 'template<> void f(A<B, 2> &v)',
+           {2: "IE1fR1AI1BX2EE", 3: "IE1fR1AI1BXL2EEE", 4: "IE1fvR1AI1BXL2EEE"})
+     exprCheck('A<1>::value', 'N1AIXL1EEE5valueE')
++
++
++def test_user_defined_literal_parsing():
++    # ensure numeric user-defined literals are parsed (e.g., suffixes like q_J)
++    class Config:
++        cpp_id_attributes = ["id_attr"]
++        cpp_paren_attributes = ["paren_attr"]
++    parser = DefinitionParser('6.62607015e-34q_J * 1q_s', location=None,
++                              config=Config())
++    parser.allowFallbackExpressionParsing = False
++    ast = parser.parse_expression()
++    # stringification should reproduce the input (whitespace may be normalized)
++    assert str(ast) == '6.62607015e-34q_J * 1q_s'
+     check('class', "template<int T = 42> A", {2: "I_iE1A"})
+     check('enumerator', 'A = std::numeric_limits<unsigned long>::max()', {2: "1A"})
+ 

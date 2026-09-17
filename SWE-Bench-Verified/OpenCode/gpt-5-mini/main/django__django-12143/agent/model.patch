@@ -1,0 +1,61 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 137e6faa0f..96106960b2 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1630,8 +1630,15 @@ class ModelAdmin(BaseModelAdmin):
+         return self.changeform_view(request, object_id, form_url, extra_context)
+ 
+     def _get_edited_object_pks(self, request, prefix):
+-        """Return POST data values of list_editable primary keys."""
+-        pk_pattern = re.compile(r'{}-\d+-{}$'.format(prefix, self.model._meta.pk.name))
++        """Return POST data values of list_editable primary keys.
++
++        The regex built to match formset field names must escape the prefix
++        (and the primary key name) because prefixes can contain arbitrary
++        characters, including regex metacharacters.
++        """
++        pk_name = self.model._meta.pk.name
++        # Escape the prefix and pk name to avoid accidental regex interpretation
++        pk_pattern = re.compile(r'{}-\d+-{}$'.format(re.escape(prefix), re.escape(pk_name)))
+         return [value for key, value in request.POST.items() if pk_pattern.match(key)]
+ 
+     def _get_list_editable_queryset(self, request, prefix):
+diff --git a/tests/admin_changelist/tests.py b/tests/admin_changelist/tests.py
+index 05490b061a..b35bbd6a18 100644
+--- a/tests/admin_changelist/tests.py
++++ b/tests/admin_changelist/tests.py
+@@ -819,6 +819,34 @@ class ChangeListTests(TestCase):
+         pks = m._get_edited_object_pks(request, prefix='form')
+         self.assertEqual(sorted(pks), sorted([str(a.pk), str(b.pk), str(c.pk)]))
+ 
++    def test_get_edited_object_ids_with_regex_chars_in_prefix(self):
++        """Regression test: prefixes containing regex special chars must be
++        treated literally (see ticket on regex escaping of formset prefixes)."""
++        a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
++        b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
++        superuser = self._create_superuser('superuser')
++        self.client.force_login(superuser)
++        changelist_url = reverse('admin:admin_changelist_swallow_changelist')
++        m = SwallowAdmin(Swallow, custom_site)
++        # Use a prefix that contains regex-special characters
++        weird_prefix = 'form.^$*[]()'
++        data = {
++            weird_prefix + '-TOTAL_FORMS': '2',
++            weird_prefix + '-INITIAL_FORMS': '2',
++            weird_prefix + '-MIN_NUM_FORMS': '0',
++            weird_prefix + '-MAX_NUM_FORMS': '1000',
++            weird_prefix + '-0-uuid': str(a.pk),
++            weird_prefix + '-1-uuid': str(b.pk),
++            weird_prefix + '-0-load': '9.0',
++            weird_prefix + '-0-speed': '9.0',
++            weird_prefix + '-1-load': '5.0',
++            weird_prefix + '-1-speed': '5.0',
++            '_save': 'Save',
++        }
++        request = self.factory.post(changelist_url, data=data)
++        pks = m._get_edited_object_pks(request, prefix=weird_prefix)
++        self.assertEqual(sorted(pks), sorted([str(a.pk), str(b.pk)]))
++
+     def test_get_list_editable_queryset(self):
+         a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+         Swallow.objects.create(origin='Swallow B', load=2, speed=2)

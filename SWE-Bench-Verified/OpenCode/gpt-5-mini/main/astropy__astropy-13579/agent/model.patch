@@ -1,0 +1,97 @@
+diff --git a/astropy/wcs/wcsapi/tests/test_sliced_world_to_pixel.py b/astropy/wcs/wcsapi/tests/test_sliced_world_to_pixel.py
+new file mode 100644
+index 000000000..fe04cb575
+--- /dev/null
++++ b/astropy/wcs/wcsapi/tests/test_sliced_world_to_pixel.py
+@@ -0,0 +1,61 @@
++import astropy.units as u
++import numpy as np
++from numpy.testing import assert_allclose
++
++from astropy.wcs import WCS
++from astropy.coordinates import SkyCoord
++from astropy.wcs.utils import wcs_to_celestial_frame
++
++from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
++from astropy.wcs.wcsapi.high_level_wcs_wrapper import HighLevelWCSWrapper
++
++
++def test_sliced_world_to_pixel_preserves_celestial_coordinates():
++    # Reproduction of reported issue: a 3D WCS where the spectral axis is
++    # fixed by slicing should still map celestial SkyCoord inputs to the same
++    # pixel coordinates as the full WCS.
++    nx = 100
++    ny = 25
++    nz = 2
++    wcs_header = {
++        'WCSAXES': 3,
++        'CRPIX1': (nx + 1)/2,
++        'CRPIX2': (ny + 1)/2,
++        'CRPIX3': 1.0,
++        'PC1_1': 0.0,
++        'PC1_2': -1.0,
++        'PC1_3': 0.0,
++        'PC2_1': 1.0,
++        'PC2_2': 0.0,
++        'PC2_3': -1.0,
++        'CDELT1': 5,
++        'CDELT2': 5,
++        'CDELT3': 0.055,
++        'CUNIT1': 'arcsec',
++        'CUNIT2': 'arcsec',
++        'CUNIT3': 'Angstrom',
++        'CTYPE1': 'HPLN-TAN',
++        'CTYPE2': 'HPLT-TAN',
++        'CTYPE3': 'WAVE',
++        'CRVAL1': 0.0,
++        'CRVAL2': 0.0,
++        'CRVAL3': 1.05,
++    }
++
++    fits_wcs = WCS(header=wcs_header)
++
++    # Celestial point at origin
++    pt = SkyCoord(Tx=0*u.arcsec, Ty=0*u.arcsec, frame=wcs_to_celestial_frame(fits_wcs))
++
++    # Full WCS world_to_pixel including spectral gives expected central pixel
++    px_full, py_full, pz_full = fits_wcs.world_to_pixel(pt, 1.05*u.Angstrom)
++
++    # Slice out the first spectral plane and wrap as a high-level WCS
++    ll_sliced_wcs = SlicedLowLevelWCS(fits_wcs, 0)
++    hl_sliced_wcs = HighLevelWCSWrapper(ll_sliced_wcs)
++
++    # world_to_pixel on the sliced high-level WCS with only the SkyCoord
++    px_slice, py_slice = hl_sliced_wcs.world_to_pixel(pt)
++
++    assert_allclose(px_slice, px_full)
++    assert_allclose(py_slice, py_full)
+diff --git a/astropy/wcs/wcsapi/wrappers/sliced_wcs.py b/astropy/wcs/wcsapi/wrappers/sliced_wcs.py
+index d7605b078..dbd07d57c 100644
+--- a/astropy/wcs/wcsapi/wrappers/sliced_wcs.py
++++ b/astropy/wcs/wcsapi/wrappers/sliced_wcs.py
+@@ -246,12 +246,24 @@ class SlicedLowLevelWCS(BaseWCSWrapper):
+         world_arrays = tuple(map(np.asanyarray, world_arrays))
+         world_arrays_new = []
+         iworld_curr = -1
++        # If a world dimension has been dropped by the slice, we need to
++        # supply the underlying WCS with the fixed world value corresponding
++        # to the slice. These values are available from
++        # self.dropped_world_dimensions()['value'] in the order of the
++        # dropped world axes. Fall back to 1. if no dropped info is present
++        # (shouldn't normally happen).
++        dropped_vals = self.dropped_world_dimensions.get("value", []) if self.dropped_world_dimensions else []
++        dropped_i = 0
+         for iworld in range(self._wcs.world_n_dim):
+             if iworld in self._world_keep:
+                 iworld_curr += 1
+                 world_arrays_new.append(world_arrays[iworld_curr])
+             else:
+-                world_arrays_new.append(1.)
++                if dropped_i < len(dropped_vals):
++                    world_arrays_new.append(dropped_vals[dropped_i])
++                    dropped_i += 1
++                else:
++                    world_arrays_new.append(1.)
+ 
+         world_arrays_new = np.broadcast_arrays(*world_arrays_new)
+         pixel_arrays = list(self._wcs.world_to_pixel_values(*world_arrays_new))

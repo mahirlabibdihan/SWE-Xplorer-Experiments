@@ -1,0 +1,57 @@
+diff --git a/django/forms/fields.py b/django/forms/fields.py
+index 65d6a9ec82..8435627048 100644
+--- a/django/forms/fields.py
++++ b/django/forms/fields.py
+@@ -1023,6 +1023,14 @@ class MultiValueField(Field):
+             value = self.widget.decompress(value)
+         if not value or isinstance(value, (list, tuple)):
+             if not value or not [v for v in value if v not in self.empty_values]:
++                # If no data has been provided for this MultiValueField, we
++                # normally treat the whole field as empty. However, if any of
++                # the subfields are explicitly marked as required, that should
++                # make the overall field invalid even when the parent field
++                # itself is not required. This ensures that per-subfield
++                # "required" flags are respected.
++                if any(getattr(f, 'required', False) for f in self.fields):
++                    raise ValidationError(self.error_messages['required'], code='required')
+                 if self.required:
+                     raise ValidationError(self.error_messages['required'], code='required')
+                 else:
+diff --git a/tests/forms_tests/field_tests/test_multivaluefield.py b/tests/forms_tests/field_tests/test_multivaluefield.py
+index 29287d0b01..e4c2358476 100644
+--- a/tests/forms_tests/field_tests/test_multivaluefield.py
++++ b/tests/forms_tests/field_tests/test_multivaluefield.py
+@@ -172,3 +172,33 @@ class MultiValueFieldTest(SimpleTestCase):
+         })
+         form.is_valid()
+         self.assertEqual(form.cleaned_data['field1'], 'some text,JP,2007-04-25 06:24:00')
++
++    def test_required_subfield_with_all_empty(self):
++        """
++        If the MultiValueField as a whole is not required but one of the
++        subfields is marked required, providing empty values for all
++        subfields should still trigger a required validation error.
++        """
++        from django.forms import MultiValueField, MultiWidget, CharField, Form
++
++        class MF(MultiValueField):
++            widget = MultiWidget
++            def __init__(self):
++                fields = [
++                    CharField(required=False),
++                    CharField(required=True),
++                ]
++                widget = self.widget(widgets=[f.widget for f in fields], attrs={})
++                super().__init__(fields=fields, widget=widget, require_all_fields=False, required=False)
++            def compress(self, value):
++                return []
++
++        class F(Form):
++            mf = MF()
++
++        f = F({
++            'mf_0': '',
++            'mf_1': '',
++        })
++        # Expect invalid because the second subfield is required.
++        self.assertFalse(f.is_valid())

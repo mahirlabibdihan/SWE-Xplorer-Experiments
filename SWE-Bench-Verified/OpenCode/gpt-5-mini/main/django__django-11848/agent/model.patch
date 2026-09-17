@@ -1,0 +1,56 @@
+diff --git a/django/utils/http.py b/django/utils/http.py
+index 572cfb4347..6dbbf625f0 100644
+--- a/django/utils/http.py
++++ b/django/utils/http.py
+@@ -176,10 +176,17 @@ def parse_http_date(date):
+     try:
+         year = int(m.group('year'))
+         if year < 100:
+-            if year < 70:
+-                year += 2000
+-            else:
+-                year += 1900
++            # RFC 7231: recipients MUST interpret a two-digit year that
++            # appears to be more than 50 years in the future as representing
++            # the most recent year in the past with the same last two digits.
++            # Compute the candidate year in the current century, then if it
++            # is more than 50 years in the future, roll back one century.
++            now_year = datetime.datetime.utcnow().year
++            century_base = now_year - (now_year % 100)
++            candidate = century_base + year
++            if candidate - now_year > 50:
++                candidate -= 100
++            year = candidate
+         month = MONTHS.index(m.group('mon').lower()) + 1
+         day = int(m.group('day'))
+         hour = int(m.group('hour'))
+diff --git a/tests/utils_tests/test_http.py b/tests/utils_tests/test_http.py
+index bc8bcfe977..a72257c077 100644
+--- a/tests/utils_tests/test_http.py
++++ b/tests/utils_tests/test_http.py
+@@ -328,6 +328,25 @@ class HttpDateProcessingTests(unittest.TestCase):
+         parsed = parse_http_date('Sun Nov  6 08:49:37 0037')
+         self.assertEqual(datetime.utcfromtimestamp(parsed), datetime(2037, 11, 6, 8, 49, 37))
+ 
++    def test_two_digit_year_rfc7231_future_rule(self):
++        # Verify RFC7231 interpretation: if the two-digit year would be more
++        # than 50 years in the future, interpret it as the most recent past
++        # year with the same last two digits.
++        from unittest.mock import patch
++
++        # Fix "now" to 2026-01-01 so tests are deterministic.
++        with patch('django.utils.http.datetime.datetime.utcnow', return_value=datetime(2026, 1, 1)):
++            # 76 -> candidate 2076; 2076 - 2026 == 50 -> not more than 50,
++            # so it should be interpreted as 2076 (future within 50 years).
++            parsed = parse_http_date('Sunday, 06-Nov-76 08:49:37 GMT')
++            self.assertEqual(datetime.utcfromtimestamp(parsed), datetime(2076, 11, 6, 8, 49, 37))
++
++            # 94 -> candidate 2094; 2094 - 2026 == 68 -> more than 50, so
++            # it should be interpreted as 1994 (most recent year in the past
++            # with same last two digits).
++            parsed = parse_http_date('Sunday, 06-Nov-94 08:49:37 GMT')
++            self.assertEqual(datetime.utcfromtimestamp(parsed), datetime(1994, 11, 6, 8, 49, 37))
++
+ 
+ class EscapeLeadingSlashesTests(unittest.TestCase):
+     def test(self):

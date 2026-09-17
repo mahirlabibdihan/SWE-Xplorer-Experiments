@@ -1,0 +1,100 @@
+diff --git a/django/db/models/fields/related_lookups.py b/django/db/models/fields/related_lookups.py
+index 1a845a1f7f..ce2e9c747b 100644
+--- a/django/db/models/fields/related_lookups.py
++++ b/django/db/models/fields/related_lookups.py
+@@ -90,22 +90,44 @@ class RelatedIn(In):
+                         -1
+                     ]
+                     self.rhs = [target_field.get_prep_value(v) for v in self.rhs]
+-            elif not getattr(self.rhs, "has_select_fields", True) and not getattr(
+-                self.lhs.field.target_field, "primary_key", False
+-            ):
+-                self.rhs.clear_select_clause()
+-                if (
+-                    getattr(self.lhs.output_field, "primary_key", False)
+-                    and self.lhs.output_field.model == self.rhs.model
+-                ):
+-                    # A case like
+-                    # Restaurant.objects.filter(place__in=restaurant_qs), where
+-                    # place is a OneToOneField and the primary key of
+-                    # Restaurant.
+-                    target_field = self.lhs.field.name
+-                else:
+-                    target_field = self.lhs.field.target_field.name
+-                self.rhs.add_fields([target_field], True)
++            else:
++                # If the RHS is a Query and it doesn't already select a single
++                # column suitable for the IN lookup, clear its select clause and
++                # make it select only the target field. This avoids subqueries
++                # that return multiple columns (which would error out on SQL
++                # backends expecting a single-column subquery).
++                    from django.db.models.sql.query import Query
++
++                    if isinstance(self.rhs, Query):
++                    # Determine if RHS already selects exactly one column.
++                    rhs_selects_single = False
++                    # If values() was used, values_select holds the field names.
++                    if getattr(self.rhs, "values_select", ()):  # values()/values_list()
++                        rhs_selects_single = len(self.rhs.values_select) == 1
++                    # If explicit select columns present, check length.
++                    elif getattr(self.rhs, "select", ()):  # explicit select columns
++                        rhs_selects_single = len(self.rhs.select) == 1 and not (
++                            self.rhs.annotation_select_mask or self.rhs.extra_select_mask
++                        )
++                    # If RHS does not select a single column and the relation's
++                    # target isn't a primary key, replace the select with the
++                    # single target field.
++                    if not rhs_selects_single and not getattr(
++                        self.lhs.field.target_field, "primary_key", False
++                    ):
++                        self.rhs.clear_select_clause()
++                        if (
++                            getattr(self.lhs.output_field, "primary_key", False)
++                            and self.lhs.output_field.model == self.rhs.model
++                        ):
++                            # A case like
++                            # Restaurant.objects.filter(place__in=restaurant_qs), where
++                            # place is a OneToOneField and the primary key of
++                            # Restaurant.
++                            target_field = self.lhs.field.name
++                        else:
++                            target_field = self.lhs.field.target_field.name
++                        self.rhs.add_fields([target_field], True)
+         return super().get_prep_lookup()
+ 
+     def as_sql(self, compiler, connection):
+diff --git a/tests/annotations/tests.py b/tests/annotations/tests.py
+index 8de2bf1998..5ddacad98e 100644
+--- a/tests/annotations/tests.py
++++ b/tests/annotations/tests.py
+@@ -199,6 +199,30 @@ class NonAggregateAnnotationTestCase(TestCase):
+                 ),
+             ]
+         )
++
++    def test_annotation_and_alias_filter_in_subquery(self):
++        long_books_qs = (
++            Book.objects.filter(
++                pages__gt=400,
++            )
++            .annotate(book_annotate=Value(1))
++            .alias(book_alias=Value(1))
++        )
++        publisher_books_qs = (
++            Publisher.objects.filter(
++                book__in=long_books_qs
++            )
++            .values("name")
++        )
++        self.assertCountEqual(
++            publisher_books_qs,
++            [
++                {'name': 'Apress'},
++                {'name': 'Sams'},
++                {'name': 'Prentice Hall'},
++                {'name': 'Morgan Kaufmann'}
++            ]
++        )
+         employees = Employee.objects.annotate(
+             store_opened_year=F("store__original_opening__year"),
+         )

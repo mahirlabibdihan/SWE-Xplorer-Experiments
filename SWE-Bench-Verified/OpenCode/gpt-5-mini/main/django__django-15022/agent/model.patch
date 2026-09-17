@@ -1,0 +1,58 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 66f3396a6b..f0602b6af7 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -1031,6 +1031,12 @@ class ModelAdmin(BaseModelAdmin):
+         if search_fields and search_term:
+             orm_lookups = [construct_search(str(search_field))
+                            for search_field in search_fields]
++            # Build a single combined Q object for all search words instead of
++            # calling queryset.filter() repeatedly. Each call to filter() can
++            # add JOINs when lookups span relationships; combining the per-word
++            # OR queries with AND and applying them in one filter avoids
++            # generating unnecessary repeated JOINs.
++            final_query = None
+             for bit in smart_split(search_term):
+                 if bit.startswith(('"', "'")) and bit[0] == bit[-1]:
+                     bit = unescape_string_literal(bit)
+@@ -1038,7 +1044,12 @@ class ModelAdmin(BaseModelAdmin):
+                     *((orm_lookup, bit) for orm_lookup in orm_lookups),
+                     _connector=models.Q.OR,
+                 )
+-                queryset = queryset.filter(or_queries)
++                if final_query is None:
++                    final_query = or_queries
++                else:
++                    final_query &= or_queries
++            if final_query is not None:
++                queryset = queryset.filter(final_query)
+             may_have_duplicates |= any(
+                 lookup_spawns_duplicates(self.opts, search_spec)
+                 for search_spec in orm_lookups
+diff --git a/tests/admin_changelist/tests.py b/tests/admin_changelist/tests.py
+index 92ea0dd718..ff10b60043 100644
+--- a/tests/admin_changelist/tests.py
++++ b/tests/admin_changelist/tests.py
+@@ -549,6 +549,22 @@ class ChangeListTests(TestCase):
+                 request.user = self.superuser
+                 group_changelist = group_model_admin.get_changelist_instance(request)
+                 self.assertEqual(group_changelist.queryset.count(), result_count)
++
++    def test_search_multiple_words_avoids_repeated_joins(self):
++        """
++        Ensure that searching for multiple words doesn't add repeated JOINs
++        for the same related table (regression test for unnecessary joins).
++        """
++        concert_model_admin = ConcertAdmin(Concert, custom_site)
++        # Only search on the related group__name to force a join.
++        concert_model_admin.search_fields = ['group__name']
++
++        request = self.factory.get('/concert/', data={SEARCH_VAR: 'Woodstock Concert'})
++        request.user = self.superuser
++        cl = concert_model_admin.get_changelist_instance(request)
++        sql = str(cl.queryset.query)
++        # The related table should appear only once in the generated SQL.
++        self.assertEqual(sql.count('admin_changelist_group'), 1)
+         # Many-to-many lookup.
+         for search_string, result_count in (
+             ('Finlayson Duo Tiny', 1),

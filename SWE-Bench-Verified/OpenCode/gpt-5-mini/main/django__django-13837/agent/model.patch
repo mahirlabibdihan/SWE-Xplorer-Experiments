@@ -1,0 +1,100 @@
+diff --git a/django/utils/autoreload.py b/django/utils/autoreload.py
+index b8efb9f881..97b0d9aab9 100644
+--- a/django/utils/autoreload.py
++++ b/django/utils/autoreload.py
+@@ -216,33 +216,46 @@ def get_child_arguments():
+     executable is reported to not have the .exe extension which can cause bugs
+     on reloading.
+     """
+-    import django.__main__
+-    django_main_path = Path(django.__main__.__file__)
+-    py_script = Path(sys.argv[0])
+-
++    # Prefer using the documented way of detecting a -m invocation by
++    # inspecting the top-level __main__.__spec__.parent value. If that is
++    # present and non-empty, Python was started with `-m <package>` and the
++    # child process should be started the same way.
+     args = [sys.executable] + ['-W%s' % o for o in sys.warnoptions]
+-    if py_script == django_main_path:
+-        # The server was started with `python -m django runserver`.
+-        args += ['-m', 'django']
++
++    main_mod = sys.modules.get('__main__')
++    main_spec = getattr(main_mod, '__spec__', None)
++    if main_spec is not None and getattr(main_spec, 'parent', None):
++        # Started with `python -m <package>` where <package> == main_spec.parent
++        pkg = main_spec.parent
++        args += ['-m', pkg]
+         args += sys.argv[1:]
+-    elif not py_script.exists():
+-        # sys.argv[0] may not exist for several reasons on Windows.
+-        # It may exist with a .exe extension or have a -script.py suffix.
+-        exe_entrypoint = py_script.with_suffix('.exe')
+-        if exe_entrypoint.exists():
+-            # Should be executed directly, ignoring sys.executable.
+-            # TODO: Remove str() when dropping support for PY37.
+-            # args parameter accepts path-like on Windows from Python 3.8.
+-            return [str(exe_entrypoint), *sys.argv[1:]]
+-        script_entrypoint = py_script.with_name('%s-script.py' % py_script.name)
+-        if script_entrypoint.exists():
+-            # Should be executed as usual.
+-            # TODO: Remove str() when dropping support for PY37.
+-            # args parameter accepts path-like on Windows from Python 3.8.
+-            return [*args, str(script_entrypoint), *sys.argv[1:]]
+-        raise RuntimeError('Script %s does not exist.' % py_script)
+     else:
+-        args += sys.argv
++        import django.__main__
++        django_main_path = Path(django.__main__.__file__)
++        py_script = Path(sys.argv[0])
++
++        if py_script == django_main_path:
++            # The server was started with `python -m django runserver`.
++            args += ['-m', 'django']
++            args += sys.argv[1:]
++        elif not py_script.exists():
++            # sys.argv[0] may not exist for several reasons on Windows.
++            # It may exist with a .exe extension or have a -script.py suffix.
++            exe_entrypoint = py_script.with_suffix('.exe')
++            if exe_entrypoint.exists():
++                # Should be executed directly, ignoring sys.executable.
++                # TODO: Remove str() when dropping support for PY37.
++                # args parameter accepts path-like on Windows from Python 3.8.
++                return [str(exe_entrypoint), *sys.argv[1:]]
++            script_entrypoint = py_script.with_name('%s-script.py' % py_script.name)
++            if script_entrypoint.exists():
++                # Should be executed as usual.
++                # TODO: Remove str() when dropping support for PY37.
++                # args parameter accepts path-like on Windows from Python 3.8.
++                return [*args, str(script_entrypoint), *sys.argv[1:]]
++            raise RuntimeError('Script %s does not exist.' % py_script)
++        else:
++            args += sys.argv
+     return args
+ 
+ 
+diff --git a/tests/utils_tests/test_autoreload.py b/tests/utils_tests/test_autoreload.py
+index b9f2db7276..fcc9c9093c 100644
+--- a/tests/utils_tests/test_autoreload.py
++++ b/tests/utils_tests/test_autoreload.py
+@@ -165,6 +165,20 @@ class TestChildArguments(SimpleTestCase):
+             [sys.executable, '-m', 'django', 'runserver']
+         )
+ 
++    @mock.patch('sys.warnoptions', [])
++    def test_run_as_module_other_package(self):
++        """If Python was started with -m <package>, use that package when
++        restarting the child process (not only when it's 'django').
++        """
++        main = types.ModuleType('__main__')
++        main.__spec__ = types.SimpleNamespace(parent='my_package')
++        with mock.patch.dict(sys.modules, {'__main__': main}):
++            with mock.patch('sys.argv', ['-m', 'runserver']):
++                self.assertEqual(
++                    autoreload.get_child_arguments(),
++                    [sys.executable, '-m', 'my_package', 'runserver']
++                )
++
+     @mock.patch('sys.argv', [__file__, 'runserver'])
+     @mock.patch('sys.warnoptions', ['error'])
+     def test_warnoptions(self):

@@ -1,0 +1,62 @@
+diff --git a/django/db/backends/mysql/base.py b/django/db/backends/mysql/base.py
+index 2c62182d31..457c348d27 100644
+--- a/django/db/backends/mysql/base.py
++++ b/django/db/backends/mysql/base.py
+@@ -199,10 +199,19 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+         settings_dict = self.settings_dict
+         if settings_dict['USER']:
+             kwargs['user'] = settings_dict['USER']
++        # Use the new mysqlclient kwarg names: 'database' & 'password'.
++        # Normalize legacy OPTIONS keys ('db' / 'passwd') to the newer names
++        # so users that still set the old keys in OPTIONS are supported.
++        options = settings_dict['OPTIONS'].copy()
++        if 'db' in options and 'database' not in options:
++            options['database'] = options.pop('db')
++        if 'passwd' in options and 'password' not in options:
++            options['password'] = options.pop('passwd')
++
+         if settings_dict['NAME']:
+-            kwargs['db'] = settings_dict['NAME']
++            kwargs['database'] = settings_dict['NAME']
+         if settings_dict['PASSWORD']:
+-            kwargs['passwd'] = settings_dict['PASSWORD']
++            kwargs['password'] = settings_dict['PASSWORD']
+         if settings_dict['HOST'].startswith('/'):
+             kwargs['unix_socket'] = settings_dict['HOST']
+         elif settings_dict['HOST']:
+@@ -213,7 +222,8 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+         # "UPDATE", not the number of changed rows.
+         kwargs['client_flag'] = CLIENT.FOUND_ROWS
+         # Validate the transaction isolation level, if specified.
+-        options = settings_dict['OPTIONS'].copy()
++        # isolation_level was already popped from options above, so reuse our
++        # normalized copy here.
+         isolation_level = options.pop('isolation_level', 'read committed')
+         if isolation_level:
+             isolation_level = isolation_level.lower()
+@@ -225,6 +235,8 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+                         ', '.join("'%s'" % s for s in sorted(self.isolation_levels))
+                     ))
+         self.isolation_level = isolation_level
++        # Allow OPTIONS to override connection params; options now uses
++        # 'database'/'password' when present (legacy 'db'/'passwd' moved).
+         kwargs.update(options)
+         return kwargs
+ 
+diff --git a/django/db/backends/mysql/client.py b/django/db/backends/mysql/client.py
+index 95442a32b0..7ba8adbc28 100644
+--- a/django/db/backends/mysql/client.py
++++ b/django/db/backends/mysql/client.py
+@@ -8,7 +8,11 @@ class DatabaseClient(BaseDatabaseClient):
+     def settings_to_cmd_args_env(cls, settings_dict, parameters):
+         args = [cls.executable_name]
+         env = None
+-        db = settings_dict['OPTIONS'].get('db', settings_dict['NAME'])
++        # Prefer the newer 'database' option, fall back to legacy 'db'
++        db = settings_dict['OPTIONS'].get(
++            'database',
++            settings_dict['OPTIONS'].get('db', settings_dict['NAME']),
++        )
+         user = settings_dict['OPTIONS'].get('user', settings_dict['USER'])
+         password = settings_dict['OPTIONS'].get(
+             'password',

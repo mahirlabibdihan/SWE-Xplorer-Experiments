@@ -1,0 +1,86 @@
+diff --git a/sklearn/linear_model/logistic.py b/sklearn/linear_model/logistic.py
+index e4ea696ce..a89c2fba3 100644
+--- a/sklearn/linear_model/logistic.py
++++ b/sklearn/linear_model/logistic.py
+@@ -922,7 +922,12 @@ def _log_reg_scoring_path(X, y, train, test, pos_class=None, Cs=10,
+         check_input=False, max_squared_sum=max_squared_sum,
+         sample_weight=sample_weight)
+ 
+-    log_reg = LogisticRegression(fit_intercept=fit_intercept)
++    # Ensure the temporary LogisticRegression used for scoring has the
++    # same multi_class setting as requested. Previously this used the
++    # default multi_class='ovr' which made probabilistic scorers (that
++    # call predict_proba) inconsistent with the multinomial option.
++    log_reg = LogisticRegression(fit_intercept=fit_intercept,
++                                 multi_class=multi_class)
+ 
+     # The score method of Logistic Regression has a classes_ attribute.
+     if multi_class == 'ovr':
+diff --git a/sklearn/linear_model/tests/test_logistic.py b/sklearn/linear_model/tests/test_logistic.py
+index 56be87f71..e85a2d7f1 100644
+--- a/sklearn/linear_model/tests/test_logistic.py
++++ b/sklearn/linear_model/tests/test_logistic.py
+@@ -263,6 +263,63 @@ def test_multinomial_binary_probabilities():
+     assert_almost_equal(proba, expected_proba)
+ 
+ 
++def test_log_reg_scoring_path_multinomial_proba():
++    # Regression test for ensuring that _log_reg_scoring_path uses the
++    # multinomial probability estimates when multi_class='multinomial'
++    # so that probabilistic scorers (eg. neg_log_loss) are consistent.
++    rng = np.random.RandomState(1234)
++    samples = 200
++    features = 5
++    folds = 10
++
++    X = rng.random_sample((samples, features))
++    y = rng.randint(0, 3, size=samples)
++
++    test_idx = rng.choice(range(samples), size=int(samples / float(folds)),
++                          replace=False)
++    train_idx = [i for i in range(samples) if i not in test_idx]
++
++    # Use neg_log_loss scorer
++    scorer = 'neg_log_loss'
++
++    from sklearn.linear_model.logistic import _log_reg_scoring_path
++    from sklearn.utils.extmath import softmax
++
++    coefs, Cs, scores, n_iter = _log_reg_scoring_path(
++        X, y, train_idx, test_idx, fit_intercept=True,
++        scoring=scorer, multi_class='multinomial')
++
++    # choose first C
++    c_index = 0
++    w = coefs[c_index]
++
++    # Build decision function on test set
++    X_test = X[test_idx]
++    # w has shape (n_classes, n_features + 1)
++    decision = np.dot(X_test, w[:, :-1].T) + w[:, -1]
++
++    # multinomial probabilities via softmax
++    probs_multi = softmax(decision)
++
++    # OvR-like probabilities: sigmoid on each column then renormalize
++    probs_ovr = 1. / (1. + np.exp(-decision))
++    probs_ovr = probs_ovr / probs_ovr.sum(axis=1)[:, np.newaxis]
++
++    # compute neg_log_loss scores (sklearn metrics.log_loss returns positive
++    # log loss so scorer is negative of that)
++    from sklearn.metrics import log_loss
++
++    y_test = y[test_idx]
++    # labels are 0,1,2
++    loss_multi = -log_loss(y_test, probs_multi, labels=[0, 1, 2])
++    loss_ovr = -log_loss(y_test, probs_ovr, labels=[0, 1, 2])
++
++    # score returned by _log_reg_scoring_path should equal multinomial score
++    assert_almost_equal(scores[c_index], loss_multi)
++    # And it should differ from the OvR-derived score in at least some cases
++    assert not np.allclose(loss_multi, loss_ovr)
++
++
+ def test_sparsify():
+     # Test sparsify and densify members.
+     n_samples, n_features = iris.data.shape

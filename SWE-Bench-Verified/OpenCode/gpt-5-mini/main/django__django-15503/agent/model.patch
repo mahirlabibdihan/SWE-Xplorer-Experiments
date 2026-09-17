@@ -1,0 +1,86 @@
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index fdca700c9d..3a1cad39b5 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -126,16 +126,31 @@ class JSONField(CheckFieldDefaultMixin, Field):
+         )
+ 
+ 
+-def compile_json_path(key_transforms, include_root=True):
++def compile_json_path(key_transforms, include_root=True, force_string_keys=False):
++    """
++    Compile a JSON path from a sequence of key transforms.
++
++    If force_string_keys is True, numeric-looking keys are treated as
++    object member names (i.e. quoted) rather than array indices. This is
++    necessary for some backends (SQLite, MySQL, Oracle) where a path
++    component like [1] is interpreted as an array index and won't match
++    an object property named "1".
++    """
+     path = ["$"] if include_root else []
+     for key_transform in key_transforms:
+-        try:
+-            num = int(key_transform)
+-        except ValueError:  # non-integer
++        if not force_string_keys:
++            try:
++                num = int(key_transform)
++            except (ValueError, TypeError):  # non-integer
++                path.append(".")
++                path.append(json.dumps(key_transform))
++            else:
++                path.append("[%s]" % num)
++        else:
++            # Force treating the key as a string (object member), not an
++            # array index, even if it looks numeric.
+             path.append(".")
+             path.append(json.dumps(key_transform))
+-        else:
+-            path.append("[%s]" % num)
+     return "".join(path)
+ 
+ 
+@@ -193,11 +208,19 @@ class HasKeyLookup(PostgresOperatorLookup):
+                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+             else:
+                 rhs_key_transforms = [key]
++            # For some backends (SQLite, MySQL, Oracle) numeric-looking
++            # keys in object members must be treated as strings (quoted)
++            # rather than array indices. PostgreSQL's JSON operators treat
++            # numeric-looking keys as object member names, so keep the
++            # original behaviour there.
++            force_string_keys = connection.vendor != "postgresql"
+             rhs_params.append(
+                 "%s%s"
+                 % (
+                     lhs_json_path,
+-                    compile_json_path(rhs_key_transforms, include_root=False),
++                    compile_json_path(
++                        rhs_key_transforms, include_root=False, force_string_keys=force_string_keys
++                    ),
+                 )
+             )
+         # Add condition for each key.
+diff --git a/tests/model_fields/test_jsonfield.py b/tests/model_fields/test_jsonfield.py
+index dfd00f4745..1023321052 100644
+--- a/tests/model_fields/test_jsonfield.py
++++ b/tests/model_fields/test_jsonfield.py
+@@ -549,6 +549,18 @@ class TestQuerying(TestCase):
+                     [expected],
+                 )
+ 
++    def test_has_key_numeric_string(self):
++        # Regression test for numeric-looking object keys on backends where
++        # JSON path numeric components are treated as array indices
++        # (SQLite/MySQL/Oracle). Ensure that a string key that looks like a
++        # number is found by has_key lookup.
++        a = NullableJSONModel.objects.create(value={"foo": "bar"})
++        b = NullableJSONModel.objects.create(value={"1111": "bar"})
++        c1 = NullableJSONModel.objects.filter(value__has_key="foo").count()
++        c2 = NullableJSONModel.objects.filter(value__has_key="1111").count()
++        self.assertEqual(c1, 1)
++        self.assertEqual(c2, 1)
++
+     def test_has_key_list(self):
+         obj = NullableJSONModel.objects.create(value=[{"a": 1}, {"b": "x"}])
+         tests = [

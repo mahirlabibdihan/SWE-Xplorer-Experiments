@@ -1,0 +1,53 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index 13a6809dd8..fe43306bc7 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -410,6 +410,23 @@ class Query(BaseExpression):
+             aggregate = aggregate_expr.resolve_expression(
+                 self, allow_joins=True, reuse=None, summarize=True
+             )
++            # Aggregates over window expressions are not supported. Detect
++            # direct usage of an OVER clause inside the aggregate or
++            # references to annotation names that contain window expressions
++            # and raise an explicit error to avoid producing SQL that would
++            # cause the database to error (e.g. Postgres: "aggregate
++            # function calls cannot contain window function calls").
++            if getattr(aggregate, "contains_over_clause", False):
++                raise NotSupportedError(
++                    "Cannot aggregate over window expressions (%s)." % alias
++                )
++            for ref in aggregate.get_refs():
++                if ref in self.annotations and getattr(
++                    self.annotations[ref], "contains_over_clause", False
++                ):
++                    raise NotSupportedError(
++                        "Cannot aggregate over window expressions (%s)." % alias
++                    )
+             if not aggregate.contains_aggregate:
+                 raise TypeError("%s is not an aggregate expression" % alias)
+             # Temporarily add aggregate to annotations to allow remaining
+diff --git a/tests/expressions_window/tests.py b/tests/expressions_window/tests.py
+index 3a02a36707..9ddc25bc3a 100644
+--- a/tests/expressions_window/tests.py
++++ b/tests/expressions_window/tests.py
+@@ -1174,6 +1174,20 @@ class WindowFunctionTests(TestCase):
+         self.assertEqual(sql.count("select"), 3)
+         self.assertNotIn("group by", sql)
+ 
++    def test_aggregate_over_window_raises(self):
++        """
++        Aggregating over a window annotation is not supported and should raise
++        NotSupportedError instead of generating invalid SQL that the database
++        would reject.
++        """
++        qs = Employee.objects.annotate(
++            cumul_salary=Window(
++                expression=Sum("salary"), order_by=F("hire_date").asc()
++            )
++        )
++        with self.assertRaisesMessage(NotSupportedError, "Cannot aggregate over window expressions"):
++            qs.aggregate(total=Sum("salary"), cumul_total=Sum("cumul_salary"))
++
+     @skipUnlessDBFeature("supports_frame_range_fixed_distance")
+     def test_range_n_preceding_and_following(self):
+         qs = Employee.objects.annotate(

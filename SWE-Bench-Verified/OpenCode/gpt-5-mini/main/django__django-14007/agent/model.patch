@@ -1,0 +1,87 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 55b1691166..735270ae43 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -871,7 +871,20 @@ class Model(metaclass=ModelBase):
+             returning_fields = meta.db_returning_fields
+             results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+             if results:
++                # Apply any database converters for the returned fields (e.g.
++                # Field.from_db_value) before assigning to the instance. This
++                # mirrors the conversion path used when reading query results
++                # so that values returned from INSERT...RETURNING or last
++                # insert id lookups undergo the same processing.
++                connection = connections[using]
+                 for value, field in zip(results[0], returning_fields):
++                    # Backend and field converters may be provided. The
++                    # converter signature is converter(value, expression,
++                    # connection).
++                    backend_converters = connection.ops.get_db_converters(field)
++                    field_converters = field.get_db_converters(connection)
++                    for conv in backend_converters + field_converters:
++                        value = conv(value, field, connection)
+                     setattr(self, field.attname, value)
+         return updated
+ 
+diff --git a/tests/from_db_value/models.py b/tests/from_db_value/models.py
+index 58e8ec3a27..eed5091124 100644
+--- a/tests/from_db_value/models.py
++++ b/tests/from_db_value/models.py
+@@ -21,3 +21,25 @@ class CashField(models.DecimalField):
+ 
+ class CashModel(models.Model):
+     cash = CashField()
++
++
++# A custom AutoField subclass that wraps integer PKs using a helper class.
++class MyIntWrapper(int):
++    def __repr__(self):
++        return f"<MyIntWrapper: {int(self)}>"
++
++
++class MyAutoField(models.BigAutoField):
++    def from_db_value(self, value, expression, connection):
++        if value is None:
++            return None
++        return MyIntWrapper(value)
++
++    def get_prep_value(self, value):
++        if value is None:
++            return None
++        return int(value)
++
++
++class AutoModel(models.Model):
++    id = MyAutoField(primary_key=True)
+diff --git a/tests/from_db_value/tests.py b/tests/from_db_value/tests.py
+index ab92f37ccf..ed67da2140 100644
+--- a/tests/from_db_value/tests.py
++++ b/tests/from_db_value/tests.py
+@@ -2,7 +2,7 @@ from django.db import connection
+ from django.db.models import Max
+ from django.test import TestCase
+ 
+-from .models import Cash, CashModel
++from .models import Cash, CashModel, AutoModel, MyIntWrapper
+ 
+ 
+ class FromDBValueTest(TestCase):
+@@ -33,3 +33,18 @@ class FromDBValueTest(TestCase):
+     def test_connection(self):
+         instance = CashModel.objects.get()
+         self.assertEqual(instance.cash.vendor, connection.vendor)
++
++    def test_auto_field_from_db_value_on_create(self):
++        """Ensure that from_db_value is applied to auto PKs returned on create."""
++        am = AutoModel.objects.create()
++        # The id should be wrapped by MyIntWrapper by the field's from_db_value
++        self.assertIsInstance(am.id, MyIntWrapper)
++
++    def test_auto_field_from_db_value_on_bulk_create(self):
++        """Ensure bulk_create populates returned PKs using from_db_value."""
++        # Some backends don't return rows for bulk_create; skip if no id is set.
++        am = AutoModel()
++        AutoModel.objects.bulk_create([am])
++        # If the backend set an id, it should have been converted.
++        if am.id is not None:
++            self.assertIsInstance(am.id, MyIntWrapper)

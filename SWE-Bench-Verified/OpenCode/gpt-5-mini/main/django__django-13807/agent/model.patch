@@ -1,0 +1,79 @@
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index 2eeaf98c0d..53abb9de4c 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -326,20 +326,34 @@ class DatabaseWrapper(BaseDatabaseWrapper):
+                 if table_names is None:
+                     violations = cursor.execute('PRAGMA foreign_key_check').fetchall()
+                 else:
++                    def _quote_identifier(identifier):
++                        # Quote the identifier with double quotes and escape any
++                        # embedded double quotes by doubling them. This produces a
++                        # valid SQL identifier for SQLite (e.g. "order").
++                        return '"%s"' % identifier.replace('"', '""')
++
+                     violations = chain.from_iterable(
+-                        cursor.execute('PRAGMA foreign_key_check(%s)' % table_name).fetchall()
++                        cursor.execute('PRAGMA foreign_key_check(%s)' % _quote_identifier(table_name)).fetchall()
+                         for table_name in table_names
+                     )
+                 # See https://www.sqlite.org/pragma.html#pragma_foreign_key_check
+                 for table_name, rowid, referenced_table_name, foreign_key_index in violations:
++                    quoted_table = '"%s"' % table_name.replace('"', '""')
+                     foreign_key = cursor.execute(
+-                        'PRAGMA foreign_key_list(%s)' % table_name
++                        'PRAGMA foreign_key_list(%s)' % quoted_table
+                     ).fetchall()[foreign_key_index]
+                     column_name, referenced_column_name = foreign_key[3:5]
+                     primary_key_column_name = self.introspection.get_primary_key_column(cursor, table_name)
++                    # Quote the table name for the SELECT as well. The
++                    # primary key and column names are column identifiers and
++                    # should be safe to inject here as they originate from
++                    # introspection, but we still keep them unquoted so the
++                    # SQL remains simple. The table name must be quoted to
++                    # avoid syntax errors on reserved words.
++                    quoted_table = '"%s"' % table_name.replace('"', '""')
+                     primary_key_value, bad_value = cursor.execute(
+                         'SELECT %s, %s FROM %s WHERE rowid = %%s' % (
+-                            primary_key_column_name, column_name, table_name
++                            primary_key_column_name, column_name, quoted_table
+                         ),
+                         (rowid,),
+                     ).fetchone()
+diff --git a/tests/backends/tests.py b/tests/backends/tests.py
+index ed1847ede5..1b9cba62fc 100644
+--- a/tests/backends/tests.py
++++ b/tests/backends/tests.py
+@@ -625,6 +625,32 @@ class FkConstraintsTests(TransactionTestCase):
+                     connection.check_constraints()
+             transaction.set_rollback(True)
+ 
++    @skipUnlessDBFeature('supports_pragma_foreign_key_check')
++    def test_check_constraints_reserved_table_name(self):
++        """
++        Ensure check_constraints works when a table name is an SQL reserved
++        word (e.g. "order"). Regression test for quoting table names in
++        PRAGMA statements.
++        """
++        from django.db import connection as conn
++        with conn.cursor() as cursor:
++            # Create referenced and referring tables. Use explicit table name
++            # "order" which is a SQL keyword.
++            cursor.execute('CREATE TABLE "ref_for_order" (id integer primary key)')
++            cursor.execute(
++                'CREATE TABLE "order" (id integer primary key, ref_id integer, '
++                'FOREIGN KEY(ref_id) REFERENCES "ref_for_order"(id))'
++            )
++            # Insert a row with a bad foreign key reference.
++            cursor.execute('INSERT INTO "order" (id, ref_id) VALUES (1, 999)')
++        try:
++            with self.assertRaises(IntegrityError):
++                conn.check_constraints(table_names=['order'])
++        finally:
++            with conn.cursor() as cursor:
++                cursor.execute('DROP TABLE IF EXISTS "order"')
++                cursor.execute('DROP TABLE IF EXISTS "ref_for_order"')
++
+ 
+ class ThreadTests(TransactionTestCase):
+ 

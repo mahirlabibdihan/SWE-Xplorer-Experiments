@@ -1,0 +1,72 @@
+diff --git a/django/db/backends/ddl_references.py b/django/db/backends/ddl_references.py
+index 44e49806f8..ee24dadeee 100644
+--- a/django/db/backends/ddl_references.py
++++ b/django/db/backends/ddl_references.py
+@@ -84,9 +84,11 @@ class Columns(TableColumns):
+     def __str__(self):
+         def col_str(column, idx):
+             try:
+-                return self.quote_name(column) + self.col_suffixes[idx]
++                suffix = self.col_suffixes[idx]
+             except IndexError:
+-                return self.quote_name(column)
++                suffix = ''
++            # Add a separating space only when there is a suffix (eg. 'DESC').
++            return '%s%s' % (self.quote_name(column), (' ' + suffix) if suffix else '')
+ 
+         return ', '.join(col_str(column, idx) for idx, column in enumerate(self.columns))
+ 
+@@ -112,11 +114,16 @@ class IndexColumns(Columns):
+         def col_str(column, idx):
+             # Index.__init__() guarantees that self.opclasses is the same
+             # length as self.columns.
+-            col = '{} {}'.format(self.quote_name(column), self.opclasses[idx])
++            # Only include opclass when it's truthy.
++            opclass = self.opclasses[idx]
++            col = '%s%s' % (self.quote_name(column), (' ' + opclass) if opclass else '')
+             try:
+-                col = '{} {}'.format(col, self.col_suffixes[idx])
++                suffix = self.col_suffixes[idx]
+             except IndexError:
+-                pass
++                suffix = ''
++            # Add a separating space only when there is a suffix (eg. 'DESC').
++            if suffix:
++                col = '%s %s' % (col, suffix)
+             return col
+ 
+         return ', '.join(col_str(column, idx) for idx, column in enumerate(self.columns))
+diff --git a/tests/indexes/tests.py b/tests/indexes/tests.py
+index 588feaddff..d38bccf572 100644
+--- a/tests/indexes/tests.py
++++ b/tests/indexes/tests.py
+@@ -223,6 +223,29 @@ class SchemaIndexesPostgreSQLTests(TransactionTestCase):
+             cursor.execute(self.get_opclass_query % indexname)
+             self.assertCountEqual(cursor.fetchall(), [('text_pattern_ops', indexname)])
+ 
++    def test_create_index_whitespace_formatting(self):
++        """Ensure spacing is correct for opclasses and ordering."""
++        indexname = 'test_whitespace'
++        # opclasses without explicit ordering (ascending) should not leave a
++        # trailing space after the opclass.
++        index = Index(
++            name=indexname,
++            fields=['body'],
++            opclasses=['text_pattern_ops'],
++        )
++        editor = connection.schema_editor()
++        sql = str(index.create_sql(IndexedArticle2, editor))
++        # Should contain: ("body" text_pattern_ops)
++        self.assertIn('("body" text_pattern_ops)', sql)
++        # Descending ordering should have a space before DESC
++        index_desc = Index(
++            name='test_whitespace_desc',
++            fields=['-body'],
++            opclasses=['text_pattern_ops'],
++        )
++        sql_desc = str(index_desc.create_sql(IndexedArticle2, editor))
++        self.assertIn('("body" text_pattern_ops DESC)', sql_desc)
++
+ 
+ @skipUnless(connection.vendor == 'mysql', 'MySQL tests')
+ class SchemaIndexesMySQLTests(TransactionTestCase):

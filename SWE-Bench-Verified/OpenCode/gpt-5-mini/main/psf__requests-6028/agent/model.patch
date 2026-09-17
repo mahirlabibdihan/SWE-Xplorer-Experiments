@@ -1,0 +1,83 @@
+diff --git a/requests/auth.py b/requests/auth.py
+index eeface39..c219000b 100644
+--- a/requests/auth.py
++++ b/requests/auth.py
+@@ -28,14 +28,13 @@ CONTENT_TYPE_MULTI_PART = 'multipart/form-data'
+ def _basic_auth_str(username, password):
+     """Returns a Basic Auth string."""
+ 
+-    # "I want us to put a big-ol' comment on top of it that
+-    # says that this behaviour is dumb but we need to preserve
+-    # it because people are relying on it."
+-    #    - Lukasa
+-    #
+-    # These are here solely to maintain backwards compatibility
+-    # for things like ints. This will be removed in 3.0.0.
+-    if not isinstance(username, basestring):
++    # Treat None as an empty string (no password) rather than converting it
++    # to the string "None". For other non-string types (ints, etc.) preserve
++    # the backwards-compatible behaviour of coercing them to str with a
++    # deprecation warning.
++    if username is None:
++        username = ''
++    elif not isinstance(username, basestring):
+         warnings.warn(
+             "Non-string usernames will no longer be supported in Requests "
+             "3.0.0. Please convert the object you've passed in ({!r}) to "
+@@ -45,7 +44,9 @@ def _basic_auth_str(username, password):
+         )
+         username = str(username)
+ 
+-    if not isinstance(password, basestring):
++    if password is None:
++        password = ''
++    elif not isinstance(password, basestring):
+         warnings.warn(
+             "Non-string passwords will no longer be supported in Requests "
+             "3.0.0. Please convert the object you've passed in ({!r}) to "
+diff --git a/requests/utils.py b/requests/utils.py
+index 1c2ae4e0..6832f140 100644
+--- a/requests/utils.py
++++ b/requests/utils.py
+@@ -990,12 +990,19 @@ def get_auth_from_url(url):
+     """
+     parsed = urlparse(url)
+ 
++    # parsed.username / parsed.password may be None when not present in the
++    # URL. Handle them individually to avoid losing the username when the
++    # password is missing (which could otherwise trigger the except block and
++    # return empty strings for both values).
++    username = parsed.username if parsed.username is not None else ''
++    password = parsed.password if parsed.password is not None else ''
++
+     try:
+-        auth = (unquote(parsed.username), unquote(parsed.password))
++        return (unquote(username), unquote(password))
+     except (AttributeError, TypeError):
+-        auth = ('', '')
+-
+-    return auth
++        # In the unlikely event unquote() raises for these values, fall back
++        # to empty strings rather than propagating the error.
++        return ('', '')
+ 
+ 
+ # Moved outside of function to avoid recompile every call
+diff --git a/tests/test_requests.py b/tests/test_requests.py
+index 29b3aca8..14716b82 100644
+--- a/tests/test_requests.py
++++ b/tests/test_requests.py
+@@ -1896,6 +1896,13 @@ class TestRequests:
+         headers = adapter.proxy_headers("http://user:@httpbin.org")
+         assert headers == {'Proxy-Authorization': 'Basic dXNlcjo='}
+ 
++    def test_proxy_auth_no_password(self):
++        # When the URL contains a username but no ':'/password (e.g. "http://user@host")
++        # we should treat that as an empty password, not lose the username.
++        adapter = HTTPAdapter()
++        headers = adapter.proxy_headers("http://user@httpbin.org")
++        assert headers == {'Proxy-Authorization': 'Basic dXNlcjo='}
++
+     def test_response_json_when_content_is_None(self, httpbin):
+         r = requests.get(httpbin('/status/204'))
+         # Make sure r.content is None

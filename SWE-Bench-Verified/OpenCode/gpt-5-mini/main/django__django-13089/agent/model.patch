@@ -1,0 +1,73 @@
+diff --git a/django/core/cache/backends/db.py b/django/core/cache/backends/db.py
+index 33c79c5a14..ac6ffbdb11 100644
+--- a/django/core/cache/backends/db.py
++++ b/django/core/cache/backends/db.py
+@@ -267,9 +267,16 @@ class DatabaseCache(BaseDatabaseCache):
+                 cursor.execute(
+                     connection.ops.cache_key_culling_sql() % table,
+                     [cull_num])
++                # cursor.fetchone() may return None if the previous query
++                # didn't yield any rows (e.g. OFFSET was past the end of
++                # the result set). Guard against that to avoid
++                # "'NoneType' object is not subscriptable" errors.
++                row = cursor.fetchone()
++                if not row:
++                    return
+                 cursor.execute("DELETE FROM %s "
+                                "WHERE cache_key < %%s" % table,
+-                               [cursor.fetchone()[0]])
++                               [row[0]])
+ 
+     def clear(self):
+         db = router.db_for_write(self.cache_model_class)
+diff --git a/tests/cache/tests.py b/tests/cache/tests.py
+index d404475e16..dc44c88e83 100644
+--- a/tests/cache/tests.py
++++ b/tests/cache/tests.py
+@@ -621,6 +621,46 @@ class BaseCacheTests:
+     def test_zero_cull(self):
+         self._perform_cull_test('zero_cull', 50, 19)
+ 
++    def test_cull_query_no_result_is_handled(self):
++        """Ensure _cull handles the case where the culling SELECT returns no rows.
++
++        This simulates the cursor.fetchone() returning None for the
++        cache_key_culling_sql() query; the code should not raise and should
++        not attempt to delete using a None value.
++        """
++        from django.core.cache.backends.db import DatabaseCache
++        from datetime import datetime
++
++        class FakeCursor:
++            def __init__(self):
++                self.executed = []
++                self._fetch_calls = 0
++
++            def execute(self, sql, params=None):
++                self.executed.append((sql, params))
++                # no-op; behavior controlled via fetchone
++
++            def fetchone(self):
++                # First fetchone() is for SELECT COUNT(*) -> return a large
++                # number so culling logic continues. The next fetchone()
++                # simulates a missing row (None).
++                self._fetch_calls += 1
++                if self._fetch_calls == 1:
++                    return (10,)
++                return None
++
++        cache = DatabaseCache('cache_table_for_test', params={})
++        # Make the cache think it has a very small max so culling triggers.
++        cache._max_entries = 1
++        cache._cull_frequency = 3
++
++        fake_cursor = FakeCursor()
++        # Should not raise
++        cache._cull('default', fake_cursor, datetime.now())
++        # Ensure the cache_key_culling_sql() was executed (the second SQL)
++        found = any('ORDER BY cache_key' in (sql or '') for sql, _ in fake_cursor.executed)
++        self.assertTrue(found)
++
+     def _perform_invalid_key_test(self, key, expected_warning):
+         """
+         All the builtin backends should warn (except memcached that should

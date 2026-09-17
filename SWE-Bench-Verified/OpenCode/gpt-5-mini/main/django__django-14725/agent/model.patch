@@ -1,0 +1,120 @@
+diff --git a/django/forms/formsets.py b/django/forms/formsets.py
+index 75b0646512..e8f5e0e684 100644
+--- a/django/forms/formsets.py
++++ b/django/forms/formsets.py
+@@ -478,7 +478,7 @@ class BaseFormSet(RenderableFormMixin):
+ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+                     can_delete=False, max_num=None, validate_max=False,
+                     min_num=None, validate_min=False, absolute_max=None,
+-                    can_delete_extra=True, renderer=None):
++                    can_delete_extra=True, can_create=True, renderer=None):
+     """Return a FormSet for the given form class."""
+     if min_num is None:
+         min_num = DEFAULT_MIN_NUM
+@@ -498,6 +498,7 @@ def formset_factory(form, formset=BaseFormSet, extra=1, can_order=False,
+         'extra': extra,
+         'can_order': can_order,
+         'can_delete': can_delete,
++        'can_create': can_create,
+         'can_delete_extra': can_delete_extra,
+         'min_num': min_num,
+         'max_num': max_num,
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 7effb202e3..039f7e03f6 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -568,6 +568,10 @@ class BaseModelFormSet(BaseFormSet):
+     A ``FormSet`` for editing a queryset and/or adding new objects to it.
+     """
+     model = None
++    # Whether creating new model instances via this formset is allowed.
++    # When False, any changed extra forms are considered invalid and will
++    # not be saved.
++    can_create = True
+ 
+     # Set of fields that must be unique among forms of this set.
+     unique_fields = set()
+@@ -681,6 +685,20 @@ class BaseModelFormSet(BaseFormSet):
+     save.alters_data = True
+ 
+     def clean(self):
++        # If creation of new objects is not allowed, ensure no extra form
++        # contains data that would create a new object. This prevents
++        # malicious clients from adding objects by posting additional data.
++        if not getattr(self, 'can_create', True):
++            for form in self.extra_forms:
++                # Ignore empty extra forms and forms marked for deletion.
++                if not form.has_changed():
++                    continue
++                if self.can_delete and self._should_delete_form(form):
++                    continue
++                raise ValidationError(
++                    "Adding new objects in this formset is not permitted.",
++                )
++
+         self.validate_unique()
+ 
+     def validate_unique(self):
+@@ -820,6 +838,9 @@ class BaseModelFormSet(BaseFormSet):
+             # object.
+             if self.can_delete and self._should_delete_form(form):
+                 continue
++            # If creation of new objects is not allowed, skip saving them.
++            if not getattr(self, 'can_create', True):
++                continue
+             self.new_objects.append(self.save_new(form, commit=commit))
+             if not commit:
+                 self.saved_forms.append(form)
+@@ -875,7 +896,7 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                          widgets=None, validate_max=False, localized_fields=None,
+                          labels=None, help_texts=None, error_messages=None,
+                          min_num=None, validate_min=False, field_classes=None,
+-                         absolute_max=None, can_delete_extra=True, renderer=None):
++                         absolute_max=None, can_delete_extra=True, can_create=True, renderer=None):
+     """Return a FormSet class for the given Django model class."""
+     meta = getattr(form, 'Meta', None)
+     if (getattr(meta, 'fields', fields) is None and
+@@ -894,7 +915,7 @@ def modelformset_factory(model, form=ModelForm, formfield_callback=None,
+                               can_order=can_order, can_delete=can_delete,
+                               validate_min=validate_min, validate_max=validate_max,
+                               absolute_max=absolute_max, can_delete_extra=can_delete_extra,
+-                              renderer=renderer)
++                              can_create=can_create, renderer=renderer)
+     FormSet.model = model
+     return FormSet
+ 
+diff --git a/tests/model_formsets/tests.py b/tests/model_formsets/tests.py
+index bb1a8a8a5e..c7191fca98 100644
+--- a/tests/model_formsets/tests.py
++++ b/tests/model_formsets/tests.py
+@@ -2021,3 +2021,30 @@ class TestModelFormsetOverridesTroughFormMeta(TestCase):
+         BookFormSet = modelformset_factory(Author, fields='__all__', renderer=renderer)
+         formset = BookFormSet()
+         self.assertEqual(formset.renderer, renderer)
++
++
++class ModelFormsetCreateTests(TestCase):
++    def test_modelformset_disallow_new_objects(self):
++        # Ensure that when can_create=False, extra forms with data are rejected
++        a1 = Author.objects.create(name='Alpha')
++        a2 = Author.objects.create(name='Beta')
++        qs = Author.objects.order_by('name')
++
++        FormSet = modelformset_factory(Author, fields='__all__', extra=1, can_create=False)
++
++        data = {
++            'form-TOTAL_FORMS': '3',
++            'form-INITIAL_FORMS': '2',
++            'form-MAX_NUM_FORMS': '',
++            'form-0-id': str(a1.id),
++            'form-0-name': a1.name,
++            'form-1-id': str(a2.id),
++            'form-1-name': a2.name,
++            # extra form filled in -> should be disallowed
++            'form-2-name': 'Gamma',
++        }
++        formset = FormSet(data=data, queryset=qs)
++        self.assertIs(formset.is_valid(), False)
++        self.assertEqual(formset.non_form_errors(), ['Adding new objects in this formset is not permitted.'])
++        # No new objects should have been created
++        self.assertEqual(Author.objects.count(), 2)

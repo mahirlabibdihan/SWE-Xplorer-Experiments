@@ -1,0 +1,60 @@
+diff --git a/sklearn/metrics/_ranking.py b/sklearn/metrics/_ranking.py
+index 0cdead923..dbdb5e3ae 100644
+--- a/sklearn/metrics/_ranking.py
++++ b/sklearn/metrics/_ranking.py
+@@ -1079,11 +1079,25 @@ def roc_curve(
+         tps = tps[optimal_idxs]
+         thresholds = thresholds[optimal_idxs]
+ 
+-    # Add an extra threshold position
+-    # to make sure that the curve starts at (0, 0)
++    # Add an extra threshold position to make sure that the curve starts
++    # at (0, 0). Historically this was implemented as
++    # `thresholds[0] + 1` which can produce values > 1 for probability
++    # estimates (which are in [0, 1]). For probability estimates it is
++    # preferable to use the next representable float above the maximum score
++    # so that the added threshold is strictly greater than any observed
++    # score while remaining numerically close to the scores.
+     tps = np.r_[0, tps]
+     fps = np.r_[0, fps]
+-    thresholds = np.r_[thresholds[0] + 1, thresholds]
++    # If scores look like probability estimates (all in [0, 1]) use the
++    # next floating-point value above the maximum score. Otherwise, keep the
++    # previous behaviour of adding 1.
++    max_score = thresholds[0]
++    if 0.0 <= max_score <= 1.0:
++        # np.nextafter returns the next representable float towards +inf
++        extra_threshold = np.nextafter(max_score, np.inf)
++    else:
++        extra_threshold = max_score + 1
++    thresholds = np.r_[extra_threshold, thresholds]
+ 
+     if fps[-1] <= 0:
+         warnings.warn(
+diff --git a/sklearn/metrics/tests/test_ranking.py b/sklearn/metrics/tests/test_ranking.py
+index f38f118c3..4c3203399 100644
+--- a/sklearn/metrics/tests/test_ranking.py
++++ b/sklearn/metrics/tests/test_ranking.py
+@@ -418,13 +418,20 @@ def test_roc_curve_drop_intermediate():
+     y_true = [0, 0, 0, 0, 1, 1]
+     y_score = [0.0, 0.2, 0.5, 0.6, 0.7, 1.0]
+     tpr, fpr, thresholds = roc_curve(y_true, y_score, drop_intermediate=True)
+-    assert_array_almost_equal(thresholds, [2.0, 1.0, 0.7, 0.0])
++    # The first threshold is set to a value strictly greater than the
++    # maximum score (previously implemented as +1). The remaining
++    # thresholds should match the expected values.
++    assert thresholds[0] > thresholds[1]
++    assert_array_almost_equal(thresholds[1:], [1.0, 0.7, 0.0])
+ 
+     # Test dropping thresholds with repeating scores
+     y_true = [0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]
+     y_score = [0.0, 0.1, 0.6, 0.6, 0.7, 0.8, 0.9, 0.6, 0.7, 0.8, 0.9, 0.9, 1.0]
+     tpr, fpr, thresholds = roc_curve(y_true, y_score, drop_intermediate=True)
+-    assert_array_almost_equal(thresholds, [2.0, 1.0, 0.9, 0.7, 0.6, 0.0])
++    # See comment above: only assert the relative ordering and the
++    # subsequent thresholds which are stable.
++    assert thresholds[0] > thresholds[1]
++    assert_array_almost_equal(thresholds[1:], [1.0, 0.9, 0.7, 0.6, 0.0])
+ 
+ 
+ def test_roc_curve_fpr_tpr_increasing():

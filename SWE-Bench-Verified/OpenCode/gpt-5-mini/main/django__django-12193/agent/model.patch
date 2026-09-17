@@ -1,0 +1,60 @@
+diff --git a/django/contrib/postgres/forms/array.py b/django/contrib/postgres/forms/array.py
+index 2e19cd574a..776d32080f 100644
+--- a/django/contrib/postgres/forms/array.py
++++ b/django/contrib/postgres/forms/array.py
+@@ -137,17 +137,21 @@ class SplitArrayWidget(forms.Widget):
+             self.widget.is_localized = self.is_localized
+         value = value or []
+         context['widget']['subwidgets'] = []
+-        final_attrs = self.build_attrs(attrs)
+-        id_ = final_attrs.get('id')
++        base_attrs = self.build_attrs(attrs)
++        id_ = base_attrs.get('id')
+         for i in range(max(len(value), self.size)):
+             try:
+                 widget_value = value[i]
+             except IndexError:
+                 widget_value = None
++            # Use a fresh attrs dict per subwidget to avoid widgets (e.g.
++            # CheckboxInput) mutating the attrs dict passed to them which
++            # would affect subsequent subwidgets. See ticket for details.
++            widget_attrs = {**base_attrs}
+             if id_:
+-                final_attrs = {**final_attrs, 'id': '%s_%s' % (id_, i)}
++                widget_attrs['id'] = '%s_%s' % (id_, i)
+             context['widget']['subwidgets'].append(
+-                self.widget.get_context(name + '_%s' % i, widget_value, final_attrs)['widget']
++                self.widget.get_context(name + '_%s' % i, widget_value, widget_attrs)['widget']
+             )
+         return context
+ 
+diff --git a/tests/postgres_tests/test_array.py b/tests/postgres_tests/test_array.py
+index 481d93f830..cf79433e09 100644
+--- a/tests/postgres_tests/test_array.py
++++ b/tests/postgres_tests/test_array.py
+@@ -1124,6 +1124,25 @@ class TestSplitFormWidget(PostgreSQLWidgetTestCase):
+             )
+         )
+ 
++    def test_checkbox_input_does_not_leak_checked_between_subwidgets(self):
++        """CheckboxInput.get_context must not mutate the attrs passed to other
++        subwidgets. Ensure only the subwidget for a True value has the
++        'checked' attribute in its attrs dict.
++        """
++        widget = SplitArrayWidget(forms.CheckboxInput(), size=3)
++        # With explicit id in attrs
++        ctx = widget.get_context('array', [True, False, False], attrs={'id': 'foo'})
++        subattrs = [w['attrs'] for w in ctx['widget']['subwidgets']]
++        self.assertIn('checked', subattrs[0])
++        self.assertNotIn('checked', subattrs[1])
++        self.assertNotIn('checked', subattrs[2])
++
++        # Without explicit attrs (attrs is None)
++        ctx = widget.get_context('array', [True, False], attrs=None)
++        subattrs = [w['attrs'] for w in ctx['widget']['subwidgets']]
++        self.assertIn('checked', subattrs[0])
++        self.assertNotIn('checked', subattrs[1])
++
+     def test_value_omitted_from_data(self):
+         widget = SplitArrayWidget(forms.TextInput(), size=2)
+         self.assertIs(widget.value_omitted_from_data({}, {}, 'field'), True)

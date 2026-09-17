@@ -1,0 +1,58 @@
+diff --git a/django/forms/models.py b/django/forms/models.py
+index 5edbbd376f..66954f03d0 100644
+--- a/django/forms/models.py
++++ b/django/forms/models.py
+@@ -46,11 +46,16 @@ def construct_instance(form, instance, fields=None, exclude=None):
+             continue
+         if exclude and f.name in exclude:
+             continue
+-        # Leave defaults for fields that aren't in POST data, except for
+-        # checkbox inputs because they don't appear in POST data if not checked.
+-        if (f.has_default() and
+-                form[f.name].field.widget.value_omitted_from_data(form.data, form.files, form.add_prefix(f.name))):
+-            continue
++        # Previously, defaults on model fields were always preserved when the
++        # widget's value was omitted from the submitted data. This prevented
++        # any value placed into ``cleaned_data`` (for example, in Form.clean())
++        # from overwriting a model default. Allow cleaned_data to take
++        # precedence so that form cleaning can explicitly set or clear values
++        # even when the widget didn't submit a value.
++        #
++        # Note: widgets that truly omit data (like file inputs) will still be
++        # represented in cleaned_data (possibly as ``None``), and that value
++        # should be applied to the instance.
+         # Defer saving file-type fields until after the other fields, so a
+         # callable upload_to can use the values from other fields.
+         if isinstance(f, models.FileField):
+diff --git a/tests/model_forms/tests.py b/tests/model_forms/tests.py
+index 3893eb334c..ce2f84e481 100644
+--- a/tests/model_forms/tests.py
++++ b/tests/model_forms/tests.py
+@@ -2590,6 +2590,27 @@ class CustomCleanTests(TestCase):
+         category = form.save()
+         self.assertEqual(category.name, 'TEST')
+ 
++    def test_cleaned_data_overwrites_model_default(self):
++        """
++        Ensure values placed into cleaned_data override model defaults even when
++        the widget's value is omitted from POST data.
++        """
++        class PublicationDefaultsForm(forms.ModelForm):
++            class Meta:
++                model = PublicationDefaults
++                fields = ('title', 'mode')
++
++            def clean(self):
++                # Simulate logic that derives the mode value during cleaning.
++                self.cleaned_data['mode'] = 'de'
++                return self.cleaned_data
++
++        data = {'title': 'Test'}  # omit 'mode' from submitted data
++        form = PublicationDefaultsForm(data)
++        self.assertTrue(form.is_valid())
++        pub = form.save()
++        self.assertEqual(pub.mode, 'de')
++
+ 
+ class ModelFormInheritanceTests(SimpleTestCase):
+     def test_form_subclass_inheritance(self):

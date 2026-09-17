@@ -1,0 +1,58 @@
+diff --git a/django/forms/widgets.py b/django/forms/widgets.py
+index 40ac1d3162..9c8a200b69 100644
+--- a/django/forms/widgets.py
++++ b/django/forms/widgets.py
+@@ -659,8 +659,16 @@ class ChoiceWidget(Widget):
+ 
+     def format_value(self, value):
+         """Return selected values as a list."""
++        # For multiple-select widgets, None means no selection.
+         if value is None and self.allow_multiple_selected:
+             return []
++        # For single-select widgets (e.g. RadioSelect), if the widget is
++        # required and the value is None, prefer to return an empty list so
++        # that an implicit empty choice ("") is not auto-selected. This
++        # avoids radio widgets rendering the blank choice as checked for
++        # required fields.
++        if value is None and not self.allow_multiple_selected and getattr(self, 'is_required', False):
++            return []
+         if not isinstance(value, (tuple, list)):
+             value = [value]
+         return [str(v) if v is not None else '' for v in value]
+diff --git a/tests/model_forms/test_modelchoicefield.py b/tests/model_forms/test_modelchoicefield.py
+index 4a2ef30b90..830f75640c 100644
+--- a/tests/model_forms/test_modelchoicefield.py
++++ b/tests/model_forms/test_modelchoicefield.py
+@@ -7,7 +7,7 @@ from django.forms.widgets import CheckboxSelectMultiple
+ from django.template import Context, Template
+ from django.test import TestCase
+ 
+-from .models import Article, Author, Book, Category, Writer
++from .models import Article, Author, Book, Category, Writer, Award
+ 
+ 
+ class ModelChoiceFieldTests(TestCase):
+@@ -353,3 +353,23 @@ class ModelChoiceFieldTests(TestCase):
+         )
+         with self.assertNumQueries(2):
+             template.render(Context({'form': CategoriesForm()}))
++
++    def test_radioselect_does_not_select_blank_for_required_fk(self):
++        """RadioSelect should not auto-select the blank option for required
++        ModelChoiceFields that come from a ForeignKey with null=True, blank=False.
++        See the issue where the blank choice looked like a valid selected
++        option for radio widgets.
++        """
++        class AwardForm(forms.ModelForm):
++            class Meta:
++                model = Award
++                fields = ['character']
++                widgets = {'character': forms.RadioSelect}
++
++        form = AwardForm()
++        html = str(form['character'])
++        # The choices include a blank option, but it should not be selected.
++        self.assertIn('value=""', html)
++        # Ensure the blank option is not marked checked.
++        self.assertNotIn('value="" checked', html)
++        self.assertNotIn('value="" checked="checked"', html)

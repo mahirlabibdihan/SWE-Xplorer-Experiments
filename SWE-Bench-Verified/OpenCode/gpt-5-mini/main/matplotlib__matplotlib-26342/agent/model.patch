@@ -1,0 +1,132 @@
+diff --git a/lib/matplotlib/contour.py b/lib/matplotlib/contour.py
+index 3f84250b64..a3636ffd93 100644
+--- a/lib/matplotlib/contour.py
++++ b/lib/matplotlib/contour.py
+@@ -986,6 +986,80 @@ class ContourSet(ContourLabeler, mcoll.Collection):
+             self._transform = self._transform._as_mpl_transform(self.axes)
+         return self._transform
+ 
++    def set_paths(self, paths):
++        """Set the list of paths used by this ContourSet.
++
++        This mirrors the :meth:`Collection.set_paths` API and allows users to
++        replace the internal paths (for example, with transformed versions).
++        The axes data limits and sticky edges are updated to reflect the new
++        paths.  Any cached old-style split collections are removed so they can
++        be recreated from the new paths if requested.
++        """
++        # Accept any iterable; store as list for indexing.
++        self._paths = list(paths)
++        self.stale = True
++
++        # Remove any cached split-collections created by the deprecated
++        # ``collections`` property so they can be recreated from the new
++        # paths.  Also remove them from the axes to avoid leaving stale
++        # artists around.
++        if hasattr(self, "_old_style_split_collections"):
++            try:
++                for col in self._old_style_split_collections:
++                    try:
++                        col.remove()
++                    except Exception:
++                        # Fallback: try to remove from the axes' collection list.
++                        try:
++                            self.axes.collections.remove(col)
++                        except Exception:
++                            pass
++            finally:
++                delattr(self, "_old_style_split_collections")
++
++        # Update data limits based on the new paths.  Paths may be
++        # TransformedPath instances; handle those by asking for the
++        # fully-transformed path.
++        verts = []
++        for p in self._paths:
++            if hasattr(p, "vertices"):
++                v = p.vertices
++            elif isinstance(p, mtransforms.TransformedPath):
++                # get_fully_transformed_path returns a Path
++                v = p.get_fully_transformed_path().vertices
++            else:
++                # Best-effort: try to access a transformed path API
++                try:
++                    v = p.get_fully_transformed_path().vertices
++                except Exception:
++                    v = np.empty((0, 2))
++            if len(v):
++                verts.append(v)
++
++        if verts:
++            pts = np.concatenate(verts, axis=0)
++            self._mins = pts.min(axis=0)
++            self._maxs = pts.max(axis=0)
++            # Update sticky edges and axes limits
++            if self.axes is not None:
++                self.sticky_edges.x[:] = [self._mins[0], self._maxs[0]]
++                self.sticky_edges.y[:] = [self._mins[1], self._maxs[1]]
++                self.axes.update_datalim([self._mins, self._maxs])
++                # Request autoscale; match constructor behaviour
++                try:
++                    self.axes.autoscale_view(tight=True)
++                except Exception:
++                    # Some axes (in tests/mocks) may not support autoscale_view
++                    pass
++
++        # Changing paths can affect label placement/colors etc.; mark changed.
++        try:
++            self.changed()
++        except Exception:
++            # Don't let changed() errors break set_paths; leave the
++            # stale flag set so a later draw will update state.
++            pass
++
+     def __getstate__(self):
+         state = self.__dict__.copy()
+         # the C object _contour_generator cannot currently be pickled. This
+diff --git a/lib/matplotlib/tests/test_contour.py b/lib/matplotlib/tests/test_contour.py
+index b6ddb2830a..64c6a56021 100644
+--- a/lib/matplotlib/tests/test_contour.py
++++ b/lib/matplotlib/tests/test_contour.py
+@@ -11,6 +11,7 @@ import matplotlib as mpl
+ from matplotlib import pyplot as plt, rc_context, ticker
+ from matplotlib.colors import LogNorm, same_color
+ import matplotlib.patches as mpatches
++from matplotlib.path import Path
+ from matplotlib.testing.decorators import image_comparison
+ import pytest
+ 
+@@ -280,6 +281,34 @@ def test_corner_mask(split_collections):
+     _maybe_split_collections(split_collections)
+ 
+ 
++def test_contour_set_paths_updates_paths_and_datalim():
++    # Ensure that ContourSet.set_paths replaces internal paths and updates
++    # axes data limits.
++    fig, ax = plt.subplots()
++    x = np.linspace(0, 2, 3)
++    y = np.linspace(0, 2, 3)
++    X, Y = np.meshgrid(x, y)
++    Z = X + Y
++    cs = ax.contour(X, Y, Z)
++
++    old_xlim = ax.get_xlim()
++    # Create new paths by shifting existing ones far to the right so limits
++    # should expand.
++    orig_paths = cs.get_paths()
++    new_paths = []
++    for p in orig_paths:
++        if len(p.vertices):
++            verts = p.vertices + np.array([10.0, 0.0])
++            new_paths.append(Path(verts, p.codes if p.codes is not None else None))
++        else:
++            new_paths.append(Path(np.empty((0, 2))))
++
++    cs.set_paths(new_paths)
++    assert cs.get_paths() == new_paths
++    # Axes limits should have expanded to contain shifted data.
++    assert ax.get_xlim()[1] > old_xlim[1]
++
++
+ def test_contourf_decreasing_levels():
+     # github issue 5477.
+     z = [[0.1, 0.3], [0.5, 0.7]]

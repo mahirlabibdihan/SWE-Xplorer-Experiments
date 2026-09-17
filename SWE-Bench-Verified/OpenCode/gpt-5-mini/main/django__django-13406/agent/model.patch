@@ -1,0 +1,67 @@
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index b48d0df9c0..36a0e45f20 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -210,7 +210,24 @@ class QuerySet:
+ 
+     @query.setter
+     def query(self, value):
++        # When a Query object is assigned to a QuerySet, make sure the
++        # QuerySet's iterable class and fields reflect the semantics of the
++        # Query. For example, queries produced by values() expect the
++        # QuerySet to yield dicts, not model instances. Restoring a pickled
++        # Query into another QuerySet should therefore switch the iterable
++        # class to ValuesIterable when appropriate.
+         self._query = value
++        try:
++            # If this is a values() query, ensure we return dict-like rows.
++            if getattr(value, 'values_select', None):
++                self._iterable_class = ValuesIterable
++                # Clear any explicitly requested _fields; ValuesIterable will
++                # derive names from the query itself.
++                self._fields = None
++        except Exception:
++            # Be conservative: if anything goes wrong inspecting the query,
++            # leave the QuerySet as-is.
++            pass
+ 
+     def as_manager(cls):
+         # Address the circular dependency between `Queryset` and `Manager`.
+diff --git a/tests/queries/tests.py b/tests/queries/tests.py
+index f9a57b088a..721bcf3783 100644
+--- a/tests/queries/tests.py
++++ b/tests/queries/tests.py
+@@ -7,7 +7,7 @@ from threading import Lock
+ 
+ from django.core.exceptions import EmptyResultSet, FieldError
+ from django.db import DEFAULT_DB_ALIAS, connection
+-from django.db.models import Count, Exists, F, OuterRef, Q
++from django.db.models import Count, Exists, F, OuterRef, Q, Sum
+ from django.db.models.expressions import RawSQL
+ from django.db.models.sql.constants import LOUTER
+ from django.db.models.sql.where import NothingNode, WhereNode
+@@ -708,6 +708,24 @@ class Queries1Tests(TestCase):
+             ['<Annotation: a1>']
+         )
+ 
++    def test_pickled_query_restored_preserves_values(self):
++        """
++        Recreating a QuerySet by assigning a pickled Query to another
++        QuerySet should preserve values() semantics (i.e. return dicts
++        rather than model instances).
++        """
++        qs = Item.objects.values('creator__name').annotate(total_id=Sum('id'))
++        # Ensure original yields dicts
++        self.assertTrue(len(qs) > 0)
++        self.assertIsInstance(qs[0], dict)
++
++        # Assign the pickled query to a plain QuerySet and ensure it still
++        # yields dicts rather than model instances.
++        qs2 = Item.objects.all()
++        qs2.query = pickle.loads(pickle.dumps(qs.query))
++        self.assertTrue(len(qs2) > 0)
++        self.assertIsInstance(qs2[0], dict)
++
+     def test_tickets_7448_7707(self):
+         # Complex objects should be converted to strings before being used in
+         # lookups.

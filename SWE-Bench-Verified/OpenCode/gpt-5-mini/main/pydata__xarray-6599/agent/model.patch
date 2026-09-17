@@ -1,0 +1,209 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 823cbe02..5d0adb7e 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -1905,15 +1905,105 @@ def polyval(
+     coeffs = coeffs.reindex(
+         {degree_dim: np.arange(max_deg + 1)}, fill_value=0, copy=False
+     )
+-    coord = _ensure_numeric(coord)  # type: ignore # https://github.com/python/mypy/issues/1533 ?
++    # Convert the DataArray values to numeric for evaluation, but do not
++    # permanently replace any datetime-like coordinate variables on the
++    # original object: we will restore them on the result. Some coordinate
++    # variables (e.g., timedelta64) may otherwise participate in arithmetic
++    # accidentally which can lead to overflow or incorrect results.
++    # See issue: polyval with timedelta64 coordinates produces wrong results
++    # If the user passed a DataArray that has a coordinate variable for the
++    # same dimension (e.g., the common pattern of ``DataArray(data=datetimes,
++    # coords={dim: timedeltas})``) then we should evaluate the polynomial at
++    # the coordinate variable values (the index), not the DataArray.data. Use
++    # that coordinate variable for the numeric evaluation while keeping the
++    # original DataArray around so we can restore its labels on the result.
++    eval_coord = coord
++    if hasattr(coord, "dims") and len(coord.dims) == 1:
++        dim0 = coord.dims[0]
++        if dim0 in coord.coords:
++            # use the coordinate variable for evaluation
++            eval_coord = coord.coords[dim0]
++
++    coord_numeric = _ensure_numeric(eval_coord)  # type: ignore # https://github.com/python/mypy/issues/1533 ?
++
++    # Convert any datetime-like coordinate variables attached to `eval_coord`
++    # to numeric values on the numeric copy used for computation. Keep the
++    # originals to restore later.
++    orig_dt_coords = {}
++    for name, c in eval_coord.coords.items():
++        if getattr(c, "dtype", None) is not None and c.dtype.kind in "mM":
++            orig_dt_coords[name] = c
++            # convert coordinate variable to numeric (ns) on the working copy
++            try:
++                if c.dtype.kind == "m":
++                    # timedelta-like arrays: do not supply a datetime offset
++                    # (subtracting a datetime from a datetime is invalid).
++                    num = datetime_to_numeric(c.data, offset=None, datetime_unit="ns")
++                else:
++                    num = datetime_to_numeric(
++                        c.data, offset=np.datetime64("1970-01-01"), datetime_unit="ns"
++                    )
++            except Exception:
++                # fallback: use _ensure_numeric for the coordinate object
++                num = _ensure_numeric(c).data
++            coord_numeric = coord_numeric.copy()
++            coord_numeric.coords[name] = c.copy(data=num)
+ 
+     # using Horner's method
+     # https://en.wikipedia.org/wiki/Horner%27s_method
+-    res = coeffs.isel({degree_dim: max_deg}, drop=True) + zeros_like(coord)
++    res = coeffs.isel({degree_dim: max_deg}, drop=True) + zeros_like(coord_numeric)
+     for deg in range(max_deg - 1, -1, -1):
+-        res *= coord
++        res *= coord_numeric
+         res += coeffs.isel({degree_dim: deg}, drop=True)
+ 
++    # Reorder dimensions so that any dimensions from the coordinate object
++    # appear first (this matches historical behavior where broadcast
++    # dimensions come first).
++    try:
++        if hasattr(coord, "dims"):
++            new_order = tuple(coord.dims) + tuple(d for d in res.dims if d not in coord.dims)
++            res = res.transpose(*new_order, missing_dims="ignore")
++    except Exception:
++        # be defensive: skip transpose if it fails
++        pass
++
++    # Restore original datetime-like coordinate variables (if any) on the
++    # resulting DataArray/Dataset so that we preserve the original labels.
++    # If the user passed in a DataArray, prefer restoring the original
++    # DataArray.data as the index coordinate (common pattern: data holds the
++    # labelled datetimes while the coordinate variable holds timedeltas).
++    try:
++        if hasattr(coord, "dims") and len(coord.dims) == 1:
++            dim0 = coord.dims[0]
++            if hasattr(coord, "data") and getattr(coord.data, "dtype", None) is not None and coord.data.dtype.kind in "mM":
++                res.coords[dim0] = coord.data
++            elif dim0 in coord.coords:
++                res.coords[dim0] = coord.coords[dim0]
++    except Exception:
++        # be defensive: skip restoring if it fails
++        pass
++
++    # Also restore any datetime-like coord variables we converted on the
++    # evaluation object that appear on the result.
++    for name, orig in orig_dt_coords.items():
++        # If we already restored the main dimension coordinate from the
++        # original DataArray.data (above), don't overwrite it with the
++        # evaluation-coordinate we converted earlier (which might be a
++        # timedelta).
++        if (
++            hasattr(coord, "dims")
++            and len(coord.dims) == 1
++            and name == coord.dims[0]
++            and hasattr(coord, "data")
++            and getattr(coord.data, "dtype", None) is not None
++            and coord.data.dtype.kind in "mM"
++        ):
++            continue
++        try:
++            res.coords[name] = orig
++        except Exception:
++            pass
++
+     return res
+ 
+ 
+@@ -1934,13 +2024,23 @@ def _ensure_numeric(data: T_Xarray) -> T_Xarray:
+ 
+     def to_floatable(x: DataArray) -> DataArray:
+         if x.dtype.kind in "mM":
+-            return x.copy(
+-                data=datetime_to_numeric(
+-                    x.data,
+-                    offset=np.datetime64("1970-01-01"),
+-                    datetime_unit="ns",
+-                ),
+-            )
++            # Use a different offset strategy for timedelta vs datetime:
++            # - For timedelta (kind == 'm'), do not provide a datetime offset
++            #   since subtracting a datetime from a timedelta is invalid.
++            # - For datetime (kind == 'M'), use the UNIX epoch offset to
++            #   reduce round-off errors.
++            if x.dtype.kind == "m":
++                return x.copy(
++                    data=datetime_to_numeric(x.data, offset=None, datetime_unit="ns")
++                )
++            else:
++                return x.copy(
++                    data=datetime_to_numeric(
++                        x.data,
++                        offset=np.datetime64("1970-01-01"),
++                        datetime_unit="ns",
++                    ),
++                )
+         return x
+ 
+     if isinstance(data, Dataset):
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index 737ed82b..32ec90d2 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -2037,6 +2037,60 @@ def test_polyval_degree_dim_checks():
+         xr.polyval(x, coeffs.assign_coords(degree=coeffs.degree.astype(float)))
+ 
+ 
++def test_polyval_with_timedelta_coords_matches_expected():
++    # Regression test for: polyval with timedelta64 coordinates should
++    # produce the same numeric results as earlier releases.
++    import numpy as np
++
++    values = np.array(
++        [
++            "2021-04-01T05:25:19.000000000",
++            "2021-04-01T05:25:29.000000000",
++            "2021-04-01T05:25:39.000000000",
++            "2021-04-01T05:25:49.000000000",
++            "2021-04-01T05:25:59.000000000",
++            "2021-04-01T05:26:09.000000000",
++        ],
++        dtype="datetime64[ns]",
++    )
++    azimuth_time = xr.DataArray(
++        values, name="azimuth_time", coords={"azimuth_time": values - values[0]}
++    )
++
++    polyfit_coefficients = xr.DataArray(
++        [
++            [2.33333335e-43, 1.62499999e-43, 2.79166678e-43],
++            [-1.15316667e-30, 1.49518518e-31, 9.08833333e-31],
++            [-2.50272583e-18, -1.23851062e-18, -2.99098229e-18],
++            [5.83965193e-06, -1.53321770e-07, -4.84640242e-06],
++            [4.44739216e06, 1.45053974e06, 5.29960857e06],
++        ],
++        dims=("degree", "axis"),
++        coords={"axis": [0, 1, 2], "degree": [4, 3, 2, 1, 0]},
++    )
++
++    actual = xr.polyval(azimuth_time, polyfit_coefficients)
++
++    expected = xr.DataArray(
++        [
++            [4447392.16, 1450539.74, 5299608.57],
++            [4505537.25588366, 1448882.82238152, 5250846.359196],
++            [4563174.92026797, 1446979.12250014, 5201491.44401733],
++            [4620298.31815291, 1444829.59596699, 5151549.377964],
++            [4676900.67053846, 1442435.23739315, 5101025.78153601],
++            [4732975.25442459, 1439797.08038974, 5049926.34223336],
++        ],
++        dims=("azimuth_time", "axis"),
++        coords={
++            "azimuth_time": values,
++            "axis": [0, 1, 2],
++        },
++    )
++
++    # Allow a small relative tolerance
++    xr.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
++
++
+ @pytest.mark.parametrize("use_dask", [False, True])
+ @pytest.mark.parametrize(
+     "a, b, ae, be, dim, axis",

@@ -1,0 +1,84 @@
+diff --git a/lib/matplotlib/cm.py b/lib/matplotlib/cm.py
+index 38158db956..5f94324dab 100644
+--- a/lib/matplotlib/cm.py
++++ b/lib/matplotlib/cm.py
+@@ -76,7 +76,23 @@ class ColormapRegistry(Mapping):
+ 
+     def __getitem__(self, item):
+         try:
+-            return self._cmaps[item].copy()
++            # Return a copy so callers can modify the colormap without
++            # mutating the registry. The authoritative name for the
++            # colormap is the registry key; ensure the returned colormap's
++            # .name reflects that key. This avoids surprising behavior when
++            # a colormap instance with a different internal name is
++            # registered under another name (see GH issue where
++            # register_cmap(name='foo', cmap=some_cmap_named_bar) caused
++            # rcParams to be set to 'bar' after pyplot.set_cmap('foo')).
++            cmap = self._cmaps[item].copy()
++            try:
++                cmap.name = item
++            except Exception:
++                # Be conservative: if the Colormap implementation for some
++                # reason doesn't allow setting .name, fall back to the
++                # original copy.
++                pass
++            return cmap
+         except KeyError:
+             raise KeyError(f"{item!r} is not a known colormap name") from None
+ 
+diff --git a/lib/matplotlib/tests/test_colors.py b/lib/matplotlib/tests/test_colors.py
+index 2e841699cd..b7c1e315b5 100644
+--- a/lib/matplotlib/tests/test_colors.py
++++ b/lib/matplotlib/tests/test_colors.py
+@@ -117,6 +117,50 @@ def test_register_cmap():
+             cm.register_cmap('nome', cmap='not a cmap')
+ 
+ 
++def test_register_cmap_name_mismatch():
++    """Ensure that registering a Colormap instance under a different name
++    than its internal ``.name`` attribute works correctly.
++
++    Regression test for a case where pyplot.set_cmap would set rcParams
++    to the colormap object's internal name (cmap.name) instead of the
++    registered name, leading to lookup failures.
++    """
++    from matplotlib.colors import LinearSegmentedColormap
++
++    my_cmap_data = [[1.5e-03, 4.7e-04, 1.4e-02],
++                    [2.3e-03, 1.3e-03, 1.8e-02],
++                    [3.3e-03, 2.3e-03, 2.4e-02]]
++    # internal name differs from registry name
++    original_name = 'some_cmap_name'
++    registered_name = 'my_cmap_name'
++    my_cmap = LinearSegmentedColormap.from_list(original_name, my_cmap_data)
++
++    with pytest.warns(
++            mpl.MatplotlibDeprecationWarning,
++            match=r"matplotlib\.colormaps\.register\(name\)"
++    ):
++        cm.register_cmap(name=registered_name, cmap=my_cmap)
++
++    try:
++        # Using the pyplot API to set the colormap by the registered name
++        plt.set_cmap(registered_name)
++        # rcParam should reflect the registered name, not the internal name
++        assert mpl.rcParams['image.cmap'] == registered_name
++
++        # Creating an image should not raise and the image's cmap should
++        # report the registered name.
++        fig, ax = plt.subplots()
++        im = ax.imshow([[1, 1], [2, 2]])
++        assert im.get_cmap().name == registered_name
++        plt.close(fig)
++    finally:
++        with pytest.warns(
++                mpl.MatplotlibDeprecationWarning,
++                match=r"matplotlib\.colormaps\.unregister\(name\)"
++        ):
++            cm.unregister_cmap(registered_name)
++
++
+ def test_colormaps_get_cmap():
+     cr = mpl.colormaps
+ 

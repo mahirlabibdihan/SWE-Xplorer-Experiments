@@ -1,0 +1,49 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 4038859cfa..088d351766 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1297,8 +1297,19 @@ class Model(metaclass=ModelBase):
+ 
+     @classmethod
+     def _check_default_pk(cls):
++        # Don't warn when the primary key was auto-created for a multi-table
++        # inheritance parent link promoted to primary key. In that case the
++        # pk is an auto-created OneToOneField with remote_field.parent_link
++        # set to True and should not trigger the DEFAULT_AUTO_FIELD warning.
++        pk = cls._meta.pk
++        is_parent_link_pk = False
++        remote_field = getattr(pk, 'remote_field', None)
++        if remote_field is not None and getattr(remote_field, 'parent_link', False):
++            is_parent_link_pk = True
++
+         if (
+-            cls._meta.pk.auto_created and
++            pk.auto_created and
++            not is_parent_link_pk and
+             not settings.is_overridden('DEFAULT_AUTO_FIELD') and
+             not cls._meta.app_config._is_default_auto_field_overridden
+         ):
+diff --git a/tests/check_framework/test_model_checks.py b/tests/check_framework/test_model_checks.py
+index d4342ada07..bbefbeb252 100644
+--- a/tests/check_framework/test_model_checks.py
++++ b/tests/check_framework/test_model_checks.py
+@@ -408,6 +408,19 @@ class ModelDefaultAutoFieldTests(SimpleTestCase):
+ 
+         self.assertEqual(checks.run_checks(app_configs=self.apps.get_app_configs()), [])
+ 
++    def test_inherited_pk_no_warning(self):
++        """Ensure that a child model inheriting an explicit PK from a parent
++        does not trigger the DEFAULT_AUTO_FIELD warning (models.W042).
++        """
++        class Parent(models.Model):
++            id = models.BigAutoField(primary_key=True)
++
++        class Child(Parent):
++            pass
++
++        # Both models should not trigger the default pk warning.
++        self.assertEqual(checks.run_checks(app_configs=self.apps.get_app_configs()), [])
++
+     @isolate_apps('check_framework.apps.CheckPKConfig', kwarg_name='apps')
+     def test_app_default_auto_field(self, apps):
+         class ModelWithPkViaAppConfig(models.Model):

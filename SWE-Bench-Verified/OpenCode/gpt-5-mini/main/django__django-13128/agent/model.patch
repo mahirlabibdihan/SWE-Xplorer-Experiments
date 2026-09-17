@@ -1,0 +1,66 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index d913658291..523559cba8 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -473,6 +473,35 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
+         sql = connection.ops.combine_expression(self.connector, expressions)
+         return expression_wrapper % sql, expression_params
+ 
++    def _resolve_output_field(self):
++        """
++        Determine the output field for this combined expression.
++
++        Special-case temporal subtraction: Date/Time/DateTime - same-type Date/Time/DateTime
++        yields a DurationField. Otherwise, fall back to the generic
++        BaseExpression resolution logic.
++        """
++        # Temporal subtraction (Date/Time/DateTime - same type) -> DurationField
++        if self.connector == self.SUB:
++            try:
++                lhs_field = self.lhs._output_field_or_none
++            except Exception:
++                lhs_field = None
++            try:
++                rhs_field = self.rhs._output_field_or_none
++            except Exception:
++                rhs_field = None
++
++            if lhs_field is not None and rhs_field is not None:
++                lhs_type = lhs_field.get_internal_type()
++                rhs_type = rhs_field.get_internal_type()
++                datetime_types = {'DateField', 'DateTimeField', 'TimeField'}
++                if lhs_type == rhs_type and lhs_type in datetime_types:
++                    return fields.DurationField()
++
++        # Fallback to base behaviour
++        return super()._resolve_output_field()
++
+     def resolve_expression(self, query=None, allow_joins=True, reuse=None, summarize=False, for_save=False):
+         c = self.copy()
+         c.is_summary = summarize
+diff --git a/tests/expressions/tests.py b/tests/expressions/tests.py
+index 72f95f0194..8a9d925c52 100644
+--- a/tests/expressions/tests.py
++++ b/tests/expressions/tests.py
+@@ -1627,6 +1627,21 @@ class FTimeDeltaTests(TestCase):
+         for e in qs:
+             self.assertEqual(e.delta, delta)
+ 
++    @skipUnlessDBFeature('supports_temporal_subtraction')
++    def test_datetime_subtraction_without_expressionwrapper(self):
++        """Temporal subtraction should infer a DurationField without wrapping
++        the subtraction in an ExpressionWrapper. Regression test for
++        DateTimeField - DateTimeField -> DurationField being inferred.
++        """
++        # adding a zero timedelta ensures combined arithmetic with a
++        # DurationField on the RHS (no ExpressionWrapper around the
++        # subtraction)
++        qs = Experiment.objects.annotate(
++            delta=F('end') - F('start') + Value(datetime.timedelta(), output_field=DurationField())
++        )
++        for e in qs:
++            self.assertEqual(e.delta, e.end - e.start)
++
+     def test_duration_with_datetime(self):
+         # Exclude e1 which has very high precision so we can test this on all
+         # backends regardless of whether or not it supports

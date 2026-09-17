@@ -1,0 +1,54 @@
+diff --git a/django/db/migrations/recorder.py b/django/db/migrations/recorder.py
+index 1a37c6b7d0..ef6e4dbb4f 100644
+--- a/django/db/migrations/recorder.py
++++ b/django/db/migrations/recorder.py
+@@ -2,6 +2,7 @@ from django.apps.registry import Apps
+ from django.db import DatabaseError, models
+ from django.utils.functional import classproperty
+ from django.utils.timezone import now
++from django.db import router
+ 
+ from .exceptions import MigrationSchemaMissing
+ 
+@@ -62,6 +63,14 @@ class MigrationRecorder:
+         # in the codebase.
+         if self.has_table():
+             return
++        # If the router says migrations (for the migrations app) are not
++        # allowed on this connection, don't try to create the table.
++        # This mirrors how other migration operations consult the router.
++        if not router.allow_migrate_model(self.connection.alias, self.Migration):
++            raise MigrationSchemaMissing(
++                "Unable to create the django_migrations table because migrating is not "
++                "allowed on the '%s' database." % self.connection.alias
++            )
+         # Make the table
+         try:
+             with self.connection.schema_editor() as editor:
+diff --git a/tests/migrations/test_loader.py b/tests/migrations/test_loader.py
+index 03a98506e3..da41b47f9a 100644
+--- a/tests/migrations/test_loader.py
++++ b/tests/migrations/test_loader.py
+@@ -45,6 +45,22 @@ class RecorderTests(TestCase):
+             set(),
+         )
+ 
++    @override_settings(DATABASE_ROUTERS=['migrations.routers.TestRouter'])
++    def test_ensure_schema_respects_router(self):
++        """
++        The MigrationRecorder should not attempt to create the
++        django_migrations table on databases where the router disallows
++        migrating.
++        """
++        from django.db import connections
++        from django.db.migrations.exceptions import MigrationSchemaMissing
++
++        recorder = MigrationRecorder(connections['other'])
++        # The TestRouter disallows migrating non-tribble models on 'other',
++        # so ensure_schema() must not try to create the migration table.
++        with self.assertRaises(MigrationSchemaMissing):
++            recorder.ensure_schema()
++
+ 
+ class LoaderTests(TestCase):
+     """

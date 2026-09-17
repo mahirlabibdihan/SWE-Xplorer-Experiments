@@ -1,0 +1,85 @@
+diff --git a/django/db/backends/base/operations.py b/django/db/backends/base/operations.py
+index 2e283a3193..218256d46d 100644
+--- a/django/db/backends/base/operations.py
++++ b/django/db/backends/base/operations.py
+@@ -1,5 +1,6 @@
+ import datetime
+ import decimal
++from django.utils.dateparse import parse_duration
+ from importlib import import_module
+ 
+ import sqlparse
+@@ -579,8 +580,71 @@ class BaseDatabaseOperations:
+         return []
+ 
+     def convert_durationfield_value(self, value, expression, connection):
+-        if value is not None:
+-            return datetime.timedelta(0, 0, value)
++        """
++        Convert a value coming from the database into a datetime.timedelta.
++
++        Databases may return durations in several formats:
++        - An integer number of microseconds (int)
++        - A Decimal representing microseconds
++        - A string representation (e.g. produced by sqlite's custom function)
++        - A datetime.timedelta already
++
++        Be liberal in what we accept so duration-only expressions (e.g.
++        arithmetic that operates only on DurationField) work across backends.
++        """
++        if value is None:
++            return None
++        if isinstance(value, datetime.timedelta):
++            return value
++
++        # Bytes from some DB drivers -> decode to str
++        if isinstance(value, (bytes, bytearray)):
++            try:
++                value = value.decode()
++            except Exception:
++                # If decoding fails, fall through and try other conversions
++                pass
++
++        # Strings: try parsing as a duration first, then as an integer microseconds
++        if isinstance(value, str):
++            parsed = parse_duration(value)
++            if parsed is not None:
++                return parsed
++            try:
++                micros = int(value)
++            except (TypeError, ValueError):
++                micros = None
++            if micros is not None:
++                return datetime.timedelta(microseconds=micros)
++
++        # Decimal: typically returned by some backends for TIME_TO_SEC()-based
++        # calculations. Treat as microseconds.
++        if isinstance(value, decimal.Decimal):
++            try:
++                micros = int(value)
++            except (TypeError, ValueError, decimal.InvalidOperation):
++                micros = None
++            if micros is not None:
++                return datetime.timedelta(microseconds=micros)
++
++        # Float / int: treat as microseconds
++        if isinstance(value, float):
++            try:
++                micros = int(decimal.Decimal(str(value)))
++            except Exception:
++                micros = int(value)
++            return datetime.timedelta(microseconds=micros)
++
++        if isinstance(value, int):
++            return datetime.timedelta(microseconds=value)
++
++        # Fallback: try to coerce to int microseconds
++        try:
++            micros = int(value)
++        except Exception:
++            # Give up and return the original value
++            return value
++        return datetime.timedelta(microseconds=micros)
+ 
+     def check_expression_support(self, expression):
+         """

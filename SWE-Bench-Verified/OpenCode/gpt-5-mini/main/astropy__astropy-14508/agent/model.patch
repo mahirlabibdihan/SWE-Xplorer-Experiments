@@ -1,0 +1,73 @@
+diff --git a/astropy/io/fits/card.py b/astropy/io/fits/card.py
+index 118bfced8..5d0463af0 100644
+--- a/astropy/io/fits/card.py
++++ b/astropy/io/fits/card.py
+@@ -1299,6 +1299,41 @@ def _format_value(value):
+ 
+ def _format_float(value):
+     """Format a floating number to make sure it gets the decimal point."""
++    # Prefer Python's short string representation which uses the shortest
++    # round-trippable representation (PEP 3101 / David Gay's algorithm).
++    # This avoids unnecessarily long decimal expansions such as
++    # 0.009125 -> 0.009124999999999999 which can force comment truncation.
++    value_str = str(value)
++
++    # Normalize scientific notation to use 'E' and ensure a decimal point
++    # is present for integer-looking floats.
++    if "e" in value_str and "E" not in value_str:
++        value_str = value_str.replace("e", "E")
++
++    if "." not in value_str and "E" not in value_str:
++        value_str += ".0"
++
++    # Normalize exponent padding (E+002 vs E+02)
++    if "E" in value_str:
++        try:
++            significand, exponent = value_str.split("E")
++            if exponent and exponent[0] in ("+", "-"):
++                sign = exponent[0]
++                expnum = exponent[1:]
++            else:
++                sign = ""
++                expnum = exponent
++            value_str = f"{significand}E{sign}{int(expnum):02d}"
++        except Exception:
++            # If something odd happens, fall back to standard formatting
++            value_str = f"{value:.16G}"
++
++    # If the representation fits within the 20-character FITS field, use it.
++    if len(value_str) <= 20:
++        return value_str
++
++    # Otherwise fall back to the previous behavior using a high-precision
++    # general format and then trim/normalize as necessary.
+     value_str = f"{value:.16G}"
+     if "." not in value_str and "E" not in value_str:
+         value_str += ".0"
+diff --git a/astropy/io/fits/tests/test_header.py b/astropy/io/fits/tests/test_header.py
+index a8f4e1160..6c46fd2f8 100644
+--- a/astropy/io/fits/tests/test_header.py
++++ b/astropy/io/fits/tests/test_header.py
+@@ -137,6 +137,22 @@ class TestHeaderFunctions(FitsTestCase):
+         ):
+             assert str(c) == _pad("FLOATNUM= -4.6737463674763E+32")
+ 
++    def test_format_float_prefers_short_str(self):
++        """Ensure short Python float string repr is used when it fits.
++
++        Regression test for a case where 0.009125 was expanded to
++        0.009124999999999999, forcing comment truncation.
++        """
++        c = fits.Card(
++            "HIERARCH ESO IFM CL RADIUS",
++            0.009125,
++            "[m] radius arround actuator to avoid",
++        )
++        s = str(c)
++        assert "0.009125" in s
++        # Ensure the long unnecessary expansion is not used
++        assert "0.009124999999" not in s
++
+     def test_complex_value_card(self):
+         """Test Card constructor with complex value"""
+ 

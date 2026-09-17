@@ -1,0 +1,80 @@
+diff --git a/sympy/sets/sets.py b/sympy/sets/sets.py
+index 917717bb7..1f572e652 100644
+--- a/sympy/sets/sets.py
++++ b/sympy/sets/sets.py
+@@ -1932,24 +1932,45 @@ def _intersect(self, other):
+ 
+     def _complement(self, other):
+         if isinstance(other, Interval):
+-            nums = sorted(m for m in self.args if m.is_number)
+-            if other == S.Reals and nums != []:
+-                syms = [m for m in self.args if m.is_Symbol]
+-                # Reals cannot contain elements other than numbers and symbols.
++            # Separate numeric and non-numeric (symbolic/unknown) elements
++            nums = [m for m in self.args if m.is_number]
++            syms = [m for m in self.args if not m.is_number]
+ 
++            # Special handling when universe is the reals (existing behaviour)
++            if other == S.Reals and nums:
++                # Reals cannot contain elements other than numbers and symbols.
+                 intervals = []  # Build up a list of intervals between the elements
+-                intervals += [Interval(S.NegativeInfinity, nums[0], True, True)]
+-                for a, b in zip(nums[:-1], nums[1:]):
++                nums_sorted = sorted(nums)
++                intervals += [Interval(S.NegativeInfinity, nums_sorted[0], True, True)]
++                for a, b in zip(nums_sorted[:-1], nums_sorted[1:]):
+                     intervals.append(Interval(a, b, True, True))  # both open
+-                intervals.append(Interval(nums[-1], S.Infinity, True, True))
++                intervals.append(Interval(nums_sorted[-1], S.Infinity, True, True))
+ 
+-                if syms != []:
++                if syms:
+                     return Complement(Union(intervals, evaluate=False),
+-                            FiniteSet(*syms), evaluate=False)
++                                      FiniteSet(*syms), evaluate=False)
+                 else:
+                     return Union(intervals, evaluate=False)
+-            elif nums == []:
+-                return None
++
++            # For a general interval, remove numeric elements that are known
++            # to be inside the interval; symbolic elements cannot be
++            # determined so remain wrapped in a Complement with the interval.
++            if nums:
++                not_in = [n for n in nums if sympify(other.contains(n)) is not S.true]
++                finite_not_in = FiniteSet(*not_in, evaluate=False) if not_in else S.EmptySet
++
++                if syms:
++                    comp_syms = Complement(FiniteSet(*syms, evaluate=False), other, evaluate=False)
++                    if finite_not_in is S.EmptySet:
++                        return comp_syms
++                    else:
++                        return Union(finite_not_in, comp_syms, evaluate=False)
++                else:
++                    # Only numeric elements present: return those not in the interval
++                    return FiniteSet(*not_in, evaluate=False)
++
++            # No numeric elements to make a decision about membership
++            return Complement(FiniteSet(*syms, evaluate=False), other, evaluate=False)
+ 
+         elif isinstance(other, FiniteSet):
+             unk = []
+diff --git a/sympy/sets/tests/test_sets.py b/sympy/sets/tests/test_sets.py
+index 8c59d85b2..d6f051a92 100644
+--- a/sympy/sets/tests/test_sets.py
++++ b/sympy/sets/tests/test_sets.py
+@@ -224,7 +224,13 @@ def test_complement():
+ 
+     assert FiniteSet(0, x).complement(S.Reals) == Complement(Interval(-oo, 0, True, True) +
+                                                              Interval(0, oo, True, True)
+-                                                             ,FiniteSet(x), evaluate=False)
++                                                              ,FiniteSet(x), evaluate=False)
++
++    # Mixed symbolic and numeric elements: symbolic elements' membership
++    # w.r.t. an interval is unknown and should be left as a Complement
++    # while numeric elements known to be inside the interval are removed.
++    assert Complement(FiniteSet(x, y, 2), Interval(-10, 10)) == \
++        Complement(FiniteSet(x, y), Interval(-10, 10), evaluate=False)
+ 
+     square = Interval(0, 1) * Interval(0, 1)
+     notsquare = square.complement(S.Reals*S.Reals)

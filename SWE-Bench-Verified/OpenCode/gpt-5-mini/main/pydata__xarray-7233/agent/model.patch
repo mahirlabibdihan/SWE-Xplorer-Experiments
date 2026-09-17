@@ -1,0 +1,45 @@
+diff --git a/xarray/core/rolling.py b/xarray/core/rolling.py
+index c194ec08..8911f381 100644
+--- a/xarray/core/rolling.py
++++ b/xarray/core/rolling.py
+@@ -973,7 +973,14 @@ class Coarsen(CoarsenArithmetic, Generic[T_Xarray]):
+             else:
+                 reshaped[key] = var
+ 
+-        should_be_coords = set(window_dim) & set(self.obj.coords)
++        # Preserve any coordinates that depended on the coarsened dimensions
++        # (their names need not equal the dimension names). Previously we only
++        # promoted coords whose name matched a coarsened dimension which caused
++        # non-dimensional coords (e.g. 'day' depending on 'time') to be
++        # demoted to data variables. See GH issue.
++        should_be_coords = {
++            c for c, v in self.obj.coords.items() if any(dim in window_dim for dim in v.dims)
++        }
+         result = reshaped.set_coords(should_be_coords)
+         if isinstance(self.obj, DataArray):
+             return self.obj._from_temp_dataset(result)
+diff --git a/xarray/tests/test_coarsen.py b/xarray/tests/test_coarsen.py
+index d4449985..79f8e2f0 100644
+--- a/xarray/tests/test_coarsen.py
++++ b/xarray/tests/test_coarsen.py
+@@ -318,3 +318,20 @@ def test_coarsen_construct(dask: bool) -> None:
+ 
+     with pytest.raises(ValueError):
+         ds.coarsen(time=12).construct(time=("bar",))
++
++
++def test_coarsen_construct_preserve_nondim_coord() -> None:
++    # non-dimensional coordinate (coord name != dim name) should remain a
++    # coordinate after construct (regression test for demotion to variable)
++    da = xr.DataArray(np.arange(24), dims=("time",))
++    da = da.assign_coords(day=365 * da)
++    ds = da.to_dataset(name="T")
++
++    res = ds.coarsen(time=12, boundary="exact").construct(time=("year", "month"))
++
++    # 'day' should still be a coordinate (not a data variable)
++    assert "day" in res.coords
++    assert "day" not in res.data_vars
++    # values should match reshaped source
++    expected = ds["day"].data.reshape((-1, 12))
++    assert np.array_equal(res.coords["day"].data, expected)

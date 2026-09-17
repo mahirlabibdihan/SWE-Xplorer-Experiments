@@ -1,0 +1,53 @@
+diff --git a/django/db/models/base.py b/django/db/models/base.py
+index 3ce711f3f1..5435f2b312 100644
+--- a/django/db/models/base.py
++++ b/django/db/models/base.py
+@@ -1712,6 +1712,23 @@ class Model(metaclass=ModelBase):
+                     if fld.is_relation:
+                         _cls = fld.get_path_info()[-1].to_opts.model
+                 except (FieldDoesNotExist, AttributeError):
++                    # Allow the 'pk' alias on related fields (e.g. 'rel__pk').
++                    # get_field will not find 'pk' because it's an alias for
++                    # the primary key field name, so treat it as the related
++                    # model's pk field and continue validation. This prevents
++                    # false-positive models.E015 errors introduced by
++                    # regressions where '...__pk' ordering was considered
++                    # invalid.
++                    if part == 'pk':
++                        try:
++                            # Set fld to the primary key field of the current
++                            # related model so subsequent transform/lookups are
++                            # validated against the pk field.
++                            fld = _cls._meta.pk
++                            continue
++                        except Exception:
++                            # Fall through to the existing error handling
++                            pass
+                     if fld is None or fld.get_transform(part) is None:
+                         errors.append(
+                             checks.Error(
+diff --git a/tests/invalid_models_tests/test_models.py b/tests/invalid_models_tests/test_models.py
+index 0f1d1e4dc3..895f34a792 100644
+--- a/tests/invalid_models_tests/test_models.py
++++ b/tests/invalid_models_tests/test_models.py
+@@ -824,6 +824,20 @@ class OtherModelTests(SimpleTestCase):
+         with register_lookup(models.CharField, Lower):
+             self.assertEqual(Model.check(), [])
+ 
++    def test_ordering_allows_related_pk(self):
++        class Parent(models.Model):
++            pass
++
++        class Child(models.Model):
++            parent = models.ForeignKey(Parent, models.CASCADE)
++
++            class Meta:
++                ordering = ('parent__pk',)
++
++        # 'parent__pk' should be valid ordering (pk is an alias for the
++        # related model's primary key) and should not raise models.E015.
++        self.assertEqual(Child.check(), [])
++
+     def test_ordering_pointing_to_foreignkey_field(self):
+         class Parent(models.Model):
+             pass

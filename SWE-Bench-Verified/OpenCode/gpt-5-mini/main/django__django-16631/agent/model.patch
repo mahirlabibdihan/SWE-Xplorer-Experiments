@@ -1,0 +1,88 @@
+diff --git a/django/contrib/auth/__init__.py b/django/contrib/auth/__init__.py
+index 155330c596..b26312c537 100644
+--- a/django/contrib/auth/__init__.py
++++ b/django/contrib/auth/__init__.py
+@@ -104,11 +104,41 @@ def login(request, user, backend=None):
+         session_auth_hash = user.get_session_auth_hash()
+ 
+     if SESSION_KEY in request.session:
++        # When rotating SECRET_KEY, existing sessions may have been created
++        # using a previous SECRET_KEY. Accept session hashes generated with
++        # any fallback keys in settings.SECRET_KEY_FALLBACKS to avoid
++        # logging out all users when rotating keys.
++        from django.conf import settings as _settings
++        from django.utils.crypto import salted_hmac as _salted_hmac
++
++        def _session_hash_matches(stored_hash, user, current_hash):
++            # If there's no stored hash or no current hash, fall back to simple
++            # comparison.
++            if not stored_hash:
++                return False
++            if current_hash and constant_time_compare(stored_hash, current_hash):
++                return True
++            # Try comparing against any fallback secret keys.
++            try:
++                fallbacks = _settings.SECRET_KEY_FALLBACKS
++            except Exception:
++                fallbacks = []
++            key_salt = "django.contrib.auth.models.AbstractBaseUser.get_session_auth_hash"
++            for secret in [*_settings.SECRET_KEY_FALLBACKS] if fallbacks is not None else []:
++                try:
++                    candidate = _salted_hmac(
++                        key_salt, user.password, secret=secret, algorithm="sha256"
++                    ).hexdigest()
++                except Exception:
++                    # If salted_hmac raises for any reason, ignore that secret.
++                    continue
++                if constant_time_compare(stored_hash, candidate):
++                    return True
++            return False
++
++        stored_hash = request.session.get(HASH_SESSION_KEY, "")
+         if _get_user_session_key(request) != user.pk or (
+-            session_auth_hash
+-            and not constant_time_compare(
+-                request.session.get(HASH_SESSION_KEY, ""), session_auth_hash
+-            )
++            session_auth_hash and not _session_hash_matches(stored_hash, user, session_auth_hash)
+         ):
+             # To avoid reusing another user's session, create a new, empty
+             # session if the existing session corresponds to a different
+@@ -199,9 +229,34 @@ def get_user(request):
+             # Verify the session
+             if hasattr(user, "get_session_auth_hash"):
+                 session_hash = request.session.get(HASH_SESSION_KEY)
+-                session_hash_verified = session_hash and constant_time_compare(
+-                    session_hash, user.get_session_auth_hash()
+-                )
++                # Accept session hashes generated with previous SECRET_KEY
++                # values listed in SECRET_KEY_FALLBACKS.
++                from django.conf import settings as _settings
++                from django.utils.crypto import salted_hmac as _salted_hmac
++
++                current_hash = user.get_session_auth_hash()
++                session_hash_verified = False
++                if session_hash:
++                    if current_hash and constant_time_compare(session_hash, current_hash):
++                        session_hash_verified = True
++                    else:
++                        try:
++                            fallbacks = _settings.SECRET_KEY_FALLBACKS
++                        except Exception:
++                            fallbacks = []
++                        if fallbacks is None:
++                            fallbacks = []
++                        key_salt = "django.contrib.auth.models.AbstractBaseUser.get_session_auth_hash"
++                        for secret in fallbacks:
++                            try:
++                                candidate = _salted_hmac(
++                                    key_salt, user.password, secret=secret, algorithm="sha256"
++                                ).hexdigest()
++                            except Exception:
++                                continue
++                            if constant_time_compare(session_hash, candidate):
++                                session_hash_verified = True
++                                break
+                 if not session_hash_verified:
+                     request.session.flush()
+                     user = None

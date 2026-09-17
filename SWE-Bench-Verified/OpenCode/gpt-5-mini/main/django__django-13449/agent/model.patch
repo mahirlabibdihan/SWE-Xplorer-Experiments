@@ -1,0 +1,88 @@
+diff --git a/django/db/models/expressions.py b/django/db/models/expressions.py
+index 90d90119d0..f35ac986f6 100644
+--- a/django/db/models/expressions.py
++++ b/django/db/models/expressions.py
+@@ -1302,7 +1302,17 @@ class Window(Expression):
+         connection.ops.check_expression_support(self)
+         if not connection.features.supports_over_clause:
+             raise NotSupportedError('This backend does not support window expressions.')
+-        expr_sql, params = compiler.compile(self.source_expression)
++        # Use the generic as_sql() for the source expression instead of
++        # compiler.compile() for SQLite so that SQLite-specific wrappers
++        # (for example, the CAST for DecimalField in as_sqlite()) are not
++        # applied to the inner expression. We need to apply any required
++        # casting to the whole OVER(...) clause rather than the inner
++        # function call (see ticket: LAG/DecimalField on SQLite). For other
++        # backends, keep the vendor-specific behavior.
++        if connection.vendor == 'sqlite':
++            expr_sql, params = self.source_expression.as_sql(compiler, connection)
++        else:
++            expr_sql, params = compiler.compile(self.source_expression)
+         window_sql, window_params = [], []
+ 
+         if self.partition_by is not None:
+@@ -1326,11 +1336,23 @@ class Window(Expression):
+ 
+         params.extend(window_params)
+         template = template or self.template
+-
+-        return template % {
++        sql = template % {
+             'expression': expr_sql,
+             'window': ''.join(window_sql).strip()
+-        }, params
++        }
++
++        # For SQLite, expressions producing DecimalField values need to be
++        # cast to NUMERIC. Ensure the CAST wraps the entire OVER(...) clause
++        # rather than the inner function call (which would produce invalid
++        # SQL like "CAST(LAG(...) AS NUMERIC) OVER (...)".
++        try:
++            if connection.vendor == 'sqlite' and self.output_field.get_internal_type() == 'DecimalField':
++                sql = 'CAST(%s AS NUMERIC)' % sql
++        except FieldError:
++            # If we cannot resolve the output field, just return the SQL as-is.
++            pass
++
++        return sql, params
+ 
+     def __str__(self):
+         return '{} OVER ({}{}{})'.format(
+diff --git a/tests/expressions_window/tests.py b/tests/expressions_window/tests.py
+index 30ed64f529..ac40dd4883 100644
+--- a/tests/expressions_window/tests.py
++++ b/tests/expressions_window/tests.py
+@@ -202,6 +202,33 @@ class WindowFunctionTests(TestCase):
+             ('Smith', 55000, 'Sales', 53000),
+         ], transform=lambda row: (row.name, row.salary, row.department, row.lag))
+ 
++    def test_lag_decimalfield_sqlite_casts_over_clause(self):
++        """
++        Ensure that on SQLite a DecimalField used with a window function is
++        cast around the entire OVER(...) clause, not the inner function call.
++        """
++        from decimal import Decimal
++        from django.db import connection
++        from django.db.models import Value
++        from django.db.models.fields import DecimalField
++
++        # This test is specific to SQLite behavior.
++        if connection.vendor != 'sqlite':
++            self.skipTest('SQLite specific test')
++
++        # Use a Value with DecimalField as the source expression to force
++        # Decimal handling without creating a new model field.
++        expr = Lag(Value(Decimal('1.23'), output_field=DecimalField(max_digits=5, decimal_places=2)), 7)
++        w = Window(expression=expr, partition_by=F('hire_date'), order_by=F('hire_date').asc())
++        qs = Employee.objects.all().annotate(w=w)
++        sql = str(qs.query)
++
++        # The CAST should wrap the OVER(...) clause. That means the 'OVER'
++        # token must appear before the 'AS NUMERIC' cast suffix.
++        self.assertIn('OVER', sql)
++        self.assertIn('AS NUMERIC', sql)
++        self.assertLess(sql.index('OVER'), sql.index('AS NUMERIC'))
++
+     def test_first_value(self):
+         qs = Employee.objects.annotate(first_value=Window(
+             expression=FirstValue('salary'),

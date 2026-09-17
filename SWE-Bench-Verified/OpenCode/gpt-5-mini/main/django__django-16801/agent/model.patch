@@ -1,0 +1,54 @@
+diff --git a/django/db/models/fields/files.py b/django/db/models/fields/files.py
+index 7f8eb128e1..380551c764 100644
+--- a/django/db/models/fields/files.py
++++ b/django/db/models/fields/files.py
+@@ -441,7 +441,13 @@ class ImageField(FileField):
+         # after their corresponding image field don't stay cleared by
+         # Model.__init__, see bug #11196.
+         # Only run post-initialization dimension update on non-abstract models
+-        if not cls._meta.abstract:
++        # Only connect the post_init signal if this ImageField actually
++        # has width/height dimension fields to update. Connecting the
++        # signal when there are no dimension fields is a noop (the
++        # handler returns immediately) but causes unnecessary overhead
++        # during model initialization. See ticket: performance issue
++        # when many ImageFields without dimension fields are present.
++        if not cls._meta.abstract and (self.width_field or self.height_field):
+             signals.post_init.connect(self.update_dimension_fields, sender=cls)
+ 
+     def update_dimension_fields(self, instance, force=False, *args, **kwargs):
+diff --git a/tests/model_fields/test_imagefield.py b/tests/model_fields/test_imagefield.py
+index 6ef46ef200..628e21a6ec 100644
+--- a/tests/model_fields/test_imagefield.py
++++ b/tests/model_fields/test_imagefield.py
+@@ -328,6 +328,30 @@ class ImageFieldNoDimensionsTests(ImageFieldTwoDimensionsTests):
+ 
+     PersonModel = Person
+ 
++    def test_no_post_init_receiver_connected_when_no_dimension_fields(self):
++        """Ensure ImageField doesn't connect a post_init receiver when
++        it has no width_field/height_field specified.  Connecting in that
++        case is unnecessary and can slow down model initialization.
++        """
++        from django.db.models import signals
++
++        # Get the ImageField instance from the model
++        field = Person._meta.get_field("mugshot")
++
++        # _live_receivers is an internal API but useful here to inspect
++        # the currently connected receivers for the given sender (model
++        # class). It returns (sync_receivers, async_receivers).
++        sync_receivers, async_receivers = signals.post_init._live_receivers(Person)
++
++        # Assert that none of the live receivers is the bound method
++        # ImageField.update_dimension_fields of our field instance.
++        target_func = getattr(field, "update_dimension_fields")
++        for r in list(sync_receivers) + list(async_receivers):
++            # Bound method check: __self__ is the ImageField instance and
++            # __func__ is the underlying function object.
++            if getattr(r, "__self__", None) is field and getattr(r, "__func__", None) is getattr(target_func, "__func__", None):
++                self.fail("update_dimension_fields should not be connected for ImageField without dimension fields")
++
+ 
+ @skipIf(Image is None, "Pillow is required to test ImageField")
+ class ImageFieldOneDimensionTests(ImageFieldTwoDimensionsTests):

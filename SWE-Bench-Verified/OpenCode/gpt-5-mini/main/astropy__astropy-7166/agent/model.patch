@@ -1,0 +1,122 @@
+diff --git a/astropy/utils/misc.py b/astropy/utils/misc.py
+index de3fb01d1..85a395855 100644
+--- a/astropy/utils/misc.py
++++ b/astropy/utils/misc.py
+@@ -528,13 +528,82 @@ class InheritDocstrings(type):
+                 not key.startswith('_'))
+ 
+         for key, val in dct.items():
+-            if (inspect.isfunction(val) and
+-                is_public_member(key) and
+-                val.__doc__ is None):
+-                for base in cls.__mro__[1:]:
+-                    super_method = getattr(base, key, None)
+-                    if super_method is not None:
+-                        val.__doc__ = super_method.__doc__
++            # We want to handle plain functions, as well as descriptors such
++            # as classmethod, staticmethod and property.  inspect.isfunction
++            # returns False for those descriptors, so detect them here and
++            # pick the underlying function object where appropriate so that
++            # we can copy the docstring from the overridden method.
++            if not is_public_member(key):
++                continue
++
++            target = None
++            # Plain function defined in class body
++            if inspect.isfunction(val):
++                target = val
++            # classmethod and staticmethod wrap the function in __func__
++            elif isinstance(val, (classmethod, staticmethod)):
++                target = val.__func__
++            # property objects expose the fget function; setting either
++            # the property's __doc__ or the fget.__doc__ will make the
++            # docstring visible on the attribute, so prefer the fget if
++            # present.
++            elif isinstance(val, property):
++                target = val.fget if val.fget is not None else val
++
++            if target is None:
++                continue
++
++            # Only attempt to inherit if the target currently has no docstring
++            if getattr(target, '__doc__', None) is not None:
++                continue
++
++            for base in cls.__mro__[1:]:
++                super_method = getattr(base, key, None)
++                if super_method is not None:
++                    # For classmethod/staticmethod the docstring lives on
++                    # the underlying function; for property the descriptor
++                    # provides __doc__ too. Use that docstring if present.
++                    super_doc = getattr(super_method, '__doc__', None)
++                    if super_doc is None:
++                        # For classmethod/staticmethod retrieved from the
++                        # base class, try to access the underlying function
++                        # if possible.
++                        if isinstance(super_method, (classmethod, staticmethod)):
++                            super_doc = getattr(super_method.__func__, '__doc__', None)
++                        elif isinstance(super_method, property):
++                            super_doc = getattr(super_method.fget, '__doc__', None)
++
++                    if super_doc is not None:
++                        try:
++                            # For properties, set both the property's __doc__ and
++                            # the fget's __doc__ so that the attribute on the
++                            # class shows the inherited docstring.
++                            if isinstance(val, property):
++                                try:
++                                    val.__doc__ = super_doc
++                                except Exception:
++                                    pass
++                                if val.fget is not None:
++                                    try:
++                                        val.fget.__doc__ = super_doc
++                                    except Exception:
++                                        pass
++                            # For classmethod/staticmethod, set the underlying
++                            # function's __doc__
++                            elif isinstance(val, (classmethod, staticmethod)):
++                                try:
++                                    val.__func__.__doc__ = super_doc
++                                except Exception:
++                                    pass
++                            else:
++                                try:
++                                    target.__doc__ = super_doc
++                                except Exception:
++                                    pass
++                        except Exception:
++                            # Be conservative: if we can't set the docstring
++                            # on the target for some reason, skip it.
++                            pass
+                         break
+ 
+         super().__init__(name, bases, dct)
+diff --git a/astropy/utils/tests/test_misc.py b/astropy/utils/tests/test_misc.py
+index 4f632e8d1..ebdc6d66c 100644
+--- a/astropy/utils/tests/test_misc.py
++++ b/astropy/utils/tests/test_misc.py
+@@ -89,6 +89,23 @@ def test_inherit_docstrings():
+         assert Subclass.__call__.__doc__ == "FOO"
+ 
+ 
++def test_inherit_docstrings_property():
++    class Base(metaclass=misc.InheritDocstrings):
++        @property
++        def foo(self):
++            "DOCPROP"
++            return 1
++
++    class Sub(Base):
++        @property
++        def foo(self):
++            return 2
++
++    # If Base.foo has a docstring, Sub.foo should inherit it
++    if Base.foo.__doc__ is not None:
++        assert Sub.foo.__doc__ == "DOCPROP"
++
++
+ def test_set_locale():
+     # First, test if the required locales are available
+     current = locale.setlocale(locale.LC_ALL)

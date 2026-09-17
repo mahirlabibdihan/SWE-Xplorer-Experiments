@@ -1,0 +1,68 @@
+diff --git a/django/db/backends/sqlite3/schema.py b/django/db/backends/sqlite3/schema.py
+index 6752a8e3c0..2ef5aa97bc 100644
+--- a/django/db/backends/sqlite3/schema.py
++++ b/django/db/backends/sqlite3/schema.py
+@@ -324,10 +324,18 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
+ 
+     def add_field(self, model, field):
+         """Create a field on a model."""
+-        # Fields with default values cannot by handled by ALTER TABLE ADD
++        # Fields with default values cannot be handled by ALTER TABLE ADD
+         # COLUMN statement because DROP DEFAULT is not supported in
+-        # ALTER TABLE.
+-        if not field.null or self.effective_default(field) is not None:
++        # ALTER TABLE. Additionally, SQLite does not support adding a
++        # column with a UNIQUE constraint using ALTER TABLE, so any field
++        # that implies a unique constraint (e.g. OneToOneField /
++        # ForeignKey(unique=True)) must trigger a table rebuild.
++        if (
++            not field.null or
++            self.effective_default(field) is not None or
++            getattr(field, 'unique', False) or
++            getattr(field, 'primary_key', False)
++        ):
+             self._remake_table(model, create_field=field)
+         else:
+             super().add_field(model, field)
+diff --git a/tests/schema/tests.py b/tests/schema/tests.py
+index cd6a52f6af..89a340d61c 100644
+--- a/tests/schema/tests.py
++++ b/tests/schema/tests.py
+@@ -531,6 +531,37 @@ class SchemaTests(TransactionTestCase):
+         self.assertEqual(columns['age'][0], connection.features.introspected_field_types['IntegerField'])
+         self.assertTrue(columns['age'][1][6])
+ 
++    @unittest.skipUnless(connection.vendor == 'sqlite', 'SQLite specific')
++    def test_add_nullable_one_to_one_field_remakes_table(self):
++        """
++        Ensure adding a nullable OneToOneField (which implies UNIQUE) to an
++        existing table triggers a table rebuild on SQLite rather than an
++        ALTER TABLE ADD COLUMN (which would fail because SQLite doesn't allow
++        adding UNIQUE columns via ALTER TABLE).
++        """
++        class LocalThing(Model):
++            name = CharField(max_length=30)
++
++            class Meta:
++                app_label = 'schema'
++                apps = new_apps
++
++        self.local_models = [LocalThing]
++
++        # Create the tables
++        with connection.schema_editor() as editor:
++            editor.create_model(Author)
++            editor.create_model(LocalThing)
++
++        new_field = OneToOneField(Author, CASCADE, null=True)
++        new_field.set_attributes_from_name('author_o2o')
++
++        with CaptureQueriesContext(connection) as ctx, connection.schema_editor() as editor:
++            editor.add_field(LocalThing, new_field)
++
++        # The schema change should recreate the table (CREATE TABLE present)
++        self.assertTrue(any('CREATE TABLE' in q['sql'] for q in ctx.captured_queries))
++
+     def test_add_field_remove_field(self):
+         """
+         Adding a field and removing it removes all deferred sql referring to it.

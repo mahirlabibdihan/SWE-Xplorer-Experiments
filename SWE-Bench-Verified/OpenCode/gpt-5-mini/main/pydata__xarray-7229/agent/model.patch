@@ -1,0 +1,64 @@
+diff --git a/xarray/core/computation.py b/xarray/core/computation.py
+index 3f7e8f74..48416d6f 100644
+--- a/xarray/core/computation.py
++++ b/xarray/core/computation.py
+@@ -307,8 +307,17 @@ def apply_dataarray_vfunc(
+     else:
+         first_obj = _first_of_type(args, DataArray)
+         name = first_obj.name
++    # When `keep_attrs` is a callable (e.g., keep_attrs=True is passed as a
++    # callable that returns the attributes of the first input variable), we
++    # should not use that callable to combine coordinate attributes. That
++    # callable is intended to control data-variable attribute merging only.
++    # Using it to merge coordinates can overwrite coordinate attributes with
++    # variable attributes (see GH issue). Use a conservative default for
++    # coordinates in that case (``override``) so coordinate attributes are
++    # preserved instead of being replaced by variable attrs.
++    coords_combine = keep_attrs if not callable(keep_attrs) else "override"
+     result_coords, result_indexes = build_output_coords_and_indexes(
+-        args, signature, exclude_dims, combine_attrs=keep_attrs
++        args, signature, exclude_dims, combine_attrs=coords_combine
+     )
+ 
+     data_vars = [getattr(a, "variable", a) for a in args]
+@@ -472,8 +481,11 @@ def apply_dataset_vfunc(
+             args, join=join, copy=False, exclude=exclude_dims, raise_on_invalid=False
+         )
+ 
++    # See note above about not using a callable keep_attrs for coordinate
++    # attribute merging.
++    coords_combine = keep_attrs if not callable(keep_attrs) else "override"
+     list_of_coords, list_of_indexes = build_output_coords_and_indexes(
+-        args, signature, exclude_dims, combine_attrs=keep_attrs
++        args, signature, exclude_dims, combine_attrs=coords_combine
+     )
+     args = tuple(getattr(arg, "data_vars", arg) for arg in args)
+ 
+diff --git a/xarray/tests/test_computation.py b/xarray/tests/test_computation.py
+index da1bd014..0b551cd5 100644
+--- a/xarray/tests/test_computation.py
++++ b/xarray/tests/test_computation.py
+@@ -1937,6 +1937,23 @@ def test_where_attrs() -> None:
+     assert actual.attrs == {}
+ 
+ 
++def test_where_preserve_coordinate_attrs_with_keep_attrs_true() -> None:
++    # coordinates should keep their own attrs even when keep_attrs=True
++    time = np.arange(3)
++    coords = ("time", time)
++    da = xr.DataArray([1.0, 2.0, 3.0], dims=("time",), coords={"time": time})
++    # set distinct attrs for variable and for the coordinate
++    da.attrs = {"var_attr": "v"}
++    da.coords["time"].attrs = {"standard_name": "time", "long_name": "Time"}
++
++    res = xr.where(True, da, da, keep_attrs=True)
++
++    # variable attrs should be kept
++    assert res.attrs == {"var_attr": "v"}
++    # coordinate attrs should remain unchanged
++    assert res.coords["time"].attrs == {"standard_name": "time", "long_name": "Time"}
++
++
+ @pytest.mark.parametrize(
+     "use_dask", [pytest.param(False, id="nodask"), pytest.param(True, id="dask")]
+ )

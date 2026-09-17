@@ -1,0 +1,54 @@
+diff --git a/django/db/migrations/loader.py b/django/db/migrations/loader.py
+index 95a5062ec9..a5d3896868 100644
+--- a/django/db/migrations/loader.py
++++ b/django/db/migrations/loader.py
+@@ -88,9 +88,15 @@ class MigrationLoader:
+                     continue
+                 raise
+             else:
+-                # Empty directories are namespaces.
+-                # getattr() needed on PY36 and older (replace w/attribute access).
+-                if getattr(module, '__file__', None) is None:
++                # Empty directories are namespace packages. On some Python
++                # import systems (e.g. frozen environments) regular packages
++                # may have no __file__ attribute, so only treat a module as
++                # a namespace package if its __path__ is not the usual list
++                # object. getattr() needed on PY36 and older (replace w/
++                # attribute access).
++                if getattr(module, '__file__', None) is None and not (
++                    hasattr(module, '__path__') and isinstance(module.__path__, list)
++                ):
+                     self.unmigrated_apps.add(app_config.label)
+                     continue
+                 # Module is not a package (e.g. migrations.py).
+diff --git a/tests/migrations/test_loader.py b/tests/migrations/test_loader.py
+index 27a052ddac..867d975130 100644
+--- a/tests/migrations/test_loader.py
++++ b/tests/migrations/test_loader.py
+@@ -512,6 +512,26 @@ class LoaderTests(TestCase):
+         migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+         self.assertEqual(migrations, [])
+ 
++    def test_loading_package_with_no___file__(self):
++        """Packages that set __file__ = None (frozen envs) are treated as
++        regular packages and their migrations should be discovered.
++        """
++        # Create a temporary migrations module and make its parent package
++        # behave like a frozen package by setting __file__ = None in its
++        # __init__.py.
++        with self.temporary_migration_module(module='migrations.test_migrations') as migration_dir:
++            # The context manager updates sys.path to include the temp parent
++            # directory. Compute that parent dir from migration_dir.
++            parent_dir = os.path.dirname(migration_dir)
++            init_path = os.path.join(parent_dir, '__init__.py')
++            # Overwrite the package __init__.py to emulate a frozen package.
++            with open(init_path, 'w') as f:
++                f.write("__file__ = None\n")
++            # Now the package will be imported with __file__ == None but
++            # __path__ will be a normal list, so migrations should be found.
++            loader = MigrationLoader(connection)
++            self.assertIn(('migrations', '0001_initial'), loader.disk_migrations)
++
+ 
+ class PycLoaderTests(MigrationTestBase):
+ 

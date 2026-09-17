@@ -1,0 +1,72 @@
+diff --git a/src/_pytest/mark/structures.py b/src/_pytest/mark/structures.py
+index 800a25c92..e13285156 100644
+--- a/src/_pytest/mark/structures.py
++++ b/src/_pytest/mark/structures.py
+@@ -357,9 +357,29 @@ class MarkDecorator:
+ 
+ def get_unpacked_marks(obj: object) -> Iterable[Mark]:
+     """Obtain the unpacked marks that are stored on an object."""
+-    mark_list = getattr(obj, "pytestmark", [])
+-    if not isinstance(mark_list, list):
+-        mark_list = [mark_list]
++    # For classes, consider marks set on any entry in the MRO (using
++    # __dict__ lookup to avoid inheriting a single pytestmark attribute
++    # via normal attribute lookup which would shadow others). This makes
++    # multiple inheritance of marked base classes merge their marks.
++    import inspect
++
++    if inspect.isclass(obj):
++        mark_list = []
++        for cls in obj.__mro__:
++            # Use __dict__ to only pick up marks that were explicitly set
++            # on the class itself (not inherited via attribute lookup), and
++            # preserve MRO ordering (most-derived class first).
++            if "pytestmark" in cls.__dict__:
++                pm = cls.__dict__["pytestmark"]
++                if not isinstance(pm, list):
++                    mark_list.append(pm)
++                else:
++                    mark_list.extend(pm)
++    else:
++        mark_list = getattr(obj, "pytestmark", [])
++        if not isinstance(mark_list, list):
++            mark_list = [mark_list]
++
+     return normalize_mark_list(mark_list)
+ 
+ 
+diff --git a/testing/test_mark.py b/testing/test_mark.py
+index 65f2581bd..babfb1a62 100644
+--- a/testing/test_mark.py
++++ b/testing/test_mark.py
+@@ -1109,3 +1109,30 @@ def test_marker_expr_eval_failure_handling(pytester: Pytester, expr) -> None:
+     result = pytester.runpytest(foo, "-m", expr)
+     result.stderr.fnmatch_lines([expected])
+     assert result.ret == ExitCode.USAGE_ERROR
++
++
++def test_marks_from_multiple_base_classes(pytester: Pytester) -> None:
++    p = pytester.makepyfile(
++        """
++        import pytest
++
++        @pytest.mark.foo
++        class Foo(object):
++            pass
++
++        @pytest.mark.bar
++        class Bar(object):
++            pass
++
++        class TestDings(Foo, Bar):
++            def test_dings(self):
++                assert True
++        """
++    )
++
++    # Selecting by each mark should find the test, proving both marks were
++    # applied to the class via MRO-aware collection.
++    result = pytester.runpytest(p, "-q", "-k", "foo")
++    result.stdout.fnmatch_lines(["*test_dings*"])
++    result = pytester.runpytest(p, "-q", "-k", "bar")
++    result.stdout.fnmatch_lines(["*test_dings*"])

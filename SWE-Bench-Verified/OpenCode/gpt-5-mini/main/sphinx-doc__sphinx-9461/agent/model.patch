@@ -1,0 +1,57 @@
+diff --git a/sphinx/util/inspect.py b/sphinx/util/inspect.py
+index 23dd9e930..c958e94da 100644
+--- a/sphinx/util/inspect.py
++++ b/sphinx/util/inspect.py
+@@ -844,7 +844,19 @@ def getdoc(obj: Any, attrgetter: Callable = safe_getattr,
+         if cls and name:
+             # Check a docstring of the attribute or method from super classes.
+             for basecls in getmro(cls):
+-                meth = safe_getattr(basecls, name, None)
++                # Try to get the attribute without triggering the descriptor
++                # protocol by looking into the class __dict__ first. This
++                # helps in cases like @classmethod @property where
++                # getattr(basecls, name) may invoke descriptors and return
++                # the result instead of the descriptor object itself.
++                base_dict = safe_getattr(basecls, '__dict__', None)
++                meth = None
++                if isinstance(base_dict, dict) and name in base_dict:
++                    meth = base_dict[name]
++                else:
++                    # fallback to normal getattr behavior
++                    meth = safe_getattr(basecls, name, None)
++
+                 if meth is not None:
+                     doc = attrgetter(meth, '__doc__', None)
+                     if doc is not None:
+diff --git a/tests/test_util_inspect.py b/tests/test_util_inspect.py
+index 2f805a87a..20fd273a2 100644
+--- a/tests/test_util_inspect.py
++++ b/tests/test_util_inspect.py
+@@ -698,6 +698,27 @@ def test_getdoc_inherited_decorated_method():
+     assert inspect.getdoc(Bar.meth, getattr, True, Bar, "meth") == Foo.meth.__doc__
+ 
+ 
++def test_getdoc_inherited_classmethod_property():
++    class Base:
++        @classmethod
++        @property
++        def f(cls):
++            """class property doc"""
++            return 'x'
++
++    class Derived(Base):
++        @classmethod
++        @property
++        def f(cls):
++            # no docstring here; should inherit from Base
++            pass
++
++    # without allow_inherited, no doc
++    assert inspect.getdoc(Derived.f, getattr, False, Derived, 'f') is None
++    # with allow_inherited, should return Base.f.__doc__
++    assert inspect.getdoc(Derived.f, getattr, True, Derived, 'f') == Base.f.__doc__
++
++
+ def test_is_builtin_class_method():
+     class MyInt(int):
+         def my_method(self):

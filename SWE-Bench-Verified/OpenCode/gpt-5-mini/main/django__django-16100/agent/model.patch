@@ -1,0 +1,110 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 5f07a4208a..c8835a2102 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -2010,26 +2010,30 @@ class ModelAdmin(BaseModelAdmin):
+                 request.POST, request.FILES, queryset=modified_objects
+             )
+             if formset.is_valid():
+-                changecount = 0
+-                for form in formset.forms:
+-                    if form.has_changed():
+-                        obj = self.save_form(request, form, change=True)
+-                        self.save_model(request, obj, form, change=True)
+-                        self.save_related(request, form, formsets=[], change=True)
+-                        change_msg = self.construct_change_message(request, form, None)
+-                        self.log_change(request, obj, change_msg)
+-                        changecount += 1
+-
+-                if changecount:
+-                    msg = ngettext(
+-                        "%(count)s %(name)s was changed successfully.",
+-                        "%(count)s %(name)s were changed successfully.",
+-                        changecount,
+-                    ) % {
+-                        "count": changecount,
+-                        "name": model_ngettext(self.opts, changecount),
+-                    }
+-                    self.message_user(request, msg, messages.SUCCESS)
++                # Ensure all list_editable changes are applied atomically so
++                # partial updates aren't committed if an error occurs while
++                # processing the formset.
++                with transaction.atomic(using=router.db_for_write(self.model)):
++                    changecount = 0
++                    for form in formset.forms:
++                        if form.has_changed():
++                            obj = self.save_form(request, form, change=True)
++                            self.save_model(request, obj, form, change=True)
++                            self.save_related(request, form, formsets=[], change=True)
++                            change_msg = self.construct_change_message(request, form, None)
++                            self.log_change(request, obj, change_msg)
++                            changecount += 1
++
++                    if changecount:
++                        msg = ngettext(
++                            "%(count)s %(name)s was changed successfully.",
++                            "%(count)s %(name)s were changed successfully.",
++                            changecount,
++                        ) % {
++                            "count": changecount,
++                            "name": model_ngettext(self.opts, changecount),
++                        }
++                        self.message_user(request, msg, messages.SUCCESS)
+ 
+                 return HttpResponseRedirect(request.get_full_path())
+ 
+diff --git a/tests/admin_changelist/tests.py b/tests/admin_changelist/tests.py
+index b85d5383cd..8bd8a31d5a 100644
+--- a/tests/admin_changelist/tests.py
++++ b/tests/admin_changelist/tests.py
+@@ -1057,6 +1057,50 @@ class ChangeListTests(TestCase):
+         # has the correct edits applied.
+         self.assertContains(response, "1 swallow was changed successfully.")
+         self.assertContains(response, a.origin)
++
++    def test_changelist_view_list_editable_processing_is_atomic(self):
++        """Ensure list_editable processing is atomic: if an error occurs
++        while saving formset items, earlier changes are rolled back.
++        """
++        parent = Parent.objects.create(name="parent")
++        c1 = Child.objects.create(name="first", parent=parent)
++        c2 = Child.objects.create(name="second", parent=parent)
++
++        class ExplodingAdmin(admin.ModelAdmin):
++            list_display = ["id", "name", "parent"]
++            list_display_links = ["id"]
++            list_editable = ["name"]
++
++            def save_model(self, request, obj, form, change):
++                # Simulate an error when saving the second object.
++                if obj.name == "second_changed":
++                    raise RuntimeError("boom")
++                super().save_model(request, obj, form, change)
++
++        m = ExplodingAdmin(Child, custom_site)
++        request = self.factory.post("/child/")
++        request.user = self.superuser
++
++        FormSet = m.get_changelist_formset(request)
++        prefix = FormSet.get_default_prefix()
++        data = {
++            f"{prefix}-TOTAL_FORMS": "2",
++            f"{prefix}-INITIAL_FORMS": "2",
++            f"{prefix}-MAX_NUM_FORMS": "0",
++            f"{prefix}-0-name": "first_changed",
++            f"{prefix}-0-id": str(c1.pk),
++            f"{prefix}-1-name": "second_changed",
++            f"{prefix}-1-id": str(c2.pk),
++            "_save": "Save",
++        }
++        request.POST = data
++
++        with self.assertRaises(RuntimeError):
++            m.changelist_view(request)
++
++        # Neither object should have been changed due to rollback.
++        self.assertEqual(Child.objects.get(pk=c1.pk).name, "first")
++        self.assertEqual(Child.objects.get(pk=c2.pk).name, "second")
+         a.refresh_from_db()
+         self.assertEqual(a.load, float(data["form-2-load"]))
+         self.assertEqual(a.speed, float(data["form-2-speed"]))

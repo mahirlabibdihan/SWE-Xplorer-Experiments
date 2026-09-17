@@ -1,0 +1,63 @@
+diff --git a/django/template/defaultfilters.py b/django/template/defaultfilters.py
+index 1c844580c6..d4b0161a98 100644
+--- a/django/template/defaultfilters.py
++++ b/django/template/defaultfilters.py
+@@ -21,6 +21,7 @@ from django.utils.text import (
+ )
+ from django.utils.timesince import timesince, timeuntil
+ from django.utils.translation import gettext, ngettext
++from django.utils.functional import Promise
+ 
+ from .base import Variable, VariableDoesNotExist
+ from .library import Library
+@@ -677,8 +678,25 @@ def add(value, arg):
+     try:
+         return int(value) + int(arg)
+     except (ValueError, TypeError):
++        # Try Python addition first (works for lists, tuples, etc.). If a
++        # TypeError occurs (for example when one operand is a lazy string
++        # proxy that doesn't support direct concatenation with str), fall
++        # back to stringifying both operands and concatenating their
++        # string representations. Any other exception should fail silently
++        # and return the empty string.
+         try:
+             return value + arg
++        except TypeError:
++            # Only fall back to string concatenation if one of the
++            # operands is a lazy translation proxy (Promise). This avoids
++            # changing the historical behavior where incompatible types
++            # (e.g. int + str) fail silently and return an empty string.
++            if isinstance(value, Promise) or isinstance(arg, Promise):
++                try:
++                    return str(value) + str(arg)
++                except Exception:
++                    return ''
++            return ''
+         except Exception:
+             return ''
+ 
+diff --git a/tests/template_tests/filter_tests/test_add.py b/tests/template_tests/filter_tests/test_add.py
+index 0fcc661f4a..833148e80c 100644
+--- a/tests/template_tests/filter_tests/test_add.py
++++ b/tests/template_tests/filter_tests/test_add.py
+@@ -2,6 +2,7 @@ from datetime import date, timedelta
+ 
+ from django.template.defaultfilters import add
+ from django.test import SimpleTestCase
++from django.utils.translation import gettext_lazy
+ 
+ from ..utils import setup
+ 
+@@ -46,6 +47,12 @@ class AddTests(SimpleTestCase):
+         output = self.engine.render_to_string('add07', {'d': date(2000, 1, 1), 't': timedelta(10)})
+         self.assertEqual(output, 'Jan. 11, 2000')
+ 
++    @setup({'add08': '{{ s1|add:s2 }}'})
++    def test_add08_lazy_strings(self):
++        # Ensure concatenation works when one operand is a lazy string
++        output = self.engine.render_to_string('add08', {'s1': 'hello', 's2': gettext_lazy('world')})
++        self.assertEqual(output, 'helloworld')
++
+ 
+ class FunctionTests(SimpleTestCase):
+ 

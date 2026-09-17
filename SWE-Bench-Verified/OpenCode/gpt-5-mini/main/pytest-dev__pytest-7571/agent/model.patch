@@ -1,0 +1,77 @@
+diff --git a/src/_pytest/logging.py b/src/_pytest/logging.py
+index 11031f2f2..f89a69f38 100644
+--- a/src/_pytest/logging.py
++++ b/src/_pytest/logging.py
+@@ -346,6 +346,8 @@ class LogCaptureFixture:
+         self._item = item
+         # dict of log name -> log level
+         self._initial_logger_levels = {}  # type: Dict[Optional[str], int]
++        # store the original level of the capture handler when modified via set_level
++        self._initial_handler_level = None  # type: Optional[int]
+ 
+     def _finalize(self) -> None:
+         """Finalizes the fixture.
+@@ -356,6 +358,14 @@ class LogCaptureFixture:
+         for logger_name, level in self._initial_logger_levels.items():
+             logger = logging.getLogger(logger_name)
+             logger.setLevel(level)
++        # restore handler level if it was changed
++        if self._initial_handler_level is not None:
++            try:
++                handler = self.handler
++            except Exception:
++                handler = None
++            if handler is not None:
++                handler.setLevel(self._initial_handler_level)
+ 
+     @property
+     def handler(self) -> LogCaptureHandler:
+@@ -434,6 +444,14 @@ class LogCaptureFixture:
+         # save the original log-level to restore it during teardown
+         self._initial_logger_levels.setdefault(logger, logger_obj.level)
+         logger_obj.setLevel(level)
++        # save original handler level once so it can be restored at teardown
++        try:
++            if self._initial_handler_level is None:
++                self._initial_handler_level = self.handler.level
++        except Exception:
++            # handler might not be available in the store at this moment
++            # ignore and don't record handler level
++            pass
+         self.handler.setLevel(level)
+ 
+     @contextmanager
+diff --git a/testing/logging/test_fixture.py b/testing/logging/test_fixture.py
+index da5303302..820b20ac4 100644
+--- a/testing/logging/test_fixture.py
++++ b/testing/logging/test_fixture.py
+@@ -236,6 +236,29 @@ def test_caplog_captures_despite_exception(testdir):
+     assert result.ret == 1
+ 
+ 
++def test_handler_level_restored_between_tests(testdir):
++    """Regression test: caplog should restore the handler level after a test that changed it.
++
++    See: caplog fixture should restore log levels set with caplog.set_level().
++    """
++    testdir.makepyfile(
++        """
++        import logging
++
++        def test_foo(caplog):
++            caplog.set_level(42)
++
++        def test_bar(caplog):
++            # print the handler level so we can inspect it from the test run output
++            print(caplog.handler.level)
++    """
++    )
++    result = testdir.runpytest()
++    # handler level should be restored to NOTSET (0), not left at 42
++    result.stdout.fnmatch_lines(["*0*"])
++    result.stdout.no_fnmatch_line("*42*")
++
++
+ def test_log_report_captures_according_to_config_option_upon_failure(testdir):
+     """ Test that upon failure:
+     (1) `caplog` succeeded to capture the DEBUG message and assert on it => No `Exception` is raised

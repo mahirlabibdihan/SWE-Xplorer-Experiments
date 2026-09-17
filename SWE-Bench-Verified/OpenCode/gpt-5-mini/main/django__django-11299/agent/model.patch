@@ -1,0 +1,61 @@
+diff --git a/django/db/models/sql/query.py b/django/db/models/sql/query.py
+index b99f03cd88..add1728682 100644
+--- a/django/db/models/sql/query.py
++++ b/django/db/models/sql/query.py
+@@ -1336,9 +1336,12 @@ class Query(BaseExpression):
+         joinpromoter = JoinPromoter(q_object.connector, len(q_object.children), current_negated)
+         for child in q_object.children:
+             if isinstance(child, Node):
++                # Preserve the simple_col flag when recursing so that column
++                # references inside nested Q objects (e.g. an AND within an
++                # OR) continue to use SimpleCol (unqualified column names).
+                 child_clause, needed_inner = self._add_q(
+                     child, used_aliases, branch_negated,
+-                    current_negated, allow_joins, split_subq)
++                    current_negated, allow_joins, split_subq, simple_col=simple_col)
+                 joinpromoter.add_votes(needed_inner)
+             else:
+                 child_clause, needed_inner = self.build_filter(
+diff --git a/tests/constraints/tests.py b/tests/constraints/tests.py
+index b7aeb1e7f0..d317b8996e 100644
+--- a/tests/constraints/tests.py
++++ b/tests/constraints/tests.py
+@@ -5,6 +5,12 @@ from django.test import SimpleTestCase, TestCase, skipUnlessDBFeature
+ 
+ from .models import Product
+ 
++from django.test.utils import isolate_apps
++from django.db import connection
++from django.db.models import Model, IntegerField, BooleanField
++from django.db.models.constraints import CheckConstraint
++
++
+ 
+ def get_constraints(table):
+     with connection.cursor() as cursor:
+@@ -79,6 +85,25 @@ class CheckConstraintTests(TestCase):
+         expected_name = 'price_gt_discounted_price'
+         self.assertIn(expected_name, constraints)
+ 
++    @isolate_apps('constraints')
++    def test_checkconstraint_nested_or_and_uses_simplecol(self):
++        """Check that CheckConstraint with nested AND/OR uses unqualified
++        column names (SimpleCol) for all column references.
++        """
++        class TestConstraint(Model):
++            field_1 = IntegerField(blank=True, null=True)
++            flag = BooleanField()
++
++            class Meta:
++                app_label = 'constraints'
++
++        check = models.Q(models.Q(('field_1__isnull', False), ('flag__exact', True)), ('flag__exact', False), _connector='OR')
++        constraint = CheckConstraint(check=check, name='field_1_has_value_if_flag_set')
++        with connection.schema_editor() as editor:
++            sql = constraint._get_check_sql(TestConstraint, editor)
++        # Ensure that there are no qualified column references like "alias"."field_1".
++        self.assertNotRegex(sql, r'"\w+"\."field_1"')
++
+ 
+ class UniqueConstraintTests(TestCase):
+     @classmethod

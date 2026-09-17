@@ -1,0 +1,79 @@
+diff --git a/django/contrib/contenttypes/fields.py b/django/contrib/contenttypes/fields.py
+index ed98ecb48c..896853b2af 100644
+--- a/django/contrib/contenttypes/fields.py
++++ b/django/contrib/contenttypes/fields.py
+@@ -202,7 +202,13 @@ class GenericForeignKey(FieldCacheMixin):
+             else:
+                 model = self.get_content_type(id=ct_id,
+                                               using=obj._state.db).model_class()
+-                return (model._meta.pk.get_prep_value(getattr(obj, self.fk_field)),
++                # Use the primary key field's to_python() to convert the
++                # stored object_id (often a string) to the correct Python
++                # type for the target model's PK (e.g. uuid.UUID). Using
++                # get_prep_value() here can leave strings unchanged which
++                # won't match the actual related object's pk (of a different
++                # Python type) during the prefetch matching step.
++                return (model._meta.pk.to_python(getattr(obj, self.fk_field)),
+                         model)
+ 
+         return (
+diff --git a/tests/generic_relations/models.py b/tests/generic_relations/models.py
+index eec40e87a4..8228e5038c 100644
+--- a/tests/generic_relations/models.py
++++ b/tests/generic_relations/models.py
+@@ -14,6 +14,7 @@ from django.contrib.contenttypes.fields import (
+ )
+ from django.contrib.contenttypes.models import ContentType
+ from django.db import models
++import uuid
+ 
+ 
+ class TaggedItem(models.Model):
+@@ -146,3 +147,17 @@ class AllowsNullGFK(models.Model):
+     content_type = models.ForeignKey(ContentType, models.SET_NULL, null=True)
+     object_id = models.PositiveIntegerField(null=True)
+     content_object = GenericForeignKey()
++
++
++# Models to reproduce GFK prefetch behavior with UUID primary keys
++class UUIDModel(models.Model):
++    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
++    name = models.CharField(max_length=100)
++
++
++class BarUUID(models.Model):
++    foo_content_type = models.ForeignKey(
++        ContentType, models.CASCADE, related_name='actor'
++    )
++    foo_object_id = models.CharField(max_length=255, db_index=True)
++    foo = GenericForeignKey('foo_content_type', 'foo_object_id')
+diff --git a/tests/generic_relations/tests.py b/tests/generic_relations/tests.py
+index 2e99c5b5cf..6c2202dc96 100644
+--- a/tests/generic_relations/tests.py
++++ b/tests/generic_relations/tests.py
+@@ -10,6 +10,7 @@ from .models import (
+     ProxyRelatedModel, Rock, TaggedItem, ValuableRock, ValuableTaggedItem,
+     Vegetable,
+ )
++from .models import UUIDModel, BarUUID
+ 
+ 
+ class GenericRelationsTests(TestCase):
+@@ -627,3 +628,17 @@ class TestInitWithNoneArgument(SimpleTestCase):
+         # TaggedItem requires a content_type but initializing with None should
+         # be allowed.
+         TaggedItem(content_object=None)
++
++
++class UUIDGFKTestCase(TestCase):
++    def test_prefetch_related_with_uuid_pk(self):
++        """Prefetching a GenericForeignKey should work when the related
++        model uses a UUIDField as primary key and the object_id is stored in
++        a CharField on the model holding the GFK.
++        """
++        foo = UUIDModel.objects.create(name='uuid-obj')
++        bar = BarUUID.objects.create(foo=foo)
++        # Prefetch the related GenericForeignKey and ensure it's populated
++        bars = list(BarUUID.objects.prefetch_related('foo'))
++        self.assertEqual(len(bars), 1)
++        self.assertEqual(bars[0].foo, foo)

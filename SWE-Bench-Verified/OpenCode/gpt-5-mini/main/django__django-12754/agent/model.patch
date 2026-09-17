@@ -1,0 +1,61 @@
+diff --git a/django/db/migrations/autodetector.py b/django/db/migrations/autodetector.py
+index 30616c0172..df17e55e7f 100644
+--- a/django/db/migrations/autodetector.py
++++ b/django/db/migrations/autodetector.py
+@@ -563,6 +563,21 @@ class MigrationAutodetector:
+                 if isinstance(base, str) and "." in base:
+                     base_app_label, base_name = base.split(".", 1)
+                     dependencies.append((base_app_label, base_name, None, True))
++            # If we're inheriting from a concrete base that used to have
++            # fields moved onto this subclass in the same migration, ensure
++            # the CreateModel depends on the removal of those fields from
++            # the base to avoid model class field-name clashes during
++            # migration application. See #21890.
++            for field_name in [n for n in model_state.fields if n not in related_fields]:
++                for base in model_state.bases:
++                    if isinstance(base, str) and "." in base:
++                        base_app_label, base_name = base.split(".", 1)
++                        # If the base had this field in the old state but the
++                        # new state no longer has it, add a dependency on its
++                        # removal.
++                        if ((base_app_label, base_name, field_name) in self.old_field_keys and
++                                (base_app_label, base_name, field_name) not in self.new_field_keys):
++                            dependencies.append((base_app_label, base_name, field_name, False))
+             # Depend on the other end of the primary key if it's a relation
+             if primary_key_rel:
+                 dependencies.append((
+diff --git a/tests/migrations/test_autodetector.py b/tests/migrations/test_autodetector.py
+index daff57fc2c..7f0e91a7f2 100644
+--- a/tests/migrations/test_autodetector.py
++++ b/tests/migrations/test_autodetector.py
+@@ -2193,6 +2193,30 @@ class AutodetectorTests(TestCase):
+         self.assertOperationAttributes(changes, 'testapp', 0, 0, name="Author")
+         self.assertOperationAttributes(changes, 'testapp', 0, 1, name="Aardvark")
+ 
++    def test_move_field_to_subclass_orders_removal_first(self):
++        """
++        Moving a field from a base model to a subclass in the same migration
++        should cause the field to be removed from the base before the
++        subclass is created (to avoid a field name clash on model creation).
++        """
++        Readable_old = ModelState('testapp', 'Readable', [
++            ('id', models.AutoField(primary_key=True)),
++            ('title', models.CharField(max_length=200)),
++        ])
++        Readable_new = ModelState('testapp', 'Readable', [
++            ('id', models.AutoField(primary_key=True)),
++        ])
++        Book = ModelState('testapp', 'Book', [
++            ('id', models.AutoField(primary_key=True)),
++            ('title', models.CharField(max_length=200)),
++        ], bases=('testapp.Readable',))
++        changes = self.get_changes([Readable_old], [Readable_new, Book])
++        # Should remove the field from Readable before creating Book
++        self.assertNumberMigrations(changes, 'testapp', 1)
++        self.assertOperationTypes(changes, 'testapp', 0, ['RemoveField', 'CreateModel'])
++        self.assertOperationAttributes(changes, 'testapp', 0, 0, model_name='Readable', name='title')
++        self.assertOperationAttributes(changes, 'testapp', 0, 1, name='Book')
++
+     def test_multiple_bases(self):
+         """#23956 - Inheriting models doesn't move *_ptr fields into AddField operations."""
+         A = ModelState("app", "A", [("a_id", models.AutoField(primary_key=True))])

@@ -1,0 +1,65 @@
+diff --git a/django/contrib/admin/options.py b/django/contrib/admin/options.py
+index 69a5fbf389..9e8669ff88 100644
+--- a/django/contrib/admin/options.py
++++ b/django/contrib/admin/options.py
+@@ -250,15 +250,20 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
+         db = kwargs.get('using')
+ 
+         autocomplete_fields = self.get_autocomplete_fields(request)
+-        if db_field.name in autocomplete_fields:
+-            kwargs['widget'] = AutocompleteSelectMultiple(db_field.remote_field, self.admin_site, using=db)
+-        elif db_field.name in self.raw_id_fields:
+-            kwargs['widget'] = widgets.ManyToManyRawIdWidget(db_field.remote_field, self.admin_site, using=db)
+-        elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
+-            kwargs['widget'] = widgets.FilteredSelectMultiple(
+-                db_field.verbose_name,
+-                db_field.name in self.filter_vertical
+-            )
++        # Only set a default widget when one isn't provided in kwargs. This
++        # mirrors the behavior of formfield_for_foreignkey(), and allows users
++        # to override the widget by passing a 'widget' argument to
++        # formfield_for_manytomany().
++        if 'widget' not in kwargs:
++            if db_field.name in autocomplete_fields:
++                kwargs['widget'] = AutocompleteSelectMultiple(db_field.remote_field, self.admin_site, using=db)
++            elif db_field.name in self.raw_id_fields:
++                kwargs['widget'] = widgets.ManyToManyRawIdWidget(db_field.remote_field, self.admin_site, using=db)
++            elif db_field.name in [*self.filter_vertical, *self.filter_horizontal]:
++                kwargs['widget'] = widgets.FilteredSelectMultiple(
++                    db_field.verbose_name,
++                    db_field.name in self.filter_vertical
++                )
+ 
+         if 'queryset' not in kwargs:
+             queryset = self.get_field_queryset(db, db_field, request)
+diff --git a/tests/admin_widgets/tests.py b/tests/admin_widgets/tests.py
+index 719d0d8095..ffa9d1985c 100644
+--- a/tests/admin_widgets/tests.py
++++ b/tests/admin_widgets/tests.py
+@@ -184,6 +184,26 @@ class AdminFormfieldForDBFieldTests(SimpleTestCase):
+             'Hold down “Control”, or “Command” on a Mac, to select more than one.'
+         )
+ 
++    def test_formfield_for_manytomany_allows_widget_override(self):
++        """Ensure that providing a 'widget' kwarg in formfield_for_manytomany
++        is respected and not overridden by the admin default behavior.
++        """
++        class MyAdmin(admin.ModelAdmin):
++            def formfield_for_manytomany(self, db_field, request, **kwargs):
++                if db_field.name == 'members':
++                    # Provide a custom widget instance
++                    kwargs['widget'] = forms.TextInput()
++                return super().formfield_for_manytomany(db_field, request, **kwargs)
++
++        ma = MyAdmin(Band, admin.site)
++        ff = ma.formfield_for_dbfield(Band._meta.get_field('members'), request=None)
++        # If wrapped with RelatedFieldWidgetWrapper, unwrap to get underlying widget
++        if isinstance(ff.widget, widgets.RelatedFieldWidgetWrapper):
++            widget = ff.widget.widget
++        else:
++            widget = ff.widget
++        self.assertIsInstance(widget, forms.TextInput)
++
+ 
+ @override_settings(ROOT_URLCONF='admin_widgets.urls')
+ class AdminFormfieldForDBFieldWithRequestTests(TestDataMixin, TestCase):
