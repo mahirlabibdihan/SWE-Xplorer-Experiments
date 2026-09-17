@@ -1,0 +1,1394 @@
+Generated action #1: cat <<'EOF' > /testbed/run_test.sh && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+OUT=/tmp/repro_out.txt
+mkdir -p /testbed
+
+log() { echo "[$(date +%T)] $*"; }
+
+# Ensure redis-server and redis-cli available (try apt-get if missing)
+if ! command -v redis-server >/dev/null 2>&1 || ! command -v redis-cli >/dev/null 2>&1; then
+  log "redis-server or redis-cli missing, attempting apt-get install (non-interactive)..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y redis-server >/dev/null 2>&1 || {
+    log "apt-get install redis-server failed. Will write SKIPPED tests."
+    cat > /testbed/test_status.json <<JSON
+{"tests":[{"name":"testbed/case1_repro","status":"SKIPPED"},{"name":"testbed/case2_repro","status":"SKIPPED"}]}
+JSON
+    exit 0
+  }
+fi
+
+# Start redis-server in background (daemonize)
+log "Starting redis-server..."
+# Use a temp config via command-line args to avoid persistence
+redis-server --port 6379 --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+
+# Wait for redis to be ready
+for i in $(seq 1 20); do
+  if redis-cli ping >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+
+if ! redis-cli ping >/dev/null 2>&1; then
+  log "redis-server did not start; aborting."
+  cat > /testbed/test_status.json <<JSON
+{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}
+JSON
+  exit 1
+fi
+
+run_case1() {
+  log "Running Case 1 reproduction..."
+  redis-cli FLUSHALL >/dev/null
+  {
+    echo "XGROUP CREATE planets processing \$ MKSTREAM"
+    echo "XADD planets 0-1 name Mercury"
+    echo "XADD planets 0-2 name Venus"
+    echo "XREADGROUP GROUP processing alice STREAMS planets >"
+    echo "XADD planets 0-3 name Earth"
+    echo "XADD planets 0-4 name Jupiter"
+    echo "XINFO GROUPS planets"
+    echo "XDEL planets 0-1"
+    echo "XDEL planets 0-2"
+    echo "XINFO GROUPS planets"
+    echo "XDEL planets 0-3"
+    echo "XINFO GROUPS planets"
+    echo "XREADGROUP GROUP processing alice STREAMS planets >"
+    echo "XINFO GROUPS planets"
+  } > /tmp/case1_cmds.txt
+
+  # Execute commands and capture raw output
+  while read -r line; do
+    # For XINFO use --raw to easier parse; for others use default
+    if [[ $line == XINFO* ]]; then
+      redis-cli --raw ${line#XINFO } 2>&1
+    else
+      # For XREADGROUP, need to avoid shell interpreting >
+      if [[ $line == XREADGROUP* ]]; then
+        # Execute the literal command, preserving '>' token at end
+        redis-cli --raw $(echo "$line" | sed "s/>//") ">" 2>&1 || true
+      else
+        # For other commands pass as-is (split)
+        # Use eval-safe invocation by using redis-cli with args
+        cmd=( $line )
+        redis-cli --raw "\${cmd[@]}" >/dev/null 2>&1 || redis-cli --raw ${cmd[@]} 2>&1 || true
+      fi
+    fi
+  done < /tmp/case1_cmds.txt > /tmp/case1_out.txt 2>&1 || true
+
+  # Because above attempt to handle > was awkward, run the sequence explicitly to reliably capture outputs:
+  # Re-run explicit sequence, capturing key XINFO outputs
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  redis-cli --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  redis-cli --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  # Read remaining messages
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  # Helper to extract a field value from XINFO --raw output
+  get_field() {
+    local txt="$1"
+    local key="$2"
+    echo "$txt" | awk -v k="$key" '{
+      if($0==k){getline; print; exit}
+    }'
+  }
+
+  lag_after_delete3=$(get_field "$info3" "lag" || true)
+  entries_read_after_read=$(get_field "$info4" "entries-read" || true)
+  lag_after_read=$(get_field "$info4" "lag" || true)
+
+  # For decision, we expect buggy behavior if:
+  # - lag_after_delete3 is not "(nil)" (i.e., an integer) -> bug
+  # - after reading to end, entries-read < expected 4 OR lag_after_read != "0"
+  bug1=false
+  if [[ -n "$lag_after_delete3" && "$lag_after_delete3" != "(nil)" ]]; then
+    bug1=true
+  fi
+  bug1_after_read=false
+  if [[ -n "$entries_read_after_read" && "$entries_read_after_read" -lt 4 ]] || [[ "$lag_after_read" != "0" ]]; then
+    bug1_after_read=true
+  fi
+
+  # Compose result
+  if $bug1 && $bug1_after_read; then
+    echo "CASE1: BUG observed (lag remained integer after deletion AND entries-read/lag incorrect after reading to end)" > /tmp/case1_result.txt
+    return 0
+  else
+    echo "CASE1: BUG NOT observed. Details:" > /tmp/case1_result.txt
+    echo "lag_after_delete3='$lag_after_delete3'" >> /tmp/case1_result.txt
+    echo "entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'" >> /tmp/case1_result.txt
+    return 1
+  fi
+}
+
+run_case2() {
+  log "Running Case 2 reproduction..."
+  redis-cli FLUSHALL >/dev/null
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  # Delete only 0-3 (not 0-2)
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  # Read remaining
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  get_field() {
+    local txt="$1"
+    local key="$2"
+    echo "$txt" | awk -v k="$key" '{
+      if($0==k){getline; print; exit}
+    }'
+  }
+
+  lag_after_delete=$(get_field "$info1" "lag" || true)
+  entries_read_after_read=$(get_field "$info2" "entries-read" || true)
+  lag_after_read=$(get_field "$info2" "lag" || true)
+
+  # Expectation: initially lag is (nil) -> correct; but after reading to end, bug shows entries-read < 4 or lag != 0
+  bug2=false
+  if [[ -n "$lag_after_delete" && "$lag_after_delete" != "(nil)" ]]; then
+    # If initial lag already not nil, it's unexpected; treat as bug as well
+    bug2=true
+  fi
+  if [[ -n "$entries_read_after_read" && "$entries_read_after_read" -lt 4 ]] || [[ "$lag_after_read" != "0" ]]; then
+    bug2=true
+  fi
+
+  if $bug2; then
+    echo "CASE2: BUG observed (either initial lag not nil when it should be nil OR entries-read/lag incorrect after reading to end)" > /tmp/case2_result.txt
+    return 0
+  else
+    echo "CASE2: BUG NOT observed. Details:" > /tmp/case2_result.txt
+    echo "lag_after_delete='$lag_after_delete'" >> /tmp/case2_result.txt
+    echo "entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'" >> /tmp/case2_result.txt
+    return 1
+  fi
+}
+
+status1=FAILED
+status2=FAILED
+if run_case1 >/tmp/case1_full.txt 2>&1; then
+  status1=PASSED
+else
+  status1=FAILED
+fi
+
+if run_case2 >/tmp/case2_full.txt 2>&1; then
+  status2=PASSED
+else
+  status2=FAILED
+fi
+
+# Stop redis
+log "Stopping redis-server..."
+redis-cli shutdown nosave >/dev/null 2>&1 || true
+
+# Write test_status.json to /testbed/test_status.json
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {
+      "name": "testbed/case1_repro",
+      "status": "$status1"
+    },
+    {
+      "name": "testbed/case2_repro",
+      "status": "$status2"
+    }
+  ]
+}
+JSON
+
+# Output summary to stdout for visibility
+echo "==== CASE1 OUTPUT SUMMARY ===="
+sed -n '1,120p' /tmp/case1_full.txt || true
+sed -n '1,120p' /tmp/case1_result.txt || true
+echo "==== CASE2 OUTPUT SUMMARY ===="
+sed -n '1,120p' /tmp/case2_full.txt || true
+sed -n '1,120p' /tmp/case2_result.txt || true
+echo "Wrote /testbed/test_status.json with statuses: $status1, $status2"
+EOF
+>> Executing selected action #1: cat <<'EOF' > /testbed/run_test.sh && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+OUT=/tmp/repro_out.txt
+mkdir -p /testbed
+
+log() { echo "[$(date +%T)] $*"; }
+
+# Ensure redis-server and redis-cli available (try apt-get if missing)
+if ! command -v redis-server >/dev/null 2>&1 || ! command -v redis-cli >/dev/null 2>&1; then
+  log "redis-server or redis-cli missing, attempting apt-get install (non-interactive)..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y redis-server >/dev/null 2>&1 || {
+    log "apt-get install redis-server failed. Will write SKIPPED tests."
+    cat > /testbed/test_status.json <<JSON
+{"tests":[{"name":"testbed/case1_repro","status":"SKIPPED"},{"name":"testbed/case2_repro","status":"SKIPPED"}]}
+JSON
+    exit 0
+  }
+fi
+
+# Start redis-server in background (daemonize)
+log "Starting redis-server..."
+# Use a temp config via command-line args to avoid persistence
+redis-server --port 6379 --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+
+# Wait for redis to be ready
+for i in $(seq 1 20); do
+  if redis-cli ping >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+
+if ! redis-cli ping >/dev/null 2>&1; then
+  log "redis-server did not start; aborting."
+  cat > /testbed/test_status.json <<JSON
+{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}
+JSON
+  exit 1
+fi
+
+run_case1() {
+  log "Running Case 1 reproduction..."
+  redis-cli FLUSHALL >/dev/null
+  {
+    echo "XGROUP CREATE planets processing \$ MKSTREAM"
+    echo "XADD planets 0-1 name Mercury"
+    echo "XADD planets 0-2 name Venus"
+    echo "XREADGROUP GROUP processing alice STREAMS planets >"
+    echo "XADD planets 0-3 name Earth"
+    echo "XADD planets 0-4 name Jupiter"
+    echo "XINFO GROUPS planets"
+    echo "XDEL planets 0-1"
+    echo "XDEL planets 0-2"
+    echo "XINFO GROUPS planets"
+    echo "XDEL planets 0-3"
+    echo "XINFO GROUPS planets"
+    echo "XREADGROUP GROUP processing alice STREAMS planets >"
+    echo "XINFO GROUPS planets"
+  } > /tmp/case1_cmds.txt
+
+  # Execute commands and capture raw output
+  while read -r line; do
+    # For XINFO use --raw to easier parse; for others use default
+    if [[ $line == XINFO* ]]; then
+      redis-cli --raw ${line#XINFO } 2>&1
+    else
+      # For XREADGROUP, need to avoid shell interpreting >
+      if [[ $line == XREADGROUP* ]]; then
+        # Execute the literal command, preserving '>' token at end
+        redis-cli --raw $(echo "$line" | sed "s/>//") ">" 2>&1 || true
+      else
+        # For other commands pass as-is (split)
+        # Use eval-safe invocation by using redis-cli with args
+        cmd=( $line )
+        redis-cli --raw "\${cmd[@]}" >/dev/null 2>&1 || redis-cli --raw ${cmd[@]} 2>&1 || true
+      fi
+    fi
+  done < /tmp/case1_cmds.txt > /tmp/case1_out.txt 2>&1 || true
+
+  # Because above attempt to handle > was awkward, run the sequence explicitly to reliably capture outputs:
+  # Re-run explicit sequence, capturing key XINFO outputs
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  redis-cli --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  redis-cli --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  # Read remaining messages
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  # Helper to extract a field value from XINFO --raw output
+  get_field() {
+    local txt="$1"
+    local key="$2"
+    echo "$txt" | awk -v k="$key" '{
+      if($0==k){getline; print; exit}
+    }'
+  }
+
+  lag_after_delete3=$(get_field "$info3" "lag" || true)
+  entries_read_after_read=$(get_field "$info4" "entries-read" || true)
+  lag_after_read=$(get_field "$info4" "lag" || true)
+
+  # For decision, we expect buggy behavior if:
+  # - lag_after_delete3 is not "(nil)" (i.e., an integer) -> bug
+  # - after reading to end, entries-read < expected 4 OR lag_after_read != "0"
+  bug1=false
+  if [[ -n "$lag_after_delete3" && "$lag_after_delete3" != "(nil)" ]]; then
+    bug1=true
+  fi
+  bug1_after_read=false
+  if [[ -n "$entries_read_after_read" && "$entries_read_after_read" -lt 4 ]] || [[ "$lag_after_read" != "0" ]]; then
+    bug1_after_read=true
+  fi
+
+  # Compose result
+  if $bug1 && $bug1_after_read; then
+    echo "CASE1: BUG observed (lag remained integer after deletion AND entries-read/lag incorrect after reading to end)" > /tmp/case1_result.txt
+    return 0
+  else
+    echo "CASE1: BUG NOT observed. Details:" > /tmp/case1_result.txt
+    echo "lag_after_delete3='$lag_after_delete3'" >> /tmp/case1_result.txt
+    echo "entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'" >> /tmp/case1_result.txt
+    return 1
+  fi
+}
+
+run_case2() {
+  log "Running Case 2 reproduction..."
+  redis-cli FLUSHALL >/dev/null
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  # Delete only 0-3 (not 0-2)
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+  # Read remaining
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  get_field() {
+    local txt="$1"
+    local key="$2"
+    echo "$txt" | awk -v k="$key" '{
+      if($0==k){getline; print; exit}
+    }'
+  }
+
+  lag_after_delete=$(get_field "$info1" "lag" || true)
+  entries_read_after_read=$(get_field "$info2" "entries-read" || true)
+  lag_after_read=$(get_field "$info2" "lag" || true)
+
+  # Expectation: initially lag is (nil) -> correct; but after reading to end, bug shows entries-read < 4 or lag != 0
+  bug2=false
+  if [[ -n "$lag_after_delete" && "$lag_after_delete" != "(nil)" ]]; then
+    # If initial lag already not nil, it's unexpected; treat as bug as well
+    bug2=true
+  fi
+  if [[ -n "$entries_read_after_read" && "$entries_read_after_read" -lt 4 ]] || [[ "$lag_after_read" != "0" ]]; then
+    bug2=true
+  fi
+
+  if $bug2; then
+    echo "CASE2: BUG observed (either initial lag not nil when it should be nil OR entries-read/lag incorrect after reading to end)" > /tmp/case2_result.txt
+    return 0
+  else
+    echo "CASE2: BUG NOT observed. Details:" > /tmp/case2_result.txt
+    echo "lag_after_delete='$lag_after_delete'" >> /tmp/case2_result.txt
+    echo "entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'" >> /tmp/case2_result.txt
+    return 1
+  fi
+}
+
+status1=FAILED
+status2=FAILED
+if run_case1 >/tmp/case1_full.txt 2>&1; then
+  status1=PASSED
+else
+  status1=FAILED
+fi
+
+if run_case2 >/tmp/case2_full.txt 2>&1; then
+  status2=PASSED
+else
+  status2=FAILED
+fi
+
+# Stop redis
+log "Stopping redis-server..."
+redis-cli shutdown nosave >/dev/null 2>&1 || true
+
+# Write test_status.json to /testbed/test_status.json
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {
+      "name": "testbed/case1_repro",
+      "status": "$status1"
+    },
+    {
+      "name": "testbed/case2_repro",
+      "status": "$status2"
+    }
+  ]
+}
+JSON
+
+# Output summary to stdout for visibility
+echo "==== CASE1 OUTPUT SUMMARY ===="
+sed -n '1,120p' /tmp/case1_full.txt || true
+sed -n '1,120p' /tmp/case1_result.txt || true
+echo "==== CASE2 OUTPUT SUMMARY ===="
+sed -n '1,120p' /tmp/case2_full.txt || true
+sed -n '1,120p' /tmp/case2_result.txt || true
+echo "Wrote /testbed/test_status.json with statuses: $status1, $status2"
+EOF
+Generated action #1: cat <<'EOF' > /testbed/run_test.sh && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+mkdir -p /testbed
+log() { echo "[$(date +%T)] $*"; }
+
+# Ensure redis-cli and redis-server
+if ! command -v redis-cli >/dev/null 2>&1 || ! command -v redis-server >/dev/null 2>&1; then
+  log "Installing redis-server (non-interactive)..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y redis-server >/dev/null 2>&1 || true
+fi
+
+# Kill any existing redis-server on default port to avoid conflicts, then start a fresh one
+pkill redis-server >/dev/null 2>&1 || true
+sleep 0.2
+log "Starting redis-server..."
+redis-server --port 6379 --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+
+# wait for redis to be ready
+for i in $(seq 1 20); do
+  if redis-cli ping >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+if ! redis-cli ping >/dev/null 2>&1; then
+  echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+  echo "Redis failed to start"
+  exit 1
+fi
+
+get_field() {
+  local txt="$1"; local key="$2"
+  # Handle empty input
+  if [[ -z "$txt" ]]; then
+    echo ""
+    return
+  fi
+  echo "$txt" | awk -v k="$key" '{
+    if($0==k){ if(getline) print; else print "" ; exit}
+  }'
+}
+
+run_case1() {
+  log "Case1: Running explicit sequence..."
+  redis-cli FLUSHALL >/dev/null
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  redis-cli --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  redis-cli --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  # Read remaining items
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete3=$(get_field "$info3" "lag")
+  entries_read_after_read=$(get_field "$info4" "entries-read")
+  lag_after_read=$(get_field "$info4" "lag")
+
+  echo "CASE1 INFO SNIPPETS:"
+  echo "info1:"
+  echo "$info1"
+  echo "info2:"
+  echo "$info2"
+  echo "info3:"
+  echo "$info3"
+  echo "info4:"
+  echo "$info4"
+  echo "Parsed: lag_after_delete3='$lag_after_delete3' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  # Determine bug presence per PR expectations:
+  # After deleting an entry between last-delivered-id and last-generated-id, lag should be NIL -> bug if NOT nil
+  bug_stage1=false
+  if [[ "$lag_after_delete3" != "(nil)" && -n "$lag_after_delete3" ]]; then
+    bug_stage1=true
+  fi
+
+  # After reading to end, entries-read should be 4 and lag 0. Bug if not.
+  bug_stage2=false
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then
+    bug_stage2=true
+  fi
+
+  if $bug_stage1 && $bug_stage2; then
+    echo "CASE1 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE1 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+run_case2() {
+  log "Case2: Running explicit sequence..."
+  redis-cli FLUSHALL >/dev/null
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  # Delete only 0-3
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  # Read remaining
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete=$(get_field "$info1" "lag")
+  entries_read_after_read=$(get_field "$info2" "entries-read")
+  lag_after_read=$(get_field "$info2" "lag")
+
+  echo "CASE2 INFO SNIPPETS:"
+  echo "info1:"
+  echo "$info1"
+  echo "info2:"
+  echo "$info2"
+  echo "Parsed: lag_after_delete='$lag_after_delete' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  # Expect initially lag nil; after reading to end entries-read==4 and lag==0. Bug if not.
+  bug=false
+  if [[ "$lag_after_delete" != "(nil)" && -n "$lag_after_delete" ]]; then
+    bug=true
+  fi
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then
+    bug=true
+  fi
+
+  if $bug; then
+    echo "CASE2 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE2 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+status1=FAILED
+status2=FAILED
+if run_case1 >/tmp/case1_full.txt 2>&1; then status1=PASSED; else status1=FAILED; fi
+if run_case2 >/tmp/case2_full.txt 2>&1; then status2=PASSED; else status2=FAILED; fi
+
+# Stop redis
+log "Stopping redis-server..."
+redis-cli shutdown nosave >/dev/null 2>&1 || true
+
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {"name":"testbed/case1_repro","status":"$status1"},
+    {"name":"testbed/case2_repro","status":"$status2"}
+  ]
+}
+JSON
+
+echo "==== CASE1 OUTPUT ===="
+sed -n '1,200p' /tmp/case1_full.txt || true
+echo "==== CASE2 OUTPUT ===="
+sed -n '1,200p' /tmp/case2_full.txt || true
+echo "WROTE /testbed/test_status.json with statuses: $status1, $status2"
+EOF
+>> Executing selected action #2: cat <<'EOF' > /testbed/run_test.sh && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+mkdir -p /testbed
+log() { echo "[$(date +%T)] $*"; }
+
+# Ensure redis-cli and redis-server
+if ! command -v redis-cli >/dev/null 2>&1 || ! command -v redis-server >/dev/null 2>&1; then
+  log "Installing redis-server (non-interactive)..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y redis-server >/dev/null 2>&1 || true
+fi
+
+# Kill any existing redis-server on default port to avoid conflicts, then start a fresh one
+pkill redis-server >/dev/null 2>&1 || true
+sleep 0.2
+log "Starting redis-server..."
+redis-server --port 6379 --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+
+# wait for redis to be ready
+for i in $(seq 1 20); do
+  if redis-cli ping >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+if ! redis-cli ping >/dev/null 2>&1; then
+  echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+  echo "Redis failed to start"
+  exit 1
+fi
+
+get_field() {
+  local txt="$1"; local key="$2"
+  # Handle empty input
+  if [[ -z "$txt" ]]; then
+    echo ""
+    return
+  fi
+  echo "$txt" | awk -v k="$key" '{
+    if($0==k){ if(getline) print; else print "" ; exit}
+  }'
+}
+
+run_case1() {
+  log "Case1: Running explicit sequence..."
+  redis-cli FLUSHALL >/dev/null
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  redis-cli --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  redis-cli --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  # Read remaining items
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete3=$(get_field "$info3" "lag")
+  entries_read_after_read=$(get_field "$info4" "entries-read")
+  lag_after_read=$(get_field "$info4" "lag")
+
+  echo "CASE1 INFO SNIPPETS:"
+  echo "info1:"
+  echo "$info1"
+  echo "info2:"
+  echo "$info2"
+  echo "info3:"
+  echo "$info3"
+  echo "info4:"
+  echo "$info4"
+  echo "Parsed: lag_after_delete3='$lag_after_delete3' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  # Determine bug presence per PR expectations:
+  # After deleting an entry between last-delivered-id and last-generated-id, lag should be NIL -> bug if NOT nil
+  bug_stage1=false
+  if [[ "$lag_after_delete3" != "(nil)" && -n "$lag_after_delete3" ]]; then
+    bug_stage1=true
+  fi
+
+  # After reading to end, entries-read should be 4 and lag 0. Bug if not.
+  bug_stage2=false
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then
+    bug_stage2=true
+  fi
+
+  if $bug_stage1 && $bug_stage2; then
+    echo "CASE1 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE1 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+run_case2() {
+  log "Case2: Running explicit sequence..."
+  redis-cli FLUSHALL >/dev/null
+  redis-cli --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  redis-cli --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  redis-cli --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  # Delete only 0-3
+  redis-cli --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  # Read remaining
+  redis-cli --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$(redis-cli --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete=$(get_field "$info1" "lag")
+  entries_read_after_read=$(get_field "$info2" "entries-read")
+  lag_after_read=$(get_field "$info2" "lag")
+
+  echo "CASE2 INFO SNIPPETS:"
+  echo "info1:"
+  echo "$info1"
+  echo "info2:"
+  echo "$info2"
+  echo "Parsed: lag_after_delete='$lag_after_delete' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  # Expect initially lag nil; after reading to end entries-read==4 and lag==0. Bug if not.
+  bug=false
+  if [[ "$lag_after_delete" != "(nil)" && -n "$lag_after_delete" ]]; then
+    bug=true
+  fi
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then
+    bug=true
+  fi
+
+  if $bug; then
+    echo "CASE2 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE2 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+status1=FAILED
+status2=FAILED
+if run_case1 >/tmp/case1_full.txt 2>&1; then status1=PASSED; else status1=FAILED; fi
+if run_case2 >/tmp/case2_full.txt 2>&1; then status2=PASSED; else status2=FAILED; fi
+
+# Stop redis
+log "Stopping redis-server..."
+redis-cli shutdown nosave >/dev/null 2>&1 || true
+
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {"name":"testbed/case1_repro","status":"$status1"},
+    {"name":"testbed/case2_repro","status":"$status2"}
+  ]
+}
+JSON
+
+echo "==== CASE1 OUTPUT ===="
+sed -n '1,200p' /tmp/case1_full.txt || true
+echo "==== CASE2 OUTPUT ===="
+sed -n '1,200p' /tmp/case2_full.txt || true
+echo "WROTE /testbed/test_status.json with statuses: $status1, $status2"
+EOF
+Generated action #1: cat > /testbed/run_test.sh <<'SH' && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+mkdir -p /testbed /tmp/redis-build
+REDIS_PORT=6380
+REDIS_PREFIX=/tmp/redis-build/redis-7.2.4
+REDIS_SRC=$REDIS_PREFIX/src
+log(){ echo "[$(date +%T)] $*"; }
+
+# Install build deps if missing
+if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+  log "Installing build dependencies..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y build-essential tcl git wget ca-certificates >/dev/null 2>&1 || true
+fi
+
+# Clone and build Redis 7.2.4 if not already built
+if [[ ! -x "$REDIS_SRC/redis-server" ]]; then
+  log "Cloning Redis 7.2.4 and building..."
+  rm -rf $REDIS_PREFIX
+  mkdir -p /tmp/redis-build
+  git clone --branch 7.2.4 --depth 1 https://github.com/redis/redis.git $REDIS_PREFIX >/dev/null 2>&1
+  if [[ ! -d "$REDIS_PREFIX" ]]; then
+    echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+    echo "Failed to clone redis repo"
+    exit 1
+  fi
+  (cd $REDIS_PREFIX && make -j >/dev/null 2>&1) || { echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json; echo "Build failed"; exit 1; }
+fi
+
+RSERVER="$REDIS_SRC/redis-server"
+RCLI="$REDIS_SRC/redis-cli"
+
+# Ensure previous test server on this port is not running
+pkill -f "$RSERVER.*port $REDIS_PORT" >/dev/null 2>&1 || true
+sleep 0.1
+
+log "Starting redis-server (built) on port $REDIS_PORT..."
+$RSERVER --port $REDIS_PORT --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+
+# wait for ready
+for i in $(seq 1 30); do
+  if $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+if ! $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then
+  echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+  echo "Built redis-server failed to start"
+  exit 1
+fi
+
+parse_field() {
+  local txt="$1"; local key="$2"
+  if [[ -z "$txt" ]]; then echo ""; return; fi
+  echo "$txt" | awk -v k="$key" '{
+    if($0==k){ if(getline) print; else print "" ; exit}
+  }'
+}
+
+run_case1(){
+  log "Case1: running sequence..."
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info1=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info2=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete3=$(parse_field "$info3" "lag")
+  entries_read_after_read=$(parse_field "$info4" "entries-read")
+  lag_after_read=$(parse_field "$info4" "lag")
+
+  echo "CASE1 INFO:"
+  echo "info3:"
+  echo "$info3"
+  echo "info4:"
+  echo "$info4"
+  echo "Parsed: lag_after_delete3='$lag_after_delete3' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  bug_stage1=false
+  if [[ -n "$lag_after_delete3" && "$lag_after_delete3" != "(nil)" ]]; then bug_stage1=true; fi
+  bug_stage2=false
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug_stage2=true; fi
+
+  if $bug_stage1 && $bug_stage2; then
+    echo "CASE1 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE1 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+run_case2(){
+  log "Case2: running sequence..."
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete=$(parse_field "$info1" "lag")
+  entries_read_after_read=$(parse_field "$info2" "entries-read")
+  lag_after_read=$(parse_field "$info2" "lag")
+
+  echo "CASE2 INFO:"
+  echo "info1:"
+  echo "$info1"
+  echo "info2:"
+  echo "$info2"
+  echo "Parsed: lag_after_delete='$lag_after_delete' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  bug=false
+  if [[ -n "$lag_after_delete" && "$lag_after_delete" != "(nil)" ]]; then bug=true; fi
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug=true; fi
+
+  if $bug; then
+    echo "CASE2 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE2 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+status1=FAILED; status2=FAILED
+if run_case1 >/tmp/case1_build.txt 2>&1; then status1=PASSED; else status1=FAILED; fi
+if run_case2 >/tmp/case2_build.txt 2>&1; then status2=PASSED; else status2=FAILED; fi
+
+# Shutdown built server
+log "Shutting down built redis-server..."
+$RCLI -p $REDIS_PORT shutdown nosave >/dev/null 2>&1 || true
+
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {"name":"testbed/case1_repro","status":"$status1"},
+    {"name":"testbed/case2_repro","status":"$status2"}
+  ]
+}
+JSON
+
+echo "==== CASE1 LOG ===="
+sed -n '1,200p' /tmp/case1_build.txt || true
+echo "==== CASE2 LOG ===="
+sed -n '1,200p' /tmp/case2_build.txt || true
+echo "WROTE /testbed/test_status.json with statuses: $status1, $status2"
+SH
+>> Executing selected action #3: cat > /testbed/run_test.sh <<'SH' && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+mkdir -p /testbed /tmp/redis-build
+REDIS_PORT=6380
+REDIS_PREFIX=/tmp/redis-build/redis-7.2.4
+REDIS_SRC=$REDIS_PREFIX/src
+log(){ echo "[$(date +%T)] $*"; }
+
+# Install build deps if missing
+if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+  log "Installing build dependencies..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y build-essential tcl git wget ca-certificates >/dev/null 2>&1 || true
+fi
+
+# Clone and build Redis 7.2.4 if not already built
+if [[ ! -x "$REDIS_SRC/redis-server" ]]; then
+  log "Cloning Redis 7.2.4 and building..."
+  rm -rf $REDIS_PREFIX
+  mkdir -p /tmp/redis-build
+  git clone --branch 7.2.4 --depth 1 https://github.com/redis/redis.git $REDIS_PREFIX >/dev/null 2>&1
+  if [[ ! -d "$REDIS_PREFIX" ]]; then
+    echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+    echo "Failed to clone redis repo"
+    exit 1
+  fi
+  (cd $REDIS_PREFIX && make -j >/dev/null 2>&1) || { echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json; echo "Build failed"; exit 1; }
+fi
+
+RSERVER="$REDIS_SRC/redis-server"
+RCLI="$REDIS_SRC/redis-cli"
+
+# Ensure previous test server on this port is not running
+pkill -f "$RSERVER.*port $REDIS_PORT" >/dev/null 2>&1 || true
+sleep 0.1
+
+log "Starting redis-server (built) on port $REDIS_PORT..."
+$RSERVER --port $REDIS_PORT --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+
+# wait for ready
+for i in $(seq 1 30); do
+  if $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+if ! $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then
+  echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+  echo "Built redis-server failed to start"
+  exit 1
+fi
+
+parse_field() {
+  local txt="$1"; local key="$2"
+  if [[ -z "$txt" ]]; then echo ""; return; fi
+  echo "$txt" | awk -v k="$key" '{
+    if($0==k){ if(getline) print; else print "" ; exit}
+  }'
+}
+
+run_case1(){
+  log "Case1: running sequence..."
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info1=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info2=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete3=$(parse_field "$info3" "lag")
+  entries_read_after_read=$(parse_field "$info4" "entries-read")
+  lag_after_read=$(parse_field "$info4" "lag")
+
+  echo "CASE1 INFO:"
+  echo "info3:"
+  echo "$info3"
+  echo "info4:"
+  echo "$info4"
+  echo "Parsed: lag_after_delete3='$lag_after_delete3' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  bug_stage1=false
+  if [[ -n "$lag_after_delete3" && "$lag_after_delete3" != "(nil)" ]]; then bug_stage1=true; fi
+  bug_stage2=false
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug_stage2=true; fi
+
+  if $bug_stage1 && $bug_stage2; then
+    echo "CASE1 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE1 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+run_case2(){
+  log "Case2: running sequence..."
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete=$(parse_field "$info1" "lag")
+  entries_read_after_read=$(parse_field "$info2" "entries-read")
+  lag_after_read=$(parse_field "$info2" "lag")
+
+  echo "CASE2 INFO:"
+  echo "info1:"
+  echo "$info1"
+  echo "info2:"
+  echo "$info2"
+  echo "Parsed: lag_after_delete='$lag_after_delete' entries_read_after_read='$entries_read_after_read' lag_after_read='$lag_after_read'"
+
+  bug=false
+  if [[ -n "$lag_after_delete" && "$lag_after_delete" != "(nil)" ]]; then bug=true; fi
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug=true; fi
+
+  if $bug; then
+    echo "CASE2 RESULT: BUG observed"
+    return 0
+  else
+    echo "CASE2 RESULT: BUG NOT observed"
+    return 1
+  fi
+}
+
+status1=FAILED; status2=FAILED
+if run_case1 >/tmp/case1_build.txt 2>&1; then status1=PASSED; else status1=FAILED; fi
+if run_case2 >/tmp/case2_build.txt 2>&1; then status2=PASSED; else status2=FAILED; fi
+
+# Shutdown built server
+log "Shutting down built redis-server..."
+$RCLI -p $REDIS_PORT shutdown nosave >/dev/null 2>&1 || true
+
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {"name":"testbed/case1_repro","status":"$status1"},
+    {"name":"testbed/case2_repro","status":"$status2"}
+  ]
+}
+JSON
+
+echo "==== CASE1 LOG ===="
+sed -n '1,200p' /tmp/case1_build.txt || true
+echo "==== CASE2 LOG ===="
+sed -n '1,200p' /tmp/case2_build.txt || true
+echo "WROTE /testbed/test_status.json with statuses: $status1, $status2"
+SH
+Generated action #1: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+>> Executing selected action #4: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+Reproduction submission failed validation: Reproduction submission rejected: after executing run_test.sh, the generated test_status.json contains no FAILED tests. This means the reproduction did not match a failing issue state. Adjust run_test.sh and try again.
+Generated action #1: cat > /testbed/run_test.sh <<'SH' && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+mkdir -p /testbed /tmp/redis-build
+REDIS_PORT=6380
+REDIS_PREFIX=/tmp/redis-build/redis-7.2.4
+REDIS_SRC=$REDIS_PREFIX/src
+log(){ echo "[$(date +%T)] $*"; }
+
+# Ensure build tools and clone/build Redis if needed
+if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y build-essential tcl git wget ca-certificates >/dev/null 2>&1 || true
+fi
+
+if [[ ! -x "$REDIS_SRC/redis-server" ]]; then
+  log "Cloning Redis 7.2.4 and building..."
+  rm -rf $REDIS_PREFIX
+  git clone --branch 7.2.4 --depth 1 https://github.com/redis/redis.git $REDIS_PREFIX >/dev/null 2>&1
+  (cd $REDIS_PREFIX && make -j >/dev/null 2>&1) || { echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json; exit 1; }
+fi
+
+RSERVER="$REDIS_SRC/redis-server"
+RCLI="$REDIS_SRC/redis-cli"
+
+# Kill any previous test server on the port
+pkill -f "$RSERVER.*port $REDIS_PORT" >/dev/null 2>&1 || true
+sleep 0.1
+$RSERVER --port $REDIS_PORT --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+for i in $(seq 1 30); do
+  if $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+if ! $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then
+  echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+  exit 1
+fi
+
+parse_field() {
+  local txt="$1"; local key="$2"
+  if [[ -z "$txt" ]]; then echo ""; return; fi
+  echo "$txt" | awk -v k="$key" '{
+    if($0==k){ if(getline) print; else print "" ; exit}
+  }'
+}
+
+run_case1(){
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete3=$(parse_field "$info3" "lag")
+  entries_read_after_read=$(parse_field "$info4" "entries-read")
+  lag_after_read=$(parse_field "$info4" "lag")
+
+  # Determine bug presence per PR: bug when lag not nil after deletion AND entries-read/lag incorrect after reading to end
+  bug_stage1=false
+  if [[ -n "$lag_after_delete3" && "$lag_after_delete3" != "(nil)" ]]; then bug_stage1=true; fi
+  bug_stage2=false
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug_stage2=true; fi
+
+  if $bug_stage1 && $bug_stage2; then
+    return 0  # bug observed
+  else
+    return 1  # bug not observed
+  fi
+}
+
+run_case2(){
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete=$(parse_field "$info1" "lag")
+  entries_read_after_read=$(parse_field "$info2" "entries-read")
+  lag_after_read=$(parse_field "$info2" "lag")
+
+  bug=false
+  if [[ -n "$lag_after_delete" && "$lag_after_delete" != "(nil)" ]]; then bug=true; fi
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug=true; fi
+
+  if $bug; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Run cases: interpret exit 0 (bug observed) as FAILED test in test_status.json
+if run_case1 >/tmp/case1_run.txt 2>&1; then status1=FAILED; else status1=PASSED; fi
+if run_case2 >/tmp/case2_run.txt 2>&1; then status2=FAILED; else status2=PASSED; fi
+
+# Shutdown server
+$RCLI -p $REDIS_PORT shutdown nosave >/dev/null 2>&1 || true
+
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {"name":"testbed/case1_repro","status":"$status1"},
+    {"name":"testbed/case2_repro","status":"$status2"}
+  ]
+}
+JSON
+
+echo "WROTE /testbed/test_status.json with statuses: $status1, $status2"
+SH
+>> Executing selected action #4: cat > /testbed/run_test.sh <<'SH' && chmod +x /testbed/run_test.sh && /testbed/run_test.sh
+#!/bin/bash
+set -euo pipefail
+mkdir -p /testbed /tmp/redis-build
+REDIS_PORT=6380
+REDIS_PREFIX=/tmp/redis-build/redis-7.2.4
+REDIS_SRC=$REDIS_PREFIX/src
+log(){ echo "[$(date +%T)] $*"; }
+
+# Ensure build tools and clone/build Redis if needed
+if ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y build-essential tcl git wget ca-certificates >/dev/null 2>&1 || true
+fi
+
+if [[ ! -x "$REDIS_SRC/redis-server" ]]; then
+  log "Cloning Redis 7.2.4 and building..."
+  rm -rf $REDIS_PREFIX
+  git clone --branch 7.2.4 --depth 1 https://github.com/redis/redis.git $REDIS_PREFIX >/dev/null 2>&1
+  (cd $REDIS_PREFIX && make -j >/dev/null 2>&1) || { echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json; exit 1; }
+fi
+
+RSERVER="$REDIS_SRC/redis-server"
+RCLI="$REDIS_SRC/redis-cli"
+
+# Kill any previous test server on the port
+pkill -f "$RSERVER.*port $REDIS_PORT" >/dev/null 2>&1 || true
+sleep 0.1
+$RSERVER --port $REDIS_PORT --save "" --appendonly no --daemonize yes >/dev/null 2>&1 || true
+for i in $(seq 1 30); do
+  if $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then break; fi
+  sleep 0.2
+done
+if ! $RCLI -p $REDIS_PORT ping >/dev/null 2>&1; then
+  echo '{"tests":[{"name":"testbed/case1_repro","status":"ERROR"},{"name":"testbed/case2_repro","status":"ERROR"}]}' > /testbed/test_status.json
+  exit 1
+fi
+
+parse_field() {
+  local txt="$1"; local key="$2"
+  if [[ -z "$txt" ]]; then echo ""; return; fi
+  echo "$txt" | awk -v k="$key" '{
+    if($0==k){ if(getline) print; else print "" ; exit}
+  }'
+}
+
+run_case1(){
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-1 >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-2 >/dev/null 2>&1 || true
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info3=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info4=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete3=$(parse_field "$info3" "lag")
+  entries_read_after_read=$(parse_field "$info4" "entries-read")
+  lag_after_read=$(parse_field "$info4" "lag")
+
+  # Determine bug presence per PR: bug when lag not nil after deletion AND entries-read/lag incorrect after reading to end
+  bug_stage1=false
+  if [[ -n "$lag_after_delete3" && "$lag_after_delete3" != "(nil)" ]]; then bug_stage1=true; fi
+  bug_stage2=false
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug_stage2=true; fi
+
+  if $bug_stage1 && $bug_stage2; then
+    return 0  # bug observed
+  else
+    return 1  # bug not observed
+  fi
+}
+
+run_case2(){
+  $RCLI -p $REDIS_PORT FLUSHALL >/dev/null
+  $RCLI -p $REDIS_PORT --raw XGROUP CREATE planets processing \$ MKSTREAM >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-1 name Mercury >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-2 name Venus >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-3 name Earth >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XADD planets 0-4 name Jupiter >/dev/null 2>&1
+  $RCLI -p $REDIS_PORT --raw XDEL planets 0-3 >/dev/null 2>&1 || true
+  info1=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+  $RCLI -p $REDIS_PORT --raw XREADGROUP GROUP processing alice STREAMS planets ">" >/dev/null 2>&1 || true
+  info2=$($RCLI -p $REDIS_PORT --raw XINFO GROUPS planets 2>/dev/null || true)
+
+  lag_after_delete=$(parse_field "$info1" "lag")
+  entries_read_after_read=$(parse_field "$info2" "entries-read")
+  lag_after_read=$(parse_field "$info2" "lag")
+
+  bug=false
+  if [[ -n "$lag_after_delete" && "$lag_after_delete" != "(nil)" ]]; then bug=true; fi
+  if [[ -z "$entries_read_after_read" || "$entries_read_after_read" -ne 4 || "$lag_after_read" != "0" ]]; then bug=true; fi
+
+  if $bug; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Run cases: interpret exit 0 (bug observed) as FAILED test in test_status.json
+if run_case1 >/tmp/case1_run.txt 2>&1; then status1=FAILED; else status1=PASSED; fi
+if run_case2 >/tmp/case2_run.txt 2>&1; then status2=FAILED; else status2=PASSED; fi
+
+# Shutdown server
+$RCLI -p $REDIS_PORT shutdown nosave >/dev/null 2>&1 || true
+
+cat > /testbed/test_status.json <<JSON
+{
+  "tests": [
+    {"name":"testbed/case1_repro","status":"$status1"},
+    {"name":"testbed/case2_repro","status":"$status2"}
+  ]
+}
+JSON
+
+echo "WROTE /testbed/test_status.json with statuses: $status1, $status2"
+SH
+Generated action #1: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+>> Executing selected action #5: echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+Reproduction submission validated with 2 failed test(s): testbed/case1_repro, testbed/case2_repro
